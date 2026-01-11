@@ -13,91 +13,91 @@ struct ReasonInfo {
 inline ReasonInfo decodeReason(const std::string& reason) {
     static const std::map<std::string, ReasonInfo> reasons = {
         {"Resources", {
-            "Ressources demandees non disponibles",
-            "Attendez ou reduisez --nodes, --ntasks, -c, --mem"
+            "Requested resources not available",
+            "Wait or reduce --nodes, --ntasks, -c, --mem"
         }},
         {"Priority", {
-            "D'autres jobs ont une priorite plus elevee",
-            "Attendez votre tour dans la file"
+            "Other jobs have higher priority",
+            "Wait for your turn in the queue"
         }},
         {"PartitionTimeLimit", {
-            "Temps demande depasse la limite de la partition",
-            "Reduisez --time ou changez de partition"
+            "Requested time exceeds partition limit",
+            "Reduce --time or change partition"
         }},
         {"PartitionNodeLimit", {
-            "Nombre de noeuds depasse la limite partition",
-            "Reduisez --nodes"
+            "Node count exceeds partition limit",
+            "Reduce --nodes"
         }},
         {"QOSMaxCpuPerUserLimit", {
-            "Limite CPU par utilisateur atteinte",
-            "Attendez la fin de vos autres jobs"
+            "CPU limit per user reached",
+            "Wait for your other jobs to finish"
         }},
         {"QOSMaxNodePerUserLimit", {
-            "Limite noeuds par utilisateur atteinte",
-            "Attendez la fin de vos autres jobs"
+            "Node limit per user reached",
+            "Wait for your other jobs to finish"
         }},
         {"QOSMaxJobsPerUserLimit", {
-            "Nombre max de jobs simultanes atteint",
-            "Attendez la fin d'un job"
+            "Max concurrent jobs limit reached",
+            "Wait for a job to finish"
         }},
         {"AssocGrpCpuLimit", {
-            "Limite CPU du groupe/compte atteinte",
-            "Attendez ou contactez l'admin"
+            "Group/account CPU limit reached",
+            "Wait or contact admin"
         }},
         {"AssocGrpNodeLimit", {
-            "Limite noeuds du groupe/compte atteinte",
-            "Attendez ou contactez l'admin"
+            "Group/account node limit reached",
+            "Wait or contact admin"
         }},
         {"AssocGrpMemLimit", {
-            "Limite memoire du groupe atteinte",
-            "Reduisez --mem ou attendez"
+            "Group memory limit reached",
+            "Reduce --mem or wait"
         }},
         {"ReqNodeNotAvail", {
-            "Noeuds demandes non disponibles (maintenance?)",
-            "Verifiez sinfo ou retirez --nodelist"
+            "Requested nodes unavailable (maintenance?)",
+            "Check sinfo or remove --nodelist"
         }},
         {"InvalidAccount", {
-            "Compte invalide",
-            "Verifiez --account (ex: r250127)"
+            "Invalid account",
+            "Check --account"
         }},
         {"InvalidQOS", {
-            "QOS invalide",
-            "Verifiez votre QOS"
+            "Invalid QOS",
+            "Check your QOS"
         }},
         {"Dependency", {
-            "En attente d'un autre job (dependance)",
-            "Le job demarre quand la dependance se termine"
+            "Waiting for another job (dependency)",
+            "Job starts when dependency completes"
         }},
         {"DependencyNeverSatisfied", {
-            "Dependance ne peut pas etre satisfaite",
-            "Le job dependant a echoue, annulez ce job"
+            "Dependency cannot be satisfied",
+            "Dependent job failed, cancel this job"
         }},
         {"BeginTime", {
-            "Heure de debut non atteinte",
-            "Attendez l'heure specifiee par --begin"
+            "Start time not reached",
+            "Wait for time specified by --begin"
         }},
         {"JobHeldUser", {
-            "Job mis en pause par l'utilisateur",
-            "Utilisez: scontrol release <jobid>"
+            "Job held by user",
+            "Use: scontrol release <jobid>"
         }},
         {"JobHeldAdmin", {
-            "Job mis en pause par l'admin",
-            "Contactez le support"
+            "Job held by admin",
+            "Contact support"
         }},
         {"Reservation", {
-            "En attente d'une reservation",
-            "Verifiez la reservation specifiee"
+            "Waiting for reservation",
+            "Check the specified reservation"
         }},
         {"NodeDown", {
-            "Noeuds en panne",
-            "Retirez --nodelist ou attendez"
+            "Nodes are down",
+            "Remove --nodelist or wait"
         }},
         {"BadConstraints", {
-            "Contraintes impossibles a satisfaire",
-            "Verifiez --constraint (ex: x64cpu, armgpu)"
+            "Constraints cannot be satisfied",
+            "Check --constraint"
         }},
         {"None", {
-            "Aucune raison specifiee",
+            "No reason specified",
             ""
         }},
     };
@@ -108,7 +108,7 @@ inline ReasonInfo decodeReason(const std::string& reason) {
     }
 
     // Unknown reason
-    return {reason, "Consultez: scontrol show job <id>"};
+    return {reason, "See: scontrol show job <id>"};
 }
 
 }

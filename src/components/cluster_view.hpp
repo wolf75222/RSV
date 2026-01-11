@@ -38,13 +38,13 @@ inline Component clusterView() {
         rows.push_back(
             hbox({
                 text("PARTITION") | bold | size(WIDTH, EQUAL, 15),
-                text("NOEUDS") | bold | size(WIDTH, EQUAL, 8),
+                text("NODES") | bold | size(WIDTH, EQUAL, 8),
                 text("IDLE") | bold | color(Color::Green) | size(WIDTH, EQUAL, 6),
                 text("MIX") | bold | color(Color::Yellow) | size(WIDTH, EQUAL, 6),
                 text("ALLOC") | bold | color(Color::Red) | size(WIDTH, EQUAL, 6),
                 text("DOWN") | bold | color(Color::GrayDark) | size(WIDTH, EQUAL, 6),
-                text("LIMITE") | bold | size(WIDTH, EQUAL, 12),
-                text("OCCUPATION") | bold,
+                text("LIMIT") | bold | size(WIDTH, EQUAL, 12),
+                text("USAGE") | bold,
             })
         );
         rows.push_back(separator());
@@ -67,7 +67,7 @@ inline Component clusterView() {
         // Legend
         rows.push_back(text(""));
         rows.push_back(hbox({
-            text("Legende: ") | dim,
+            text("Legend: ") | dim,
             text("=") | color(Color::Green), text(" idle  ") | dim,
             text("=") | color(Color::Yellow), text(" mix  ") | dim,
             text("=") | color(Color::Red), text(" alloc  ") | dim,

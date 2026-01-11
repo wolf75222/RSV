@@ -6,3 +6,7 @@ build/
 
 # Extras
 *.mkv
+
+# IDE/Tools
+.claude/
+.vscode/

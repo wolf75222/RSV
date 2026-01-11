@@ -48,7 +48,7 @@ int main() {
             entries->push_back(job.name + " (" + job.id + ")");
 
         if (jobs->empty()) {
-            status_message = "Aucun job";
+            status_message = "No jobs";
             return;
         }
 
@@ -57,7 +57,7 @@ int main() {
         }
         *current_job = api::slurm::getJobDetails((*jobs)[selected].id);
         last_refresh = std::chrono::steady_clock::now();
-        status_message = "Rafraichi!";
+        status_message = "Refreshed!";
     };
 
     // Cancel job function
@@ -65,10 +65,10 @@ int main() {
         if (jobs->empty()) return;
         std::string job_id = (*jobs)[selected].id;
         if (api::slurm::cancelJob(job_id)) {
-            status_message = "Job " + job_id + " annule";
+            status_message = "Job " + job_id + " cancelled";
             refresh_jobs();
         } else {
-            status_message = "Erreur annulation";
+            status_message = "Cancel error";
         }
     };
 
@@ -169,11 +169,11 @@ int main() {
     // Partition view
     Component partition_view = Renderer([&] {
         return vbox({
-            text("══════════ PARTITIONS CLUSTER ══════════") | bold | center | color(Color::Cyan),
+            text("══════════ CLUSTER PARTITIONS ══════════") | bold | center | color(Color::Cyan),
             text(""),
             ui::clusterView()->Render(),
             text(""),
-            text("Appuyez sur une touche pour fermer") | dim | center,
+            text("Press any key to close") | dim | center,
         }) | border | clear_under | center;
     });
 
