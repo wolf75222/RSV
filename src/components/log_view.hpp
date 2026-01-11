@@ -11,12 +11,12 @@ using namespace ftxui;
 
 inline std::string readLogFile(const std::string& path, int max_lines = 100) {
     if (path.empty() || path == "(null)") {
-        return "[Fichier non specifie]";
+        return "[File not specified]";
     }
 
     std::ifstream file(path);
     if (!file.is_open()) {
-        return "[Impossible d'ouvrir: " + path + "]";
+        return "[Cannot open: " + path + "]";
     }
 
     std::vector<std::string> lines;
@@ -33,7 +33,7 @@ inline std::string readLogFile(const std::string& path, int max_lines = 100) {
     }
 
     if (lines.empty()) {
-        return "[Fichier vide]";
+        return "[Empty file]";
     }
 
     return oss.str();
@@ -65,14 +65,14 @@ inline Component logView(const std::string& job_id, std::function<void()> on_clo
             (*show_stderr ? text("[stdout]") | dim : text("[stdout]") | bold | color(Color::Green)),
             text("  |  "),
             (*show_stderr ? text("[stderr]") | bold | color(Color::Red) : text("[stderr]") | dim),
-            text("  (Tab pour changer)") | dim,
+            text("  (Tab to switch)") | dim,
         }));
         elements.push_back(separator());
 
         // File path
         std::string current_path = *show_stderr ? *stderr_path : *stdout_path;
         elements.push_back(hbox({
-            text("Fichier: ") | dim,
+            text("File: ") | dim,
             text(current_path) | color(Color::Cyan),
         }));
         elements.push_back(separator());
@@ -98,9 +98,9 @@ inline Component logView(const std::string& job_id, std::function<void()> on_clo
         elements.push_back(separator());
         elements.push_back(hbox({
             text("Tab") | bold | color(Color::Yellow),
-            text(": changer stdout/stderr  ") | dim,
-            text("Echap/Entree") | bold | color(Color::Yellow),
-            text(": fermer") | dim,
+            text(": switch stdout/stderr  ") | dim,
+            text("Esc/Enter") | bold | color(Color::Yellow),
+            text(": close") | dim,
         }) | center);
 
         return vbox(elements) | border | size(HEIGHT, LESS_THAN, 40);

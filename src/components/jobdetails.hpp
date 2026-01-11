@@ -22,11 +22,11 @@ inline ftxui::Component jobdetails(const api::DetailedJob& job) {
 
         std::vector<Element> elements = {
             hbox({text("Job ID: "), text(job.id) | color(Color::Magenta)}),
-            text("Nom: " + job.name),
-            text("Date de soumission: " + job.submitTime),
-            text("Nombre de noeuds: " + std::to_string(job.nodes)),
+            text("Name: " + job.name),
+            text("Submit time: " + job.submitTime),
+            text("Nodes: " + std::to_string(job.nodes)),
             hbox({
-                text("Temps: "),
+                text("Time: "),
                 text(job.elapsedTime.empty() ? "N/A" : job.elapsedTime) | color(Color::Cyan),
                 text(" / "),
                 text(job.maxTime) | dim,
@@ -34,8 +34,8 @@ inline ftxui::Component jobdetails(const api::DetailedJob& job) {
             hbox({
                 text("Partition: "),
                 text(job.partition) | color(Color::Cyan),
-                text("  Contraintes: "),
-                text(job.constraints.empty() ? "Aucune" : job.constraints) | color(Color::Cyan),
+                text("  Constraints: "),
+                text(job.constraints.empty() ? "None" : job.constraints) | color(Color::Cyan),
             }),
             hbox({text("Status: "), text(job.status) | color(status_color)}),
         };
@@ -44,7 +44,7 @@ inline ftxui::Component jobdetails(const api::DetailedJob& job) {
         if (job.status == "PENDING" && !job.reason.empty() && job.reason != "None") {
             auto info = decodeReason(job.reason);
             elements.push_back(hbox({
-                text("Raison: "),
+                text("Reason: "),
                 text(job.reason) | bold | color(Color::Yellow),
                 text(" - "),
                 text(info.description) | dim,

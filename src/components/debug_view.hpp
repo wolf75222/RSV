@@ -74,7 +74,7 @@ inline Component debugView(const std::string& job_id, std::function<void()> on_c
         }
 
         lines.push_back(separator());
-        lines.push_back(text("Appuyez sur une touche pour fermer") | dim | center);
+        lines.push_back(text("Press any key to close") | dim | center);
 
         return vbox(lines) | border | size(WIDTH, LESS_THAN, 100);
     });

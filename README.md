@@ -10,23 +10,24 @@ This small project provides a **Terminal User Interface (TUI)** of your SLURM jo
 
 ## Features
 
-- Lists all SLURM jobs for the current user.
-- Interactive scrolling with mouse wheel.
-- UI with a sidebar menu for job selection.
+- Lists all SLURM jobs for the current user
+- Interactive scrolling with mouse wheel
+- Auto-refresh every 30 seconds
+- UI with a sidebar menu for job selection
 - Shows detailed job information:
-  - Job ID
-  - Name
-  - Submission time
-  - Number of nodes
-  - Max duration
-  - Partition
-  - Status (color-coded)
-  - Constraints
+  - Job ID, Name, Submission time
+  - Number of nodes, Elapsed/Max time
+  - Partition, Status (color-coded), Constraints
+  - **PENDING reason decoding** with actionable suggestions
 - Visualizes node allocations for running jobs:
   - CPU usage (`■` = allocated, `.` = free)
   - GPU usage (`●` = allocated, `○` = free)
   - Dynamic expansion of compressed node lists (e.g., `romeo-a[045-046]`)
-  - ASCII graphical representation of cores and GPUs per node.
+  - Nodes grouped by APU type (CPU/GPU architecture)
+- **Partition view** (`p`): cluster-wide partition status (like `sinfo`)
+- **Debug view** (`d`): raw `scontrol show job` output with syntax highlighting
+- **Log viewer** (`l`): view stdout/stderr files directly
+- **Cancel jobs** (`c`): cancel selected job via `scancel`
 - Color-coded status:
   - `RUNNING` → Green
   - `PENDING` → Yellow
@@ -38,14 +39,12 @@ This small project provides a **Terminal User Interface (TUI)** of your SLURM jo
 
 ## Prerequisites
 
-- Bash shell (`#!/bin/bash`)
-- SLURM commands available (`squeue`, `scontrol`)
-- SSH access to cluster nodes (if remote queries needed)
-- `grep`, `cut`, `printf` commands (standard on Linux)
+- SLURM commands available (`squeue`, `scontrol`, `sinfo`, `scancel`)
 - **C++17 compiler** (GCC or Clang recommended)
 - **CMake ≥ 3.14**
-- **FTXUI library** installed
 - Terminal supporting ANSI colors
+
+> Note: FTXUI library is automatically fetched during build via CMake FetchContent.
 
 ---
 
@@ -74,12 +73,23 @@ make
 ```
 
 2. The program displays:
-- A sidebar menu listing all your jobs.
-- Details of the selected job in the main panel.
-- Node allocations with CPU/GPU usage visualized in a grid.
-- Navigate the UI:
-  - Arrow keys → Move selection in sidebar.
-  - Mouse wheel → Scroll node allocations vertically.
+- A sidebar menu listing all your jobs
+- Details of the selected job in the main panel
+- Node allocations with CPU/GPU usage visualized in a grid
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `↑/↓` | Navigate job list |
+| `Mouse wheel` | Scroll details |
+| `r` | Refresh jobs |
+| `h` / `?` | Show help |
+| `p` | Partition view |
+| `d` | Debug view |
+| `l` | Log viewer |
+| `c` | Cancel job |
+| `q` / `Esc` | Quit |
 
 ---
 
