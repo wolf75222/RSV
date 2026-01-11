@@ -81,8 +81,13 @@ make
 
 | Key | Action |
 |-----|--------|
-| `↑/↓` | Navigate job list |
+| `↑/↓` or `j/k` | Navigate job list |
+| `g` / `G` | Go to first / last job |
+| `Home` / `End` | Go to first / last job |
+| `1-9` | Quick select job 1-9 |
 | `Mouse wheel` | Scroll details |
+| `PgUp` / `PgDown` | Scroll details fast |
+| `+` / `-` | Adjust scroll speed |
 | `r` | Refresh jobs |
 | `h` / `?` | Show help |
 | `p` | Partition view |
