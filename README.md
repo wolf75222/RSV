@@ -5,7 +5,13 @@ This small project provides a **Terminal User Interface (TUI)** of your SLURM jo
 ---
 
 <p align="center">
-  <img src="img/app.gif" alt="App preview" width="600">
+  <img src="img/app.gif" alt="Simple version" width="600">
+  <br><em>Simple version</em>
+</p>
+
+<p align="center">
+  <img src="img/demo.gif" alt="Enriched version" width="600">
+  <br><em>Enriched version</em>
 </p>
 
 ## Features
@@ -36,7 +42,7 @@ This small project provides a **Terminal User Interface (TUI)** of your SLURM jo
   - CPU/Node/Job limits
   - Current usage with progress bars
   - Remaining resources
-- **Cancel jobs** (`c`): cancel selected job via `scancel`
+- **Cancel jobs** (`c`): cancel selected job via `scancel` (with confirmation)
 - **Copy job ID** (`y`): copy selected job ID to clipboard
 - **Sort jobs** (`s`): cycle through sort modes (ID/Name/Entry)
 - Color-coded status:
@@ -96,7 +102,7 @@ make
 | `↑/↓` | Navigate job list |
 | `Mouse wheel` | Scroll details/logs |
 | `r` | Refresh jobs |
-| `c` | Cancel job |
+| `c` | Cancel job (with confirmation) |
 | `y` | Copy job ID (yank) |
 | `s` | Sort jobs (cycle modes) |
 | `p` | Partition view |
