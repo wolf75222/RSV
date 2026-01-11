@@ -24,6 +24,17 @@ struct NodeAllocation {
     int total_gpus;
 };
 
+struct PartitionInfo {
+    std::string name;
+    int nodes_total = 0;
+    int nodes_idle = 0;
+    int nodes_alloc = 0;
+    int nodes_mix = 0;
+    int nodes_down = 0;
+    std::string timelimit;
+    std::string state;
+};
+
 struct DetailedJob {
     int nodes = 0;
 
@@ -225,6 +236,72 @@ public:
         std::string cmd = "scancel " + job_id + " 2>&1";
         std::string result = exec(cmd);
         return result.empty() || result.find("error") == std::string::npos;
+    }
+
+    static std::vector<PartitionInfo> getPartitions() {
+        std::vector<PartitionInfo> partitions;
+
+        // Get partition summary with node states
+        std::string cmd = "sinfo -o \"%P %a %l %D %T\" --noheader 2>/dev/null";
+        std::string out = exec(cmd);
+
+        std::map<std::string, PartitionInfo> part_map;
+
+        std::istringstream iss(out);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.empty()) continue;
+
+            std::istringstream lss(line);
+            std::string name, avail, timelimit, nodes_str, state;
+            lss >> name >> avail >> timelimit >> nodes_str >> state;
+
+            // Remove trailing '*' from default partition
+            if (!name.empty() && name.back() == '*') {
+                name.pop_back();
+            }
+
+            int nodes = 0;
+            try { nodes = std::stoi(nodes_str); } catch (...) {}
+
+            if (part_map.find(name) == part_map.end()) {
+                part_map[name] = PartitionInfo{name, 0, 0, 0, 0, 0, timelimit, avail};
+            }
+
+            auto& p = part_map[name];
+            p.nodes_total += nodes;
+
+            if (state.find("idle") != std::string::npos) p.nodes_idle += nodes;
+            else if (state.find("mix") != std::string::npos) p.nodes_mix += nodes;
+            else if (state.find("alloc") != std::string::npos) p.nodes_alloc += nodes;
+            else if (state.find("down") != std::string::npos ||
+                     state.find("drain") != std::string::npos) p.nodes_down += nodes;
+        }
+
+        for (auto& [name, p] : part_map) {
+            partitions.push_back(p);
+        }
+
+        return partitions;
+    }
+
+    static std::string getRawJobDetails(const std::string& job_id) {
+        return exec("scontrol show job " + job_id + " 2>&1");
+    }
+
+    static std::pair<std::string, std::string> getJobLogPaths(const std::string& job_id) {
+        std::string raw = exec("scontrol show job " + job_id + " 2>/dev/null");
+
+        std::string stdout_path, stderr_path;
+
+        std::regex stdout_re(R"(StdOut=([^\s]+))");
+        std::regex stderr_re(R"(StdErr=([^\s]+))");
+
+        std::smatch m;
+        if (std::regex_search(raw, m, stdout_re)) stdout_path = m[1].str();
+        if (std::regex_search(raw, m, stderr_re)) stderr_path = m[1].str();
+
+        return {stdout_path, stderr_path};
     }
 
 };

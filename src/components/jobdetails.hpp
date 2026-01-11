@@ -5,6 +5,7 @@
 #include <string>
 
 #include "../api/slurmjobs.hpp"
+#include "reason_decoder.hpp"
 
 namespace ui {
 
@@ -30,18 +31,33 @@ inline ftxui::Component jobdetails(const api::DetailedJob& job) {
                 text(" / "),
                 text(job.maxTime) | dim,
             }),
-            text("Partition: " + job.partition),
+            hbox({
+                text("Partition: "),
+                text(job.partition) | color(Color::Cyan),
+                text("  Contraintes: "),
+                text(job.constraints.empty() ? "Aucune" : job.constraints) | color(Color::Cyan),
+            }),
             hbox({text("Status: "), text(job.status) | color(status_color)}),
         };
 
-        // Show reason for PENDING jobs
-        if (job.status == "PENDING" && !job.reason.empty()) {
-            elements.push_back(hbox({text("Raison: "), text(job.reason) | color(Color::Yellow)}));
+        // Show detailed reason for PENDING jobs with suggestions
+        if (job.status == "PENDING" && !job.reason.empty() && job.reason != "None") {
+            auto info = decodeReason(job.reason);
+            elements.push_back(hbox({
+                text("Raison: "),
+                text(job.reason) | bold | color(Color::Yellow),
+                text(" - "),
+                text(info.description) | dim,
+            }));
+            if (!info.suggestion.empty()) {
+                elements.push_back(hbox({
+                    text("  -> ") | color(Color::Green),
+                    text(info.suggestion) | color(Color::Green),
+                }));
+            }
         }
 
-        elements.push_back(text("Contraintes: " + (job.constraints.empty() ? "Aucune" : job.constraints)));
-
-        return vbox(elements) | flex | size(HEIGHT, EQUAL, 11);
+        return vbox(elements) | flex;
     });
 }
 

@@ -10,6 +10,9 @@
 #include "components/nodedetails.hpp"
 #include "components/title.hpp"
 #include "components/footer.hpp"
+#include "components/cluster_view.hpp"
+#include "components/debug_view.hpp"
+#include "components/log_view.hpp"
 
 using namespace ftxui;
 
@@ -26,6 +29,9 @@ int main() {
 
     int selected = 0;
     bool show_help = false;
+    bool show_partitions = false;
+    bool show_debug = false;
+    bool show_logs = false;
     std::string status_message;
     auto last_refresh = std::chrono::steady_clock::now();
     constexpr int AUTO_REFRESH_SECONDS = 30;
@@ -160,24 +166,98 @@ int main() {
     // Help modal
     Component help = ui::helpModal([&] { show_help = false; });
 
-    Component interface = Container::Tab({main_content, help}, nullptr);
+    // Partition view
+    Component partition_view = Renderer([&] {
+        return vbox({
+            text("══════════ PARTITIONS CLUSTER ══════════") | bold | center | color(Color::Cyan),
+            text(""),
+            ui::clusterView()->Render(),
+            text(""),
+            text("Appuyez sur une touche pour fermer") | dim | center,
+        }) | border | clear_under | center;
+    });
+
+    partition_view = CatchEvent(partition_view, [&](Event e) {
+        if (e.is_character() || e == Event::Escape || e == Event::Return) {
+            show_partitions = false;
+            return true;
+        }
+        return false;
+    });
+
+    // Debug view (will be created dynamically based on selected job)
+    auto debug_component = std::make_shared<Component>(
+        ui::debugView(current_job->id, [&] { show_debug = false; })
+    );
+
+    // Log view (will be created dynamically based on selected job)
+    auto log_component = std::make_shared<Component>(
+        ui::logView(current_job->id, [&] { show_logs = false; })
+    );
+
+    Component interface = Container::Tab({main_content, help, partition_view}, nullptr);
 
     interface = Renderer(interface, [&] {
+        Element base = main_content->Render();
+
         if (show_help) {
             return dbox({
-                main_content->Render(),
+                base,
                 help->Render() | clear_under | center,
             });
         }
-        return main_content->Render();
+        if (show_partitions) {
+            return dbox({
+                base,
+                partition_view->Render() | clear_under | center,
+            });
+        }
+        if (show_debug) {
+            return dbox({
+                base,
+                (*debug_component)->Render() | clear_under | center,
+            });
+        }
+        if (show_logs) {
+            return dbox({
+                base,
+                (*log_component)->Render() | clear_under | center,
+            });
+        }
+        return base;
     });
 
     // Handle keyboard events
     interface = CatchEvent(interface, [&](Event e) {
-        // Handle help modal first
+        // Handle modals first
         if (show_help) {
             if (e.is_character() || e == Event::Escape || e == Event::Return) {
                 show_help = false;
+                return true;
+            }
+            return false;
+        }
+        if (show_partitions) {
+            if (e.is_character() || e == Event::Escape || e == Event::Return) {
+                show_partitions = false;
+                return true;
+            }
+            return false;
+        }
+        if (show_debug) {
+            if (e.is_character() || e == Event::Escape || e == Event::Return) {
+                show_debug = false;
+                return true;
+            }
+            return false;
+        }
+        if (show_logs) {
+            if (e == Event::Tab || e == Event::TabReverse) {
+                // Let the log component handle tab
+                return false;
+            }
+            if (e.is_character() || e == Event::Escape || e == Event::Return) {
+                show_logs = false;
                 return true;
             }
             return false;
@@ -207,6 +287,30 @@ int main() {
         if (e == Event::Character('c') || e == Event::Character('C') ||
             e == Event::Delete) {
             cancel_selected_job();
+            return true;
+        }
+
+        // Partitions view
+        if (e == Event::Character('p') || e == Event::Character('P')) {
+            show_partitions = true;
+            return true;
+        }
+
+        // Debug view
+        if (e == Event::Character('d') || e == Event::Character('D')) {
+            if (!jobs->empty()) {
+                *debug_component = ui::debugView((*jobs)[selected].id, [&] { show_debug = false; });
+                show_debug = true;
+            }
+            return true;
+        }
+
+        // Logs view
+        if (e == Event::Character('l') || e == Event::Character('L')) {
+            if (!jobs->empty()) {
+                *log_component = ui::logView((*jobs)[selected].id, [&] { show_logs = false; });
+                show_logs = true;
+            }
             return true;
         }
 
