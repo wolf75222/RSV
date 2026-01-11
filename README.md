@@ -26,20 +26,32 @@ This small project provides a **Terminal User Interface (TUI)** of your SLURM jo
   - Nodes grouped by APU type (CPU/GPU architecture)
 - **Partition view** (`p`): cluster-wide partition status (like `sinfo`)
 - **Debug view** (`d`): raw `scontrol show job` output with syntax highlighting
-- **Log viewer** (`l`): view stdout/stderr files directly
+- **Log viewer** (`l`): view stdout/stderr files with scrolling (↑↓ or wheel)
+- **History view** (`a`): job history via `sacct` with:
+  - Filter by status (ALL/RUNNING/PENDING/COMPLETED/FAILED/CANCELLED/TIMEOUT)
+  - MaxRSS memory usage
+  - CPU count and elapsed time
+  - Exit codes
+- **User quota** (`u`): view your resource limits via `sacctmgr`:
+  - CPU/Node/Job limits
+  - Current usage with progress bars
+  - Remaining resources
 - **Cancel jobs** (`c`): cancel selected job via `scancel`
+- **Copy job ID** (`y`): copy selected job ID to clipboard
+- **Sort jobs** (`s`): cycle through sort modes (ID/Name/Entry)
 - Color-coded status:
   - `RUNNING` → Green
   - `PENDING` → Yellow
   - `COMPLETED` → Blue
   - `FAILED` → Red
   - `CANCELLED` → Purple
+  - `TIMEOUT` → Red
 
 ---
 
 ## Prerequisites
 
-- SLURM commands available (`squeue`, `scontrol`, `sinfo`, `scancel`)
+- SLURM commands available (`squeue`, `scontrol`, `sinfo`, `scancel`, `sacct`, `sacctmgr`)
 - **C++17 compiler** (GCC or Clang recommended)
 - **CMake ≥ 3.14**
 - Terminal supporting ANSI colors
@@ -82,13 +94,17 @@ make
 | Key | Action |
 |-----|--------|
 | `↑/↓` | Navigate job list |
-| `Mouse wheel` | Scroll details |
+| `Mouse wheel` | Scroll details/logs |
 | `r` | Refresh jobs |
-| `h` / `?` | Show help |
+| `c` | Cancel job |
+| `y` | Copy job ID (yank) |
+| `s` | Sort jobs (cycle modes) |
 | `p` | Partition view |
 | `d` | Debug view |
-| `l` | Log viewer |
-| `c` | Cancel job |
+| `l` | Log viewer (↑↓ to scroll, Tab for stderr) |
+| `a` | History (←→ to filter by status) |
+| `u` | User quota |
+| `h` / `?` | Show help |
 | `q` / `Esc` | Quit |
 
 ---
