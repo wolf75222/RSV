@@ -68,8 +68,14 @@ This small project provides a **Terminal User Interface (TUI)** of your SLURM jo
 
 ## Building
 
-1. Clone or copy the source code to your workstation or cluster.
-2. Create a build directory and compile:
+### Quick Start (using dev script)
+
+```bash
+./dev.sh all    # Clean build from scratch
+./dev.sh run    # Run the application
+```
+
+### Manual Build
 
 ```bash
 mkdir build
@@ -78,8 +84,49 @@ cmake ..
 make
 ```
 
-3. This will produce the executable rsv.
-4. Libraries are statically linked, so the executable is transferable to your cluster
+This produces the `rsv` executable. Libraries are statically linked, so the executable is portable and can be transferred to your cluster.
+
+---
+
+## Development
+
+The `dev.sh` script simplifies the development workflow:
+
+| Command | Description |
+|---------|-------------|
+| `./dev.sh` | Build (incremental) |
+| `./dev.sh all` | Clean + full rebuild |
+| `./dev.sh run` | Run the application |
+| `./dev.sh clean` | Remove build directory |
+| `./dev.sh help` | Show all options |
+
+---
+
+## Deployment
+
+To build locally and deploy to a remote cluster:
+
+```bash
+./deploy.sh <username> <host>
+# Example: ./deploy.sh jdoe romeo.univ-reims.fr
+```
+
+This script:
+1. Builds the project locally
+2. Copies the executable to your home directory on the cluster
+3. You can then SSH and run `./rsv` directly
+
+---
+
+## Testing
+
+A test job script is provided to create a sample SLURM job for testing RSV:
+
+```bash
+./testjob.sh
+```
+
+This submits a simple 5-minute job (4 nodes, 8 tasks, 2 GPUs/node) that sleeps, allowing you to test RSV's visualization features. Modify the script parameters as needed for your cluster.
 
 ---
 
