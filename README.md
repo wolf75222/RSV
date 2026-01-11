@@ -27,9 +27,6 @@ This small project provides a **Terminal User Interface (TUI)** of your SLURM jo
   - GPU usage (`●` = allocated, `○` = free)
   - Dynamic expansion of compressed node lists (e.g., `romeo-a[045-046]`)
   - ASCII graphical representation of cores and GPUs per node.
-
-## Planned Features
-
 - Color-coded status:
   - `RUNNING` → Green
   - `PENDING` → Yellow
