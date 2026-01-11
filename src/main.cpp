@@ -98,10 +98,10 @@ int main() {
         interface_jobs | flex,
     });
 
-    // Handle quit events (q, Q, Escape, Ctrl+C)
+    // Handle quit events (q, Q, Escape)
     interface = CatchEvent(interface, [&](Event e) {
         if (e == Event::Character('q') || e == Event::Character('Q') ||
-            e == Event::Escape || e == Event::CtrlC) {
+            e == Event::Escape || e == Event::Character('\x03')) {  // \x03 = Ctrl+C
             screen.Exit();
             return true;
         }
