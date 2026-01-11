@@ -98,6 +98,16 @@ int main() {
         interface_jobs | flex,
     });
 
+    // Handle quit events (q, Q, Escape, Ctrl+C)
+    interface = CatchEvent(interface, [&](Event e) {
+        if (e == Event::Character('q') || e == Event::Character('Q') ||
+            e == Event::Escape || e == Event::CtrlC) {
+            screen.Exit();
+            return true;
+        }
+        return false;
+    });
+
     screen.Loop(interface);
 
     return 0;
