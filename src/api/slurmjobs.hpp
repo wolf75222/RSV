@@ -32,9 +32,11 @@ struct DetailedJob {
     std::string entry_name;
     std::string submitTime;
     std::string maxTime;
+    std::string elapsedTime;
     std::string partition;
     std::string status;
     std::string constraints;
+    std::string reason;  // For PENDING jobs
 
     std::vector<NodeAllocation> node_allocations;
 };
@@ -157,6 +159,8 @@ public:
             else if (key == "Partition") job.partition = val;
             else if (key == "JobState") job.status = val;
             else if (key == "Features") job.constraints = val;
+            else if (key == "RunTime") job.elapsedTime = val;
+            else if (key == "Reason") job.reason = val;
         }
 
         std::regex nodes_re(R"(^\s*Nodes=([^\s]+))", std::regex_constants::multiline);
@@ -215,6 +219,12 @@ public:
         }
 
         return job;
+    }
+
+    static bool cancelJob(const std::string& job_id) {
+        std::string cmd = "scancel " + job_id + " 2>&1";
+        std::string result = exec(cmd);
+        return result.empty() || result.find("error") == std::string::npos;
     }
 
 };

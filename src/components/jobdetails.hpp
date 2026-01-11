@@ -19,18 +19,29 @@ inline ftxui::Component jobdetails(const api::DetailedJob& job) {
         else if (job.status == "FAILED")  status_color = Color::Red;
         else if (job.status == "CANCELLED") status_color = Color::Magenta;
 
-        auto lines = vbox({
+        std::vector<Element> elements = {
             hbox({text("Job ID: "), text(job.id) | color(Color::Magenta)}),
             text("Nom: " + job.name),
             text("Date de soumission: " + job.submitTime),
             text("Nombre de noeuds: " + std::to_string(job.nodes)),
-            text("Durée MAX: " + job.maxTime),
+            hbox({
+                text("Temps: "),
+                text(job.elapsedTime.empty() ? "N/A" : job.elapsedTime) | color(Color::Cyan),
+                text(" / "),
+                text(job.maxTime) | dim,
+            }),
             text("Partition: " + job.partition),
             hbox({text("Status: "), text(job.status) | color(status_color)}),
-            text("Contraintes: " + job.constraints)
-        });
+        };
 
-        return lines | flex | size(HEIGHT, EQUAL, 10);
+        // Show reason for PENDING jobs
+        if (job.status == "PENDING" && !job.reason.empty()) {
+            elements.push_back(hbox({text("Raison: "), text(job.reason) | color(Color::Yellow)}));
+        }
+
+        elements.push_back(text("Contraintes: " + (job.constraints.empty() ? "Aucune" : job.constraints)));
+
+        return vbox(elements) | flex | size(HEIGHT, EQUAL, 11);
     });
 }
 
