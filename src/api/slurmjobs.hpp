@@ -289,17 +289,45 @@ public:
         return exec("scontrol show job " + job_id + " 2>&1");
     }
 
+    static std::string expandSlurmPath(const std::string& path, const std::string& job_id, const std::string& job_name) {
+        std::string result = path;
+
+        // Extract base job ID (without step)
+        std::string base_job_id = job_id;
+        size_t dot_pos = job_id.find('.');
+        if (dot_pos != std::string::npos) {
+            base_job_id = job_id.substr(0, dot_pos);
+        }
+
+        // Replace SLURM placeholders
+        // %J = jobid.stepid, %j = jobid
+        size_t pos;
+        while ((pos = result.find("%J")) != std::string::npos) {
+            result.replace(pos, 2, job_id);
+        }
+        while ((pos = result.find("%j")) != std::string::npos) {
+            result.replace(pos, 2, base_job_id);
+        }
+        while ((pos = result.find("%x")) != std::string::npos) {
+            result.replace(pos, 2, job_name);
+        }
+
+        return result;
+    }
+
     static std::pair<std::string, std::string> getJobLogPaths(const std::string& job_id) {
         std::string raw = exec("scontrol show job " + job_id + " 2>/dev/null");
 
-        std::string stdout_path, stderr_path;
+        std::string stdout_path, stderr_path, job_name;
 
         std::regex stdout_re(R"(StdOut=([^\s]+))");
         std::regex stderr_re(R"(StdErr=([^\s]+))");
+        std::regex name_re(R"(JobName=([^\s]+))");
 
         std::smatch m;
-        if (std::regex_search(raw, m, stdout_re)) stdout_path = m[1].str();
-        if (std::regex_search(raw, m, stderr_re)) stderr_path = m[1].str();
+        if (std::regex_search(raw, m, name_re)) job_name = m[1].str();
+        if (std::regex_search(raw, m, stdout_re)) stdout_path = expandSlurmPath(m[1].str(), job_id, job_name);
+        if (std::regex_search(raw, m, stderr_re)) stderr_path = expandSlurmPath(m[1].str(), job_id, job_name);
 
         return {stdout_path, stderr_path};
     }
