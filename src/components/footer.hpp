@@ -36,11 +36,18 @@ inline Element footer() {
 inline Component helpModal(std::function<void()> on_close) {
     auto content = Renderer([&] {
         return vbox({
-            text("══════════════ RSV HELP ══════════════") | bold | center | color(Color::Cyan),
+            text("══════════════════ RSV HELP ══════════════════") | bold | center | color(Color::Cyan),
             text(""),
             text("Navigation") | bold | color(Color::Yellow),
-            hbox({text("  Up / Down     ") | color(Color::Cyan), text("Navigate job list")}),
+            hbox({text("  Up/Down, j/k  ") | color(Color::Cyan), text("Navigate job list")}),
+            hbox({text("  g / G         ") | color(Color::Cyan), text("Go to first / last job")}),
+            hbox({text("  Home / End    ") | color(Color::Cyan), text("Go to first / last job")}),
+            hbox({text("  1-9           ") | color(Color::Cyan), text("Quick select job 1-9")}),
+            text(""),
+            text("Scrolling") | bold | color(Color::Yellow),
             hbox({text("  Mouse wheel   ") | color(Color::Cyan), text("Scroll details")}),
+            hbox({text("  PgUp / PgDown ") | color(Color::Cyan), text("Scroll details fast")}),
+            hbox({text("  + / -         ") | color(Color::Cyan), text("Adjust scroll speed")}),
             text(""),
             text("Actions") | bold | color(Color::Yellow),
             hbox({text("  r / R         ") | color(Color::Cyan), text("Refresh jobs")}),
@@ -55,7 +62,7 @@ inline Component helpModal(std::function<void()> on_close) {
             hbox({text("  h / ?         ") | color(Color::Cyan), text("Show this help")}),
             hbox({text("  q / Escape    ") | color(Color::Cyan), text("Quit application")}),
             text(""),
-            text("═══════════════════════════════════════") | color(Color::Cyan),
+            text("═══════════════════════════════════════════════") | color(Color::Cyan),
             text(""),
             text("Press any key to close") | dim | center,
         }) | border | clear_under | center;

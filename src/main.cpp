@@ -33,6 +33,7 @@ int main() {
     bool show_debug = false;
     bool show_logs = false;
     auto log_show_stderr = std::make_shared<bool>(false);
+    float scroll_step = 0.05f;  // Adjustable with +/-
     std::string status_message;
     auto last_refresh = std::chrono::steady_clock::now();
     constexpr int AUTO_REFRESH_SECONDS = 30;
@@ -92,17 +93,15 @@ int main() {
 
     job_nodes_scrollable =
         CatchEvent(job_nodes_scrollable, [&](Event e) {
-            constexpr float wheel_step = 0.05f;
-
             bool handled = false;
 
             if (e.is_mouse()) {
                 if (e.mouse().button == Mouse::WheelDown) {
-                    scroll_y += wheel_step;
+                    scroll_y += scroll_step;
                     handled = true;
                 }
                 if (e.mouse().button == Mouse::WheelUp) {
-                    scroll_y -= wheel_step;
+                    scroll_y -= scroll_step;
                     handled = true;
                 }
             }
@@ -314,6 +313,82 @@ int main() {
                 show_logs = true;
             }
             return true;
+        }
+
+        // Helper to update job details after selection change
+        auto update_selection = [&]() {
+            if (!jobs->empty() && selected < (int)jobs->size()) {
+                *current_job = api::slurm::getJobDetails((*jobs)[selected].id);
+                scroll_y = 0.f;
+            }
+        };
+
+        // Vim-style navigation (j/k)
+        if (e == Event::Character('j')) {
+            if (!jobs->empty() && selected < (int)jobs->size() - 1) {
+                selected++;
+                update_selection();
+            }
+            return true;
+        }
+        if (e == Event::Character('k')) {
+            if (!jobs->empty() && selected > 0) {
+                selected--;
+                update_selection();
+            }
+            return true;
+        }
+
+        // Go to first/last job (g/G or Home/End)
+        if (e == Event::Character('g') || e == Event::Home) {
+            if (!jobs->empty()) {
+                selected = 0;
+                update_selection();
+            }
+            return true;
+        }
+        if (e == Event::Character('G') || e == Event::End) {
+            if (!jobs->empty()) {
+                selected = jobs->size() - 1;
+                update_selection();
+            }
+            return true;
+        }
+
+        // Page Up/Down for details scrolling
+        if (e == Event::PageUp) {
+            scroll_y -= 0.25f;
+            scroll_y = std::clamp(scroll_y, 0.f, 1.f);
+            return true;
+        }
+        if (e == Event::PageDown) {
+            scroll_y += 0.25f;
+            scroll_y = std::clamp(scroll_y, 0.f, 1.f);
+            return true;
+        }
+
+        // Zoom in/out (adjust scroll step)
+        if (e == Event::Character('+') || e == Event::Character('=')) {
+            scroll_step = std::min(scroll_step + 0.02f, 0.2f);
+            status_message = "Scroll: " + std::to_string((int)(scroll_step * 100)) + "%";
+            return true;
+        }
+        if (e == Event::Character('-') || e == Event::Character('_')) {
+            scroll_step = std::max(scroll_step - 0.02f, 0.01f);
+            status_message = "Scroll: " + std::to_string((int)(scroll_step * 100)) + "%";
+            return true;
+        }
+
+        // Quick number selection (1-9 for first 9 jobs)
+        for (char c = '1'; c <= '9'; c++) {
+            if (e == Event::Character(c)) {
+                int idx = c - '1';
+                if (!jobs->empty() && idx < (int)jobs->size()) {
+                    selected = idx;
+                    update_selection();
+                }
+                return true;
+            }
         }
 
         return false;
