@@ -32,6 +32,7 @@ int main() {
     bool show_partitions = false;
     bool show_debug = false;
     bool show_logs = false;
+    auto log_show_stderr = std::make_shared<bool>(false);
     std::string status_message;
     auto last_refresh = std::chrono::steady_clock::now();
     constexpr int AUTO_REFRESH_SECONDS = 30;
@@ -192,7 +193,7 @@ int main() {
 
     // Log view (will be created dynamically based on selected job)
     auto log_component = std::make_shared<Component>(
-        ui::logView(current_job->id, [&] { show_logs = false; })
+        ui::logView(current_job->id, log_show_stderr, [&] { show_logs = false; })
     );
 
     Component interface = Container::Tab({main_content, help, partition_view}, nullptr);
@@ -253,8 +254,8 @@ int main() {
         }
         if (show_logs) {
             if (e == Event::Tab || e == Event::TabReverse) {
-                // Let the log component handle tab
-                return false;
+                *log_show_stderr = !*log_show_stderr;
+                return true;
             }
             if (e.is_character() || e == Event::Escape || e == Event::Return) {
                 show_logs = false;
@@ -308,7 +309,8 @@ int main() {
         // Logs view
         if (e == Event::Character('l') || e == Event::Character('L')) {
             if (!jobs->empty()) {
-                *log_component = ui::logView((*jobs)[selected].id, [&] { show_logs = false; });
+                *log_show_stderr = false;  // Reset to stdout
+                *log_component = ui::logView((*jobs)[selected].id, log_show_stderr, [&] { show_logs = false; });
                 show_logs = true;
             }
             return true;

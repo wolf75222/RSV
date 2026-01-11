@@ -39,13 +39,12 @@ inline std::string readLogFile(const std::string& path, int max_lines = 100) {
     return oss.str();
 }
 
-inline Component logView(const std::string& job_id, std::function<void()> on_close) {
+inline Component logView(const std::string& job_id, std::shared_ptr<bool> show_stderr, std::function<void()> on_close) {
     auto paths = api::slurm::getJobLogPaths(job_id);
     auto stdout_path = std::make_shared<std::string>(paths.first);
     auto stderr_path = std::make_shared<std::string>(paths.second);
     auto stdout_content = std::make_shared<std::string>(readLogFile(*stdout_path));
     auto stderr_content = std::make_shared<std::string>(readLogFile(*stderr_path));
-    auto show_stderr = std::make_shared<bool>(false);
 
     auto content = Renderer([=] {
         std::vector<Element> elements;
