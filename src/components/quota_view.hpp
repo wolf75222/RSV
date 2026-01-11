@@ -120,7 +120,7 @@ inline UserQuota getUserQuota() {
     return quota;
 }
 
-inline Element renderQuotaBar(int used, int max, Color color) {
+inline Element renderQuotaBar(int used, int max, Color base_color) {
     if (max <= 0) return text("N/A") | dim;
 
     float ratio = (float)used / max;
@@ -132,7 +132,7 @@ inline Element renderQuotaBar(int used, int max, Color color) {
     for (int i = 0; i < filled; i++) bar += "█";
     for (int i = filled; i < bar_width; i++) bar += "░";
 
-    Color bar_color = color;
+    Color bar_color = base_color;
     if (ratio >= 0.9) bar_color = Color::Red;
     else if (ratio >= 0.7) bar_color = Color::Yellow;
 
