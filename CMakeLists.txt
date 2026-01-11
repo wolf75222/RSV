@@ -26,7 +26,10 @@ add_executable(rsv ${SRC})
 # Compiler options (GCC/Clang only, skip on MSVC)
 if(NOT MSVC)
     target_compile_options(rsv PRIVATE -Wall -Wunused-variable -Wimplicit-fallthrough -Wextra -Wpedantic -O3)
-    target_link_options(rsv PRIVATE -static -O3)
+    # Static linking optional: use -DSTATIC_BUILD=ON if static libs are available
+    if(STATIC_BUILD)
+        target_link_options(rsv PRIVATE -static)
+    endif()
 endif()
 
 target_link_libraries(rsv
