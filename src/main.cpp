@@ -13,6 +13,8 @@
 #include "components/cluster_view.hpp"
 #include "components/debug_view.hpp"
 #include "components/log_view.hpp"
+#include "components/history_view.hpp"
+#include "components/quota_view.hpp"
 
 using namespace ftxui;
 
@@ -33,7 +35,27 @@ int main() {
     bool show_debug = false;
     bool show_logs = false;
     auto log_show_stderr = std::make_shared<bool>(false);
+    auto log_scroll_y = std::make_shared<float>(0.f);
     std::string status_message;
+
+    // Filter state
+    bool show_filter = false;
+    std::string filter_text;
+
+    // Sort state
+    int sort_mode = 0;  // 0=none, 1=id, 2=name, 3=status
+
+    // History state
+    bool show_history = false;
+
+    // Quota state
+    bool show_quota = false;
+
+    // Cancel confirmation state
+    bool show_cancel_confirm = false;
+    std::string cancel_job_id;
+    std::string cancel_job_name;
+
     auto last_refresh = std::chrono::steady_clock::now();
     constexpr int AUTO_REFRESH_SECONDS = 30;
 
@@ -192,7 +214,18 @@ int main() {
 
     // Log view (will be created dynamically based on selected job)
     auto log_component = std::make_shared<Component>(
-        ui::logView(current_job->id, log_show_stderr, [&] { show_logs = false; })
+        ui::logView(current_job->id, log_show_stderr, log_scroll_y, [&] { show_logs = false; })
+    );
+
+    // History view
+    auto history_scroll_y = std::make_shared<float>(0.f);
+    auto history_component = std::make_shared<Component>(
+        ui::historyView(history_scroll_y, [&] { show_history = false; })
+    );
+
+    // Quota view
+    auto quota_component = std::make_shared<Component>(
+        ui::quotaView([&] { show_quota = false; })
     );
 
     Component interface = Container::Tab({main_content, help, partition_view}, nullptr);
@@ -224,6 +257,50 @@ int main() {
                 (*log_component)->Render() | clear_under | center,
             });
         }
+        if (show_history) {
+            return dbox({
+                base,
+                (*history_component)->Render() | clear_under | center,
+            });
+        }
+        if (show_quota) {
+            return dbox({
+                base,
+                (*quota_component)->Render() | clear_under | center,
+            });
+        }
+        if (show_cancel_confirm) {
+            return dbox({
+                base,
+                vbox({
+                    text("") ,
+                    text("  Cancel Job Confirmation  ") | bold | color(Color::Red) | center,
+                    text(""),
+                    separator(),
+                    text(""),
+                    hbox({
+                        text("  Are you sure you want to cancel job "),
+                        text(cancel_job_id) | bold | color(Color::Magenta),
+                        text("?"),
+                    }) | center,
+                    text(""),
+                    hbox({
+                        text("  Name: "),
+                        text(cancel_job_name) | color(Color::Cyan),
+                    }) | center,
+                    text(""),
+                    separator(),
+                    text(""),
+                    hbox({
+                        text("y") | bold | color(Color::Green),
+                        text(": Yes, cancel  ") | dim,
+                        text("n/Esc") | bold | color(Color::Red),
+                        text(": No, keep job") | dim,
+                    }) | center,
+                    text(""),
+                }) | border | clear_under | center,
+            });
+        }
         return base;
     });
 
@@ -252,15 +329,38 @@ int main() {
             return false;
         }
         if (show_logs) {
-            if (e == Event::Tab || e == Event::TabReverse) {
-                *log_show_stderr = !*log_show_stderr;
+            // Let the log component handle all events (scrolling, tab, escape)
+            return (*log_component)->OnEvent(e);
+        }
+        if (show_history) {
+            // Let the history component handle all events (scrolling, escape)
+            return (*history_component)->OnEvent(e);
+        }
+        if (show_quota) {
+            // Let the quota component handle its events
+            return (*quota_component)->OnEvent(e);
+        }
+        if (show_cancel_confirm) {
+            // Handle cancel confirmation
+            if (e == Event::Character('y') || e == Event::Character('Y')) {
+                // Confirm cancel
+                if (api::slurm::cancelJob(cancel_job_id)) {
+                    status_message = "Job " + cancel_job_id + " cancelled";
+                    refresh_jobs();
+                } else {
+                    status_message = "Cancel failed";
+                }
+                show_cancel_confirm = false;
                 return true;
             }
-            if (e.is_character() || e == Event::Escape || e == Event::Return) {
-                show_logs = false;
+            if (e == Event::Character('n') || e == Event::Character('N') ||
+                e == Event::Escape || e == Event::Return) {
+                // Abort cancel
+                status_message = "Cancel aborted";
+                show_cancel_confirm = false;
                 return true;
             }
-            return false;
+            return true;  // Consume all other keys
         }
 
         // Quit
@@ -283,10 +383,14 @@ int main() {
             return true;
         }
 
-        // Cancel job
+        // Cancel job - show confirmation
         if (e == Event::Character('c') || e == Event::Character('C') ||
             e == Event::Delete) {
-            cancel_selected_job();
+            if (!jobs->empty()) {
+                cancel_job_id = (*jobs)[selected].id;
+                cancel_job_name = (*jobs)[selected].name;
+                show_cancel_confirm = true;
+            }
             return true;
         }
 
@@ -309,9 +413,82 @@ int main() {
         if (e == Event::Character('l') || e == Event::Character('L')) {
             if (!jobs->empty()) {
                 *log_show_stderr = false;  // Reset to stdout
-                *log_component = ui::logView((*jobs)[selected].id, log_show_stderr, [&] { show_logs = false; });
+                *log_scroll_y = 0.f;       // Reset scroll
+                *log_component = ui::logView((*jobs)[selected].id, log_show_stderr, log_scroll_y, [&] { show_logs = false; });
                 show_logs = true;
             }
+            return true;
+        }
+
+        // Copy job ID (y for yank)
+        if (e == Event::Character('y') || e == Event::Character('Y')) {
+            if (!jobs->empty()) {
+                std::string job_id = (*jobs)[selected].id;
+                // Use xclip/xsel on Linux, pbcopy on Mac, clip on Windows
+                #ifdef _WIN32
+                std::string cmd = "echo " + job_id + " | clip";
+                #elif __APPLE__
+                std::string cmd = "echo -n " + job_id + " | pbcopy";
+                #else
+                std::string cmd = "echo -n " + job_id + " | xclip -selection clipboard 2>/dev/null || echo -n " + job_id + " | xsel --clipboard 2>/dev/null";
+                #endif
+                system(cmd.c_str());
+                status_message = "Copied: " + job_id;
+            }
+            return true;
+        }
+
+        // Sort jobs (s cycles through sort modes)
+        if (e == Event::Character('s') || e == Event::Character('S')) {
+            sort_mode = (sort_mode + 1) % 4;
+            auto& j = *jobs;
+            switch (sort_mode) {
+                case 1:  // Sort by ID
+                    std::sort(j.begin(), j.end(), [](const api::Job& a, const api::Job& b) {
+                        return std::stoi(a.id) < std::stoi(b.id);
+                    });
+                    status_message = "Sort: ID";
+                    break;
+                case 2:  // Sort by name
+                    std::sort(j.begin(), j.end(), [](const api::Job& a, const api::Job& b) {
+                        return a.name < b.name;
+                    });
+                    status_message = "Sort: Name";
+                    break;
+                case 3:  // Sort by entry (original)
+                    std::sort(j.begin(), j.end(), [](const api::Job& a, const api::Job& b) {
+                        return a.entry_name < b.entry_name;
+                    });
+                    status_message = "Sort: Entry";
+                    break;
+                default:
+                    refresh_jobs();  // Reset to original order
+                    status_message = "Sort: Default";
+                    break;
+            }
+            // Rebuild entries
+            entries->clear();
+            for (const auto& job : *jobs)
+                entries->push_back(job.name + " (" + job.id + ")");
+            if (!jobs->empty()) {
+                selected = 0;
+                *current_job = api::slurm::getJobDetails((*jobs)[selected].id);
+            }
+            return true;
+        }
+
+        // History view (a for archive/history)
+        if (e == Event::Character('a') || e == Event::Character('A')) {
+            *history_scroll_y = 0.f;
+            *history_component = ui::historyView(history_scroll_y, [&] { show_history = false; });
+            show_history = true;
+            return true;
+        }
+
+        // Quota view (u for user quota)
+        if (e == Event::Character('u') || e == Event::Character('U')) {
+            *quota_component = ui::quotaView([&] { show_quota = false; });
+            show_quota = true;
             return true;
         }
 
