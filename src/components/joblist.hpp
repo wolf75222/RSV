@@ -60,7 +60,7 @@ inline Element emptyList(bool filtered, const std::string& error) {
         lines.push_back(text("No jobs in the queue") | dim);
         lines.push_back(text(""));
         lines.push_back(hbox({text("a") | bold | color(theme::accent()), text(" history  ") | dim,
-                              text("p") | bold | color(theme::accent()), text(" partitions") | dim}));
+                              text("p") | bold | color(theme::accent()), text(" cluster") | dim}));
     }
     return vbox(std::move(lines)) | hcenter;
 }

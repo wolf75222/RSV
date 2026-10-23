@@ -5,7 +5,7 @@
     python3 tests/screenshots.py --ssh romeo --dir '~/RSV'   # on ROMEO (built there), drawn here
 
 Needs pyte and Pillow where it runs (pip install pyte pillow), only the standard library on the remote side.
-Writes img/rsv.gif, img/history.png and img/log.png.
+Writes img/rsv.gif, img/history.png, img/log.png, img/cluster.png and img/nodes.png.
 """
 
 import argparse
@@ -47,7 +47,7 @@ def main():
     p.add_argument("--binary", help="rsv to run (default: <dir>/build/rsv)")
     p.add_argument("--out", default=os.path.join(REPO, "img"))
     p.add_argument("--cols", type=int, default=140)
-    p.add_argument("--rows", type=int, default=36)
+    p.add_argument("--rows", type=int, default=40)
     args = p.parse_args()
 
     t = Term(command(args), cols=args.cols, rows=args.rows)
@@ -78,8 +78,14 @@ def main():
     shot(1.0, "q,a", 2.0)           # history with efficiency
     shot(2.6, "j,j,j", 0.6)
     history_png = t.snapshot()
-    shot(2.6, "q,p", 1.5)           # partitions
-    shot(2.4, "q,u", 1.5)           # limits
+    shot(3.0, "q,p", 2.0)           # cluster: overview
+    cluster_png = t.snapshot()
+    shot(2.6, "2", 0.8)             # queue
+    shot(3.0, "3", 0.8)             # nodes: why down, the map
+    nodes_png = t.snapshot()
+    shot(2.6, "q,t", 1.5)           # when would it start
+    shot(2.6, "\r", 1.5)
+    shot(2.4, "\x1b,u", 2.5)        # limits, fairshare, disk
     shot(2.6, "q,?", 0.8)           # help
     shot(1.5, "q,/,s,w,e,e,p", 0.8)  # filter
     t.send("\x1b")
@@ -93,7 +99,9 @@ def main():
     save_gif(images, os.path.join(args.out, "rsv.gif"), [d for _, d in frames])
     render_png(history_png, os.path.join(args.out, "history.png"))
     render_png(log_png, os.path.join(args.out, "log.png"))
-    for name in ("rsv.gif", "history.png", "log.png"):
+    render_png(cluster_png, os.path.join(args.out, "cluster.png"))
+    render_png(nodes_png, os.path.join(args.out, "nodes.png"))
+    for name in ("rsv.gif", "history.png", "log.png", "cluster.png", "nodes.png"):
         path = os.path.join(args.out, name)
         print("%s: %d KB" % (path, os.path.getsize(path) // 1024))
 

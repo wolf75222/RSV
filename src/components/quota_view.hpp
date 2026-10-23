@@ -9,6 +9,7 @@
 #include <ftxui/dom/elements.hpp>
 
 #include "../api/slurmjobs.hpp"
+#include "../api/usage.hpp"
 #include "theme.hpp"
 
 namespace ui {
@@ -29,7 +30,9 @@ inline int taskCount(const std::string& id) {
 */
 struct QuotaView {
     std::vector<api::Assoc> assocs;
-    std::string user, error;
+    std::vector<api::Share> shares;
+    std::vector<api::DiskQuota> disks;
+    std::string user, error, disk_error;
     bool loading = true;
     std::function<void()> reload;
 
@@ -45,9 +48,9 @@ struct QuotaView {
     }
 
     Element render(int max_width, const std::vector<api::Job>& jobs) {
-        const int width = std::min(max_width, 80);
+        const int width = std::min(max_width, 90);
         const int inner = width - 4;
-        const int bar_w = std::clamp(inner - 36, 6, 30);
+        const int bar_w = std::clamp(inner - 56, 6, 24);
 
         struct Use {
             long cpus = 0, gpus = 0, nodes = 0, running = 0, submitted = 0;
@@ -115,6 +118,39 @@ struct QuotaView {
                 any = true;
             }
             if (!any) rows.push_back(text("  No limit set for you here (the QOS and partitions still have theirs)") | dim);
+
+            // Fairshare: 1 when the account used less than its share, near 0 when much more (its jobs then wait longer)
+            for (const auto& s : shares) {
+                if (s.account != a.account || s.fairshare < 0) continue;
+                const Color c = s.fairshare >= 0.5 ? theme::green() : s.fairshare >= 0.1 ? theme::yellow() : theme::red();
+                Elements line = {text("  " + util::padRight("Fairshare", 11)) | dim, bar(s.fairshare, bar_w, c),
+                                 text(" " + std::to_string(s.fairshare).substr(0, 5)) | bold};
+                if (s.raw_usage >= 0) line.push_back(text("  " + thousands(static_cast<long>(s.raw_usage / 3600)) + " CPU-hours used (decaying)") | dim);
+                rows.push_back(hbox(std::move(line)));
+            }
+        }
+
+        // Disk quotas (GPFS): space and number of files, for you and your project groups
+        if (!disks.empty() || !disk_error.empty()) {
+            rows.push_back(text(""));
+            rows.push_back(text("Disk") | bold | color(theme::cyan()));
+            if (!disk_error.empty()) rows.push_back(text("  " + disk_error) | dim);
+            for (const auto& q : disks) {
+                const double space = q.quota_kib > 0 ? q.used_kib / q.quota_kib : 0;
+                const double files = q.files_quota > 0 ? q.files / q.files_quota : 0;
+                const bool over = (q.grace != "none" && !q.grace.empty()) || (q.files_grace != "none" && !q.files_grace.empty());
+                std::string label = q.fileset + (q.type == "GRP" ? " " + q.name : "");
+                Elements line = {text("  " + util::padRight(label, 18)) | (over ? color(theme::red()) : Decorator(dim)),
+                                 bar(std::max(space, files), bar_w, usageColor(std::max(space, files))),
+                                 text(" " + util::mib(q.used_kib / 1024) + (q.quota_kib > 0 ? " / " + util::mib(q.quota_kib / 1024) : "")),
+                                 text(" · " + thousands(static_cast<long>(q.files)) +
+                                      (q.files_quota > 0 ? " / " + thousands(static_cast<long>(q.files_quota)) : "") + " files") | dim};
+                rows.push_back(hbox(std::move(line)));
+                if (over)
+                    rows.push_back(text("    over the quota: " + std::string(q.files_grace != "none" ? "files" : "space") + ", grace " +
+                                        (q.files_grace != "none" ? q.files_grace : q.grace) + " (then nothing can be written)") |
+                                   color(theme::red()));
+            }
         }
         if (loading && assocs.empty()) rows.push_back(text("Reading sacctmgr...") | dim);
         if (!error.empty()) rows.push_back(paragraph(error) | color(theme::red()));
@@ -123,7 +159,7 @@ struct QuotaView {
         rows.push_back(text(""));
         rows.push_back(text("Running counts come from your jobs in the queue now.") | dim);
         rows.push_back(hbox(keyHints({{"r", "refresh"}, {"any key", "close"}})));
-        return panel("Accounts and limits", vbox(std::move(rows)) | size(WIDTH, EQUAL, width - 2));
+        return panel("Accounts, limits and quotas", vbox(std::move(rows)) | size(WIDTH, EQUAL, width - 2));
     }
 };
 

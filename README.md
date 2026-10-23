@@ -21,13 +21,15 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 | `↑` `↓` or `j` `k` | move (`g` `G`: first, last) |
 | `l` or `Enter` | the job's log, followed as it grows (`Tab`: errors) |
 | `d` | everything `scontrol` says about the job |
+| `n` | the job's GPUs now: use and memory |
 | `c` | cancel the job (asks first) |
 | `y` | copy the job id |
 | `/` | filter |
 | `s` | sort |
 | `a` | history of 7 days, with what each job used |
-| `p` | partitions |
-| `u` | your accounts and their limits |
+| `p` | the whole cluster, live: overview, queue, nodes |
+| `t` | when would a job start? |
+| `u` | your accounts: limits, fairshare, disk quotas |
 | `?` | help |
 | `q` | quit |
 
@@ -37,7 +39,10 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 - Shows where a job runs: its nodes, with their cores (`■`) and GPUs (`●`) in use.
 - Follows the job's output live, and shows its last lines under the details.
 - History with CPU, memory and time efficiency, and a hint when a job asked for much more than it used.
-- Partitions (free nodes, CPUs and GPUs) and your accounts' limits.
+- Running jobs: CPU and memory used now, GPUs on demand. Pending ones: their priority and rank in the queue.
+- The whole cluster, live: CPUs, GPUs, load, memory and storage in use, reservations and maintenances, partitions and their rules, everyone's queue and why it waits, the nodes down and why, and a map of every node (yours marked).
+- When would a job start? Slurm's own estimate for the job you describe, without submitting it.
+- Your accounts: their limits, fairshare and disk quotas.
 - Never freezes: Slurm is asked in the background, with timeouts. Quits when the SSH connection drops.
 - Works in any terminal, over SSH too: 24-bit colors, aligned columns whatever the names, small windows.
 

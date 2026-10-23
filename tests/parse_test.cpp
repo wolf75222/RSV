@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <string>
 
+#include "api/cluster.hpp"
 #include "api/slurmjobs.hpp"
+#include "api/usage.hpp"
 #include "components/quota_view.hpp"
 #include "utils/format.hpp"
 
@@ -201,11 +203,13 @@ static void nodes() {
 
 static void partitions() {
     const std::string out =
-        "instant*|up|1:00:00|romeo-a001|idle|0/288/0/288|gpu:h100:4|gpu:h100:0(IDX:N/A)|\n"
-        "instant*|up|1:00:00|romeo-a002|mix|128/160/0/288|gpu:h100:4|gpu:h100:2(IDX:0-1)|\n"
-        "instant*|up|1:00:00|romeo-c001|drain*|0/0/192/192|(null)|gpu:0|\n"
-        "long|up|30-00:00:00|romeo-c002|alloc|192/0/0/192|(null)|gpu:0|\n";
-    const auto p = api::parsePartitions(out);
+        "instant*|up|1:00:00|romeo-a001|idle|0/288/0/288|gpu:h100:4|gpu:h100:0(IDX:N/A)|armgpu|\n"
+        "instant*|up|1:00:00|romeo-a002|mix|128/160/0/288|gpu:h100:4|gpu:h100:2(IDX:0-1)|armgpu|\n"
+        "instant*|up|1:00:00|romeo-c001|drain*|0/0/192/192|(null)|gpu:0|x64cpu|\n"
+        "long|up|30-00:00:00|romeo-c002|alloc|192/0/0/192|(null)|gpu:0|x64cpu|\n"
+        "long|up|30-00:00:00|romeo-a002|mix|128/160/0/288|gpu:h100:4|gpu:h100:2(IDX:0-1)|armgpu|\n";
+    const auto info = api::parseSinfo(out);
+    const auto& p = info.partitions;
     CHECK_EQ(p.size(), 2u);
     if (p.size() < 2) return;
     CHECK_EQ(p[0].name, std::string("instant"));
@@ -213,11 +217,56 @@ static void partitions() {
     CHECK_EQ(p[0].nodes, 3);
     CHECK_EQ(p[0].idle, 1);
     CHECK_EQ(p[0].mixed, 1);
-    CHECK_EQ(p[0].unavailable, 1);
+    CHECK_EQ(p[0].down, 1);
     CHECK_EQ(p[0].gpus_total, 8);
     CHECK_EQ(p[0].gpus_used, 2);
     CHECK_EQ(p[0].cpus_total, 768);
-    CHECK_EQ(p[1].allocated, 1);
+    CHECK_EQ(p[1].full, 1);
+
+    // romeo-a002 is in two partitions: once in the nodes, the kinds and the totals
+    CHECK_EQ(info.nodes.size(), 4u);
+    const auto types = api::nodeTypes(info.nodes);
+    CHECK_EQ(types.size(), 2u);
+    if (types.size() == 2) {
+        CHECK_EQ(types[0].features, std::string("armgpu"));
+        CHECK_EQ(types[0].prefix, std::string("romeo-a"));
+        CHECK_EQ(types[0].nodes, 2);
+        CHECK_EQ(types[0].gpus_used, 2);
+        CHECK_EQ(types[1].down, 1);
+        CHECK_EQ(types[1].cpus_alloc, 192);
+    }
+}
+
+static void queue() {
+    // Everyone's jobs: user, account, partition, state, CPUs, TRES, reason, id
+    const std::string out =
+        "alice|proj-a|short|RUNNING|128|cpu=128,mem=1500G,node=2,gres/gpu=8|None|1001|\n"
+        "alice|proj-a|short|RUNNING|64|cpu=64,mem=10G,node=1|None|1002|\n"
+        "bob|proj-b|long|RUNNING|192|cpu=192,mem=50G,node=1|None|1003|\n"
+        "bob|proj-b|long,short|PENDING|16|cpu=16,mem=64G,node=1|Resources|1004|\n"
+        "chen|proj-a|instant|PENDING|8|cpu=8,mem=16G,node=1,gres/gpu=1|QOSMaxJobsPerUserLimit|2000_[3-40%4]|\n"
+        "dana|proj-c|instant|COMPLETED|8|cpu=8|None|1005|\n";
+    const auto q = api::parseQueue(sep(out));
+    CHECK_EQ(q.running, 3);
+    CHECK_EQ(q.pending, 1 + 38);
+    CHECK_EQ(q.cpus_running, 384);
+    CHECK_EQ(q.gpus_running, 8);
+    CHECK_EQ(q.cpus_pending, 16 + 38 * 8);
+    CHECK_EQ(q.gpus_pending, 38);
+    CHECK_EQ(q.users.size(), 3u);   // dana's job ended
+    CHECK_EQ(q.by_partition.at("short").running, 2);
+    CHECK_EQ(q.by_partition.at("long").pending, 1);   // the first partition it asked for
+    CHECK_EQ(q.reasons.at("QOSMaxJobsPerUserLimit"), 38);
+    CHECK_EQ(q.reason_use.at("Resources").cpus_pending, 16);
+    // alice and bob both use 192 CPUs: alice's 8 GPUs put her first
+    CHECK_EQ(q.by_user.size(), 3u);
+    if (q.by_user.size() == 3) {
+        CHECK_EQ(q.by_user[0].name, std::string("alice"));
+        CHECK_EQ(q.by_user[0].cpus_running, 192);
+        CHECK_EQ(q.by_user[2].name, std::string("chen"));
+    }
+    CHECK_EQ(q.by_account.size(), 2u);   // proj-a (alice and chen), proj-b
+    if (!q.by_account.empty()) CHECK_EQ(q.by_account[0].pending, 38);
 }
 
 static void sacct() {
@@ -254,6 +303,125 @@ static void assocs() {
     CHECK_EQ(a[1].grp_tres.at("gres/gpu"), 60.0);
 }
 
+static void cluster_extras() {
+    // sinfo -N with load and memory: a node reserved but idle
+    const std::string out =
+        "short|up|1-00:00:00|romeo-c026|mix|120/72/0/192|(null)|gpu:0|x64cpu|9.60|400000|700000|1160629|\n"
+        "short|up|1-00:00:00|romeo-c011|alloc|192/0/0/192|(null)|gpu:0|x64cpu|185.00|900000|200000|1160629|\n";
+    const auto info = api::parseSinfo(out);
+    CHECK_EQ(info.nodes.size(), 2u);
+    if (info.nodes.size() == 2) {
+        CHECK(info.nodes[0].reservedIdle());
+        CHECK(!info.nodes[1].reservedIdle());
+        CHECK_EQ(info.nodes[1].busyCores(), 185.0);
+        CHECK_EQ(info.nodes[0].mem_total_mib, 1160629.0);
+    }
+
+    const auto down = api::parseDownReasons("GPUACheck : Not responding|slurm|2026-09-30T14:59:53|romeo-a042|drained*\n"
+                                            "a|b reason|root|2026-10-23T16:05:06|romeo-a[044-045]|drained\n");
+    CHECK_EQ(down.size(), 2u);
+    if (down.size() == 2) {
+        CHECK_EQ(down[0].reason, std::string("a|b reason"));   // newest first, a bar in the reason kept
+        CHECK_EQ(down[0].nodes, std::string("romeo-a[044-045]"));
+        CHECK_EQ(down[1].user, std::string("slurm"));
+    }
+
+    const auto resv = api::parseReservations(
+        "ReservationName=training StartTime=2026-11-05T12:30:00 EndTime=2026-11-05T17:30:00 Duration=05:00:00\n"
+        "   Nodes=romeo-a[019,021-022] NodeCnt=3 CoreCnt=864 Features=armgpu PartitionName=instant Flags=FLEX\n"
+        "   TRES=cpu=864\n   Users=(null) Groups=(null) Accounts=(null) Licenses=(null) State=INACTIVE BurstBuffer=(null)\n\n"
+        "ReservationName=maint StartTime=2026-11-01T08:00:00 EndTime=2026-11-01T18:00:00 Duration=10:00:00\n"
+        "   Nodes=ALL NodeCnt=102 CoreCnt=25152 Features=(null) PartitionName=(null) Flags=MAINT,IGNORE_JOBS\n");
+    CHECK_EQ(resv.size(), 2u);
+    if (resv.size() == 2) {
+        CHECK_EQ(resv[0].name, std::string("maint"));   // the first to start first
+        CHECK(resv[0].maintenance());
+        CHECK_EQ(resv[1].node_count, 3);
+        CHECK_EQ(resv[1].partition, std::string("instant"));
+    }
+
+    const auto ping = api::parsePing("Slurmctld(primary) at admin1 is UP\nSlurmctld(backup) at admin2 is DOWN\n");
+    CHECK_EQ(ping.size(), 2u);
+    CHECK_EQ(api::controllerState(ping), std::string("UP"));   // the backup down doesn't matter while the primary answers
+    CHECK_EQ(api::controllerState(api::parsePing("Slurmctld(primary) at admin1 is DOWN\n")), std::string("primary controller admin1 DOWN"));
+
+    const auto d = api::parseSdiag("Data since      Fri Oct 23 02:00:00 2026 (1792713600)\nJobs submitted: 1408\n"
+                                   "Main schedule statistics (microseconds):\n\tLast cycle:   61\n\tMax cycle:    242873\n"
+                                   "\tMean cycle:   1993\nMain scheduler exit:\n\tEnd of job queue:3245\nBackfilling stats\n"
+                                   "\tLast cycle: 344\n\tMax cycle:  105366\n\tMean cycle: 1152\n");
+    CHECK_EQ(d.since, static_cast<std::time_t>(1792713600));
+    CHECK_EQ(d.submitted, 1408);
+    CHECK_EQ(d.main_mean_us, 1993);
+    CHECK_EQ(d.main_max_us, 242873);
+    CHECK_EQ(d.bf_mean_us, 1152);
+
+    const auto limits = api::parsePartitionLimits(
+        "PartitionName=long AllowGroups=ALL AllowAccounts=ALL MaxNodes=UNLIMITED MaxTime=30-00:00:00 PriorityTier=1 "
+        "State=UP DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n"
+        "PartitionName=gpu AllowAccounts=proj-a,proj-b MaxNodes=4 MaxTime=1-00:00:00 PriorityTier=50 DefMemPerCPU=4000\n");
+    CHECK_EQ(limits.size(), 2u);
+    CHECK_EQ(limits.at("long").tier, 1);
+    CHECK_EQ(limits.at("gpu").max_nodes, std::string("4"));
+    CHECK_EQ(limits.at("gpu").def_mem, std::string("4000 per CPU"));
+    CHECK_EQ(limits.at("gpu").allow_accounts, std::string("proj-a,proj-b"));
+}
+
+static void usage() {
+    const auto live = api::parseSstat("900101.batch|1|307M|cpu=01:00:00,energy=0,fs/disk=1,mem=1G,pages=0,vmem=3G\n"
+                                      "900101.0|2|102400M|cpu=1-00:00:00,energy=0,mem=200G,pages=0\n");
+    CHECK_EQ(live.steps, 2);
+    CHECK_EQ(live.cpu_seconds, 3600.0 + 86400.0);
+    CHECK_EQ(live.mem_mib, 1024.0 + 200 * 1024.0);
+    CHECK_EQ(live.max_task_mib, 102400.0);
+
+    const auto prio = api::parseSprio("100|alice|short|80000|0|79999|0|0|0|1\n"
+                                      "101|demo|short|30001|0|30000|0|0|0|1\n"
+                                      "102|bob|short|50000|0|49999|0|0|0|1\n"
+                                      "103|chen|long|99999|0|99998|0|0|0|1\n");
+    const auto rank = api::rankOf(prio, "101");
+    CHECK_EQ(rank.rank, 3);   // after alice and bob, chen is in another partition
+    CHECK_EQ(rank.of, 3);
+    CHECK_EQ(rank.mine.fairshare, 30000.0);
+    CHECK_EQ(api::rankOf(prio, "999").of, 0);
+
+    const auto shares = api::parseSshare("default|demo|0.001000|0|0.000000|1.000000\nproj-a|demo|0.040000|41234567|0.612000|0.081234\n");
+    CHECK_EQ(shares.size(), 2u);
+    if (shares.size() == 2) CHECK_EQ(shares[1].fairshare, 0.081234);
+
+    const auto quotas = api::parseMmlsquota(
+        "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:blockUsage:blockQuota:blockLimit:"
+        "blockInDoubt:blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\n"
+        "mmlsquota:user:0:1:::gpfs:USR:4242:demo:3250000:104857600:110100480:0:none:98213:1000000:1500000:0:none:x:1:home:\n"
+        "mmlsquota:user:0:1:::gpfs:USR:4242:demo:23068672:104857600:110100480:0:none:1204551:1000000:1500000:0:6 days:x:2:scratch:\n");
+    CHECK_EQ(quotas.size(), 2u);
+    if (quotas.size() == 2) {
+        CHECK_EQ(quotas[0].fileset, std::string("home"));
+        CHECK_EQ(quotas[0].quota_kib, 104857600.0);
+        CHECK_EQ(quotas[1].files, 1204551.0);
+        CHECK_EQ(quotas[1].files_grace, std::string("6 days"));
+    }
+
+    const auto ok = api::parseTestOnly("sbatch: Job 781504 to start at 2026-10-24T00:31:35 using 2 processors on nodes romeo-a[049-050] in partition short\n");
+    CHECK(ok.ok);
+    CHECK_EQ(ok.nodes, std::string("romeo-a[049-050]"));
+    CHECK_EQ(ok.partition, std::string("short"));
+    CHECK_EQ(ok.cpus, 2);
+    CHECK(ok.start > 0);
+    const auto no = api::parseTestOnly("sbatch: error: Constraint is missing: use option --constraint=<feature>\nallocation failure: Unspecified error\n");
+    CHECK(!no.ok);
+    CHECK_EQ(no.message, std::string("Constraint is missing: use option --constraint=<feature> · allocation failure: Unspecified error"));
+
+    const auto gpus = api::parseNvidiaSmi("0: 0, NVIDIA GH200 120GB, 97, 70123, 97871\n1: 3, NVIDIA GH200 120GB, 2, 512, 97871\n",
+                                          {"romeo-a012", "romeo-a013"});
+    CHECK_EQ(gpus.size(), 2u);
+    if (gpus.size() == 2) {
+        CHECK_EQ(gpus[1].node, std::string("romeo-a013"));
+        CHECK_EQ(gpus[1].index, 3);
+        CHECK_EQ(gpus[0].util, 97.0);
+        CHECK_EQ(gpus[0].mem_total_mib, 97871.0);
+    }
+}
+
 int main() {
     durations();
     widths();
@@ -262,8 +430,11 @@ int main() {
     details();
     nodes();
     partitions();
+    queue();
     sacct();
     assocs();
+    cluster_extras();
+    usage();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

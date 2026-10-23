@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,14 +24,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "api/cluster.hpp"
 #include "api/slurmjobs.hpp"
+#include "api/usage.hpp"
 #include "components/cluster_view.hpp"
 #include "components/debug_view.hpp"
 #include "components/footer.hpp"
+#include "components/gpu_view.hpp"
 #include "components/history_view.hpp"
 #include "components/jobdetails.hpp"
 #include "components/joblist.hpp"
 #include "components/log_view.hpp"
+#include "components/plan_view.hpp"
 #include "components/quota_view.hpp"
 #include "components/theme.hpp"
 #include "components/title.hpp"
@@ -224,7 +229,8 @@ public:
         gethostname(host, sizeof host - 1);
         who_ = user_ + "@" + std::string(host).substr(0, std::string(host).find('.'));
         history_.reload = [this] { loadHistory(); };
-        partitions_.reload = [this] { loadPartitions(); };
+        cluster_.reload = [this] { loadCluster(false); };
+        cluster_.refresh_seconds = opts_.refresh;
         quota_.reload = [this] { loadQuota(); };
         quota_.user = user_;
     }
@@ -243,6 +249,8 @@ public:
         const auto now = Clock::now();
         if (!refreshing_ && now - last_refresh_ >= std::chrono::seconds(opts_.refresh)) refresh();
         if (view_ == View::Logs && logs_.follow && !log_loading_ && now - last_log_read_ >= std::chrono::seconds(2)) loadLog();
+        if (view_ == View::Partitions && !cluster_.loading && now - cluster_time_ >= std::chrono::seconds(opts_.refresh))
+            loadCluster(false);
         if (view_ == View::None) requestPreview();
         if (!message_.empty() && now > message_until_) {
             message_.clear();
@@ -255,7 +263,7 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
-    enum class View { None, Help, Logs, Debug, History, Partitions, Quota, Cancel };
+    enum class View { None, Help, Logs, Debug, History, Partitions, Quota, Cancel, Gpu, Plan };
 
     // ---------------------------------------------------------------- threads
 
@@ -273,6 +281,10 @@ private:
             api::Fetched<std::vector<api::Job>> r;
             try {
                 r = api::fetchJobs(user);
+                if (!r.error.empty()) {
+                    const std::string controller = api::controllerProblem();
+                    if (!controller.empty()) r.error += " · " + controller;
+                }
             } catch (const std::exception& e) {
                 r.error = std::string("squeue: ") + e.what();
             }
@@ -304,6 +316,8 @@ private:
         prune(details_time_);
         prune(previews_);
         prune(preview_time_);
+        prune(live_);
+        prune(ranks_);
         requestDetails(false);
     }
 
@@ -323,7 +337,9 @@ private:
 
         const uint64_t generation = ++details_generation_;
         const bool active = j->active();
-        slurm_.post([this, id, generation, active] {
+        const bool pending = j->pending();
+        const std::string shown_id = j->id;
+        slurm_.post([this, id, shown_id, generation, active, pending] {
             // Moving fast through the list: only the job where it stops is read
             if (generation != details_generation_) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -331,14 +347,26 @@ private:
 
             api::Fetched<api::JobDetails> d;
             api::Fetched<std::vector<api::NodeInfo>> n;
+            api::Fetched<api::LiveUse> live;
+            api::Rank rank;
             try {
                 d = api::fetchDetails(id);
                 const std::string list = d.data.get("NodeList");
                 if (d.error.empty() && active && !list.empty() && list != "(null)") n = api::fetchNodes(list);
+                if (active) live = api::fetchLiveUse(id);
+                if (pending) {
+                    const auto all = api::fetchPriorities();
+                    rank = api::rankOf(all.data, id);
+                    if (rank.of == 0) rank = api::rankOf(all.data, shown_id);
+                }
             } catch (const std::exception& e) {
                 d.error = std::string("scontrol: ") + e.what();
             }
-            post([this, id, d = std::move(d), n = std::move(n)]() mutable {
+            post([this, id, d = std::move(d), n = std::move(n), live = std::move(live), rank]() mutable {
+                if (live.error.empty() && live.data.steps > 0) live_[id] = live.data;
+                else live_.erase(id);
+                if (rank.of > 0) ranks_[id] = rank;
+                else ranks_.erase(id);
                 details_time_[id] = Clock::now();   // an error too: asked again at the next refresh, not in a loop
                 if (details_pending_ == id) details_pending_.clear();
                 if (!d.error.empty()) {
@@ -422,21 +450,39 @@ private:
         });
     }
 
-    void loadPartitions() {
-        partitions_.loading = true;
-        slurm_.post([this] {
-            api::Fetched<std::vector<api::Partition>> r;
+    // `opening`: sdiag and the partition rules too, which change slowly
+    void loadCluster(bool opening) {
+        cluster_.loading = true;
+        cluster_time_ = Clock::now();
+        slurm_.post([this, opening] {
+            api::Fetched<api::Cluster> r;
+            api::Fetched<api::ClusterExtra> extra;
             try {
-                r = api::fetchPartitions();
+                r = api::fetchCluster();
+                if (opening) extra = api::fetchClusterExtra();
             } catch (const std::exception& e) {
                 r.error = std::string("sinfo: ") + e.what();
             }
-            post([this, r = std::move(r)]() mutable {
-                partitions_.loading = false;
-                partitions_.error = r.error;
-                if (r.error.empty()) partitions_.partitions = std::move(r.data);
+            post([this, opening, r = std::move(r), extra = std::move(extra)]() mutable {
+                cluster_.loading = false;
+                cluster_.error = r.error;
+                cluster_.data.ping = r.data.ping;
+                if (r.error.empty()) {
+                    cluster_.data = std::move(r.data);
+                    cluster_.updated = std::time(nullptr);
+                }
+                if (opening) cluster_.extra = std::move(extra.data);
             });
         });
+    }
+
+    // The nodes the user's jobs run on, marked in the cluster view
+    std::set<std::string> myNodes() const {
+        std::set<std::string> out;
+        for (const auto& j : jobs_)
+            if (j.active())
+                for (const auto& h : api::expandHostlist(j.nodelist)) out.insert(h);
+        return out;
     }
 
     void loadQuota() {
@@ -444,17 +490,94 @@ private:
         refresh();
         slurm_.post([this, user = user_] {
             api::Fetched<std::vector<api::Assoc>> r;
+            api::Fetched<std::vector<api::Share>> shares;
+            api::Fetched<std::vector<api::DiskQuota>> disks;
             try {
                 r = api::fetchAssocs(user);
+                shares = api::fetchShares(user);
+                disks = api::fetchDiskQuotas(user);
             } catch (const std::exception& e) {
                 r.error = std::string("sacctmgr: ") + e.what();
             }
-            post([this, r = std::move(r)]() mutable {
+            post([this, r = std::move(r), shares = std::move(shares), disks = std::move(disks)]() mutable {
                 quota_.loading = false;
                 quota_.error = r.error;
                 if (r.error.empty()) quota_.assocs = std::move(r.data);
+                quota_.shares = std::move(shares.data);
+                quota_.disks = std::move(disks.data);
+                quota_.disk_error = disks.error;
             });
         });
+    }
+
+    // GPUs of a running job: nvidia-smi in the job itself, only when asked (n)
+    void openGpus(const api::Job& j) {
+        gpu_ = ui::GpuView{};
+        gpu_.title = "GPUs · job " + j.id;
+        const std::string id = j.job_id, nodelist = j.nodelist;
+        const int per_node = j.nodes > 0 ? j.gpus / j.nodes : j.gpus;
+        gpu_.reload = [this, id, nodelist, per_node] {
+            slurm_.post([this, id, nodelist, per_node] {
+                api::Fetched<std::vector<api::GpuUse>> r;
+                try {
+                    r = api::fetchGpus(id, nodelist, per_node);
+                } catch (const std::exception& e) {
+                    r.error = std::string("srun: ") + e.what();
+                }
+                post([this, r = std::move(r)]() mutable {
+                    gpu_.loading = false;
+                    gpu_.gpus = std::move(r.data);
+                    gpu_.error = r.error;
+                });
+            });
+        };
+        view_ = View::Gpu;
+        gpu_.reload();
+    }
+
+    // When would a job start (t): the form starts from the user's accounts, the partitions and the kinds of nodes
+    void openPlan() {
+        view_ = View::Plan;
+        plan_.result = api::TestRun{};
+        plan_.running = false;
+        plan_.run = [this](const api::TestRequest& q) {
+            slurm_.post([this, q] {
+                api::TestRun t;
+                try {
+                    t = api::testOnly(q);
+                } catch (const std::exception& e) {
+                    t.message = std::string("sbatch: ") + e.what();
+                }
+                post([this, t] {
+                    plan_.running = false;
+                    plan_.result = t;
+                });
+            });
+        };
+        slurm_.post([this, user = user_] {
+            std::vector<std::string> accounts, partitions, features;
+            try {
+                for (const auto& a : api::fetchAssocs(user).data)
+                    if (a.max_submit != 0 && a.max_jobs != 0 &&
+                        std::find(accounts.begin(), accounts.end(), a.account) == accounts.end())
+                        accounts.push_back(a.account);
+                const api::RunResult info = api::run({"sinfo", "-h", "-o", "%P|%f"}, 15);
+                for (const auto& line : util::lines(info.out)) {
+                    const auto f = util::split(line, '|');
+                    if (f.size() < 2) continue;
+                    std::string p = util::trim(f[0]);
+                    if (!p.empty() && p.back() == '*') p.pop_back();
+                    if (!p.empty() && std::find(partitions.begin(), partitions.end(), p) == partitions.end()) partitions.push_back(p);
+                    for (const auto& feature : util::split(util::trim(f[1]), ','))
+                        if (!feature.empty() && feature != "(null)" && feature != "N/A" &&
+                            std::find(features.begin(), features.end(), feature) == features.end())
+                            features.push_back(feature);
+                }
+            } catch (const std::exception&) {
+            }
+            post([this, accounts, partitions, features] { plan_.setChoices(accounts, partitions, features); });
+        });
+        if (plan_.fields.empty()) plan_.setChoices({}, {}, {});
     }
 
     void cancelSelected() {
@@ -631,6 +754,8 @@ private:
     std::atomic<uint64_t> details_generation_{0};
     std::string details_pending_;                               // the job whose details were asked last, until they come
     std::map<std::string, ui::LogData> previews_;              // the end of each job's output
+    std::map<std::string, api::LiveUse> live_;                  // what a running job uses now (sstat)
+    std::map<std::string, api::Rank> ranks_;                    // a pending job's place in the queue (sprio)
     std::map<std::string, Clock::time_point> preview_time_;
 
     std::string selected_id_;
@@ -650,8 +775,11 @@ private:
     std::string debug_job_;
     ui::HistoryView history_;
     Clock::time_point history_time_ = Clock::now();
-    ui::PartitionsView partitions_;
+    ui::ClusterView cluster_;
+    Clock::time_point cluster_time_ = Clock::now();
     ui::QuotaView quota_;
+    ui::GpuView gpu_;
+    ui::PlanView plan_;
     api::Job cancel_;
     uint64_t log_generation_ = 0;
     bool log_loading_ = false;
@@ -730,7 +858,10 @@ Element Viewer::render() {
     if (job) {
         details_title = "Job " + job->id;
         const auto err = details_error_.find(job->job_id);
-        info = ui::jobDetails(*job, detailsFor(*job), nodes_, liveUsed(*job), details_w - 4,
+        const auto live = live_.find(job->job_id);
+        const auto rank = ranks_.find(job->job_id);
+        info = ui::jobDetails(*job, detailsFor(*job), nodes_, liveUsed(*job), live == live_.end() ? nullptr : &live->second,
+                              rank == ranks_.end() ? nullptr : &rank->second, details_w - 4,
                               err == details_error_.end() ? "" : err->second);
     } else if (!jobs_error_.empty() && jobs_time_ == 0) {
         info = {paragraph(jobs_error_) | color(ui::theme::red())};
@@ -792,8 +923,10 @@ Element Viewer::render() {
         case View::Logs: over = logs_.render(ow, oh); break;
         case View::Debug: over = debug_.render(std::min(W - 2, 120), oh); break;
         case View::History: over = history_.render(std::min(W - 2, 130), oh); break;
-        case View::Partitions: over = partitions_.render(W - 2); break;
+        case View::Partitions: over = cluster_.render(std::min(W - 2, 140), oh, myNodes()); break;
         case View::Quota: over = quota_.render(W - 2, jobs_); break;
+        case View::Gpu: over = gpu_.render(W - 2); break;
+        case View::Plan: over = plan_.render(W - 2); break;
         case View::Cancel: {
             Elements lines = {
                 hbox({text("Cancel job "), text(cancel_.id) | bold, text(" ?")}),
@@ -860,8 +993,10 @@ bool Viewer::viewEvent(Event& e) {
         case View::Logs: handled = logs_.onEvent(e, close); break;
         case View::Debug: handled = debug_.onEvent(e, close); break;
         case View::History: handled = history_.onEvent(e, close); break;
-        case View::Partitions: handled = partitions_.onEvent(e, close); break;
+        case View::Partitions: handled = cluster_.onEvent(e, close); break;
         case View::Quota: handled = quota_.onEvent(e, close); break;
+        case View::Gpu: handled = gpu_.onEvent(e, close); break;
+        case View::Plan: handled = plan_.onEvent(e, close); break;
         case View::Cancel:
             if (e == Event::Character('y') || e == Event::Character('Y')) {
                 cancelSelected();
@@ -930,10 +1065,13 @@ bool Viewer::mainEvent(Event& e) {
             loadHistory();
     } else if (e == Event::Character('p')) {
         view_ = View::Partitions;
-        loadPartitions();
+        cluster_.offset = 0;
+        loadCluster(true);
     } else if (e == Event::Character('u')) {
         view_ = View::Quota;
         loadQuota();
+    } else if (e == Event::Character('t')) {
+        openPlan();
     } else if (!job) {
         return e.is_character();
     } else if (e == Event::Character('l') || e == Event::Return) openLogs(*job);
@@ -943,6 +1081,9 @@ bool Viewer::mainEvent(Event& e) {
         const auto [out, err] = ui::logPaths(*job, detailsFor(*job));
         if (out.empty()) showMessage("No output file known for job " + job->id, true);
         else copy(out, "path");
+    } else if (e == Event::Character('n')) {
+        if (!job->active() || job->gpus == 0) showMessage("n shows the GPUs of a running job that has some", true);
+        else openGpus(*job);
     } else if (e == Event::Character('c') || e == Event::Delete) {
         if (job->finished()) {
             showMessage("Job " + job->id + " has already ended", true);

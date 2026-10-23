@@ -20,8 +20,8 @@ inline Element footer(int width, const std::string& message, bool message_is_err
                                     color(message_is_error ? theme::red() : theme::green())});
 
     static const std::vector<std::pair<std::string, std::string>> keys = {
-        {"?", "help"}, {"q", "quit"}, {"l", "log"}, {"c", "cancel"}, {"/", "filter"}, {"a", "history"},
-        {"d", "details"}, {"p", "partitions"}, {"u", "limits"}, {"s", "sort"}, {"y", "copy id"}, {"r", "refresh"}};
+        {"?", "help"}, {"q", "quit"}, {"l", "log"}, {"p", "cluster"}, {"c", "cancel"}, {"/", "filter"}, {"a", "history"},
+        {"t", "start time"}, {"u", "limits"}, {"d", "details"}, {"n", "GPUs"}, {"s", "sort"}, {"y", "copy id"}, {"r", "refresh"}};
     Elements hints = {text(" ")};
     int used = 1;
     for (const auto& [k, l] : keys) {
@@ -53,13 +53,15 @@ inline Element helpView(int max_width, int refresh_seconds) {
         title("Selected job"),
         row("l", "its log, followed as it grows (Tab: errors)"),
         row("d", "everything scontrol says about it"),
+        row("n", "its GPUs now: use and memory (nvidia-smi in the job)"),
         row("c", "cancel it (asks first)"),
         row("y  Y", "copy its id, or its output path"),
         text(""),
         title("Views"),
+        row("p", "the cluster: overview, queue, nodes (Tab between them)"),
+        row("t", "when would a job start? (sbatch --test-only)"),
         row("a", "history of the last 7 days, with CPU and memory used"),
-        row("p", "partitions: free nodes, CPUs and GPUs"),
-        row("u", "your accounts and their limits"),
+        row("u", "your accounts: limits, fairshare, disk quotas"),
         text(""),
         title("Other"),
         row("r", "refresh now (every " + std::to_string(refresh_seconds) + " s otherwise)"),

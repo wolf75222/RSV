@@ -79,6 +79,16 @@ inline Color efficiencyColor(double ratio) {
     return ratio < 0.3 ? theme::red() : ratio < 0.7 ? theme::yellow() : theme::green();
 }
 
+// 25152 -> "25 152"
+inline std::string thousands(long n) {
+    std::string digits = std::to_string(n < 0 ? -n : n), out;
+    for (size_t i = 0; i < digits.size(); i++) {
+        if (i > 0 && (digits.size() - i) % 3 == 0) out += ' ';
+        out += digits[i];
+    }
+    return n < 0 ? "-" + out : out;
+}
+
 inline std::string percent(double ratio) {
     if (ratio < 0) return "-";
     return std::to_string(static_cast<int>(ratio * 100 + 0.5)) + "%";

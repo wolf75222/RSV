@@ -30,7 +30,7 @@ inline ReasonInfo decodeReason(const std::string& full) {
         {"NodeDown", {"A node it needs is down", "Wait, or remove --nodelist"}},
         {"PartitionDown", {"The partition is down", "Wait, or use another partition"}},
         {"PartitionInactive", {"The partition is inactive", "Use another partition"}},
-        {"PartitionTimeLimit", {"--time is over the partition's limit", "Lower --time or change partition (p: limits)"}},
+        {"PartitionTimeLimit", {"--time is over the partition's limit", "Lower --time or change partition (p shows their limits)"}},
         {"PartitionNodeLimit", {"Too many nodes for this partition", "Lower --nodes or change partition"}},
         {"PartitionConfig", {"Not allowed in this partition", "Check --partition and --account"}},
         {"BadConstraints", {"No node matches --constraint", "On ROMEO: --constraint=x64cpu or armgpu"}},

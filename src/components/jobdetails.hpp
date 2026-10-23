@@ -8,6 +8,7 @@
 #include <ftxui/dom/elements.hpp>
 
 #include "../api/slurmjobs.hpp"
+#include "../api/usage.hpp"
 #include "nodedetails.hpp"
 #include "reason_decoder.hpp"
 #include "theme.hpp"
@@ -55,11 +56,19 @@ inline std::pair<std::string, std::string> logPaths(const api::Job& j, const api
     return {out, err};
 }
 
+inline std::string ordinal(int n) {
+    const int last2 = n % 100, last = n % 10;
+    const char* suffix = (last2 >= 11 && last2 <= 13) ? "th" : last == 1 ? "st" : last == 2 ? "nd" : last == 3 ? "rd" : "th";
+    return std::to_string(n) + suffix;
+}
+
 /* The details panel, as lines (the panel scrolls)
 - `used` is the run time now: squeue's value plus the time since it was read
+- `live`: what the running steps use now (sstat), `rank`: the job's place among the pending jobs (sprio)
 */
 inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const std::map<std::string, api::NodeInfo>& nodes,
-                           long used, int width, const std::string& details_error) {
+                           long used, const api::LiveUse* live, const api::Rank* rank, int width,
+                           const std::string& details_error) {
     const std::time_t now = std::time(nullptr);
     const int value_width = std::max(10, width - 11);
     auto value = [&](const std::string& s) { return text(util::cut(s, static_cast<size_t>(value_width))); };
@@ -89,6 +98,16 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
                                       text("  " + util::duration(used) + " / " + util::duration(j.limit)) | dim})));
     }
 
+    // Live: the CPU time of the running steps over the time reserved so far, and their memory now
+    if (j.active() && live && used > 0 && j.cpus > 0) {
+        const double cpu = live->cpu_seconds / (double(used) * j.cpus);
+        Elements line = {text("CPU ") | dim, text(percent(cpu)) | bold | color(efficiencyColor(cpu)),
+                         text(" busy · memory ") | dim, text(util::mib(live->mem_mib)) | bold};
+        if (j.mem_mib > 0) line.push_back(text(" of " + util::mib(j.mem_mib)) | dim);
+        if (live->max_task_mib > 0) line.push_back(text(" · max task " + util::mib(live->max_task_mib)) | dim);
+        out.push_back(field("Now", hbox(std::move(line))));
+    }
+
     if (j.pending()) {
         const ui::ReasonInfo info = decodeReason(j.reason);
         out.push_back(field("Reason", value(j.reason) | color(theme::yellow())));
@@ -99,6 +118,23 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
         else
             out.push_back(field("Starts", text("not estimated yet") | dim));
         if (!j.dependency.empty()) out.push_back(field("Depends", value(j.dependency)));
+        if (rank && rank->of > 0) {
+            // Its place in its partition, and what its priority is made of (only the factors that count)
+            std::string parts;
+            auto add = [&](const char* name, double v) {
+                if (v > 0) parts += (parts.empty() ? "" : " · ") + std::string(name) + " " + std::to_string(static_cast<long>(v + 0.5));
+            };
+            add("fairshare", rank->mine.fairshare);
+            add("age", rank->mine.age);
+            add("partition", rank->mine.partition_factor);
+            add("size", rank->mine.jobsize);
+            add("QOS", rank->mine.qos);
+            add("site", rank->mine.site);
+            out.push_back(field("Priority", hbox({text(std::to_string(static_cast<long>(rank->mine.priority + 0.5))) | bold,
+                                                  text("  " + ordinal(rank->rank) + " of " + std::to_string(rank->of) + " waiting in " +
+                                                       rank->mine.partition) | color(rank->rank <= 3 ? theme::green() : theme::yellow())})));
+            if (!parts.empty()) out.push_back(field("", text(util::cut(parts, static_cast<size_t>(value_width))) | dim));
+        }
     }
 
     // The constraint (armgpu, x64cpu on ROMEO) comes with scontrol's details

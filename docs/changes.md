@@ -25,7 +25,12 @@
 - Log viewer that follows the file like `tail -f`, the last lines of the output under the details.
 - History with CPU, memory and time efficiency, and a hint when a job asked for much more than it used.
 - Filter (`/`), sorts by state, newest, name or time left, vim keys, the mouse wheel moves through the list.
-- Partitions with CPUs and GPUs in use, limits for every account (on ROMEO "default" allows no job: it says so).
+- Cluster view in three tabs, refreshed while open: overview (CPUs, GPUs, load, memory, storage, nodes, Slurm's controller and scheduler, reservations and maintenances, partitions and their rules, kinds of nodes), queue (everyone's jobs, why they wait and what they ask for, main users or accounts), nodes (why they are down, a map of every node with the reserved but idle cores and your jobs' nodes marked, or a table with load and memory).
+- When would a job start? (`t`): `sbatch --test-only` from a small form, nothing is submitted.
+- Live CPU and memory of a running job (`sstat`), its GPUs on demand (`n`: `nvidia-smi` through `srun --overlap`), the priority and rank of a pending job (`sprio`).
+- Fairshare, CPU-hours used and disk quotas (user and project groups) in the limits view.
+- When `squeue` fails, `scontrol ping` says whether the controller answers.
+- Limits for every account (on ROMEO "default" allows no job: it says so).
 - Copy through the terminal (OSC 52), works over SSH.
 - `install.sh`: builds with cmake from Spack and installs to `~/.local/bin`. `deploy.sh` (build elsewhere and copy) is gone.
 
