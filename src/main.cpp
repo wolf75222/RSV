@@ -1,500 +1,1003 @@
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/screen/terminal.hpp>
+
 #include <algorithm>
-#include <memory>
-#include <chrono>
-#include <thread>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <poll.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "api/slurmjobs.hpp"
-#include "components/jobdetails.hpp"
-#include "components/nodedetails.hpp"
-#include "components/title.hpp"
-#include "components/footer.hpp"
 #include "components/cluster_view.hpp"
 #include "components/debug_view.hpp"
-#include "components/log_view.hpp"
+#include "components/footer.hpp"
 #include "components/history_view.hpp"
+#include "components/jobdetails.hpp"
+#include "components/joblist.hpp"
+#include "components/log_view.hpp"
 #include "components/quota_view.hpp"
+#include "components/theme.hpp"
+#include "components/title.hpp"
 
 using namespace ftxui;
 
-int main() {
-    auto jobs = std::make_shared<std::vector<api::Job>>(api::slurm::getUserJobs());
-    if (jobs->empty()) {
-        std::cout << "No jobs found for current user\n";
-        return 0;
+namespace {
+
+constexpr const char* VERSION = "2.0.0";
+
+/* Colors
+- FTXUI decides between 24 bit and 256 colors itself, when its loop starts. TERM=xterm-256color makes it
+  pick 256 colors before it looks at anything else, and over SSH nothing else reaches ROMEO anyway
+  (COLORTERM and TERM_PROGRAM aren't forwarded).
+- So RSV picks 24 bit colors, which nearly every terminal used to reach ROMEO has: the theme's RGB colors
+  stay as they are instead of being rounded to the 256 palette.
+- Except: NO_COLOR (no colors), the Linux console and old GNU screen (FTXUI's choice), Apple's Terminal
+  before macOS 26 when run on the Mac (256)
+- --color or RSV_COLOR forces a mode: truecolor, 256, 16, or auto (FTXUI's choice)
+*/
+std::optional<Terminal::Color> chooseColors(std::string mode) {
+    if (mode.empty())
+        if (const char* env = std::getenv("RSV_COLOR"); env && *env) mode = env;
+    mode = util::lower(mode);
+
+    if (mode == "truecolor" || mode == "24bit" || mode == "24-bit") return Terminal::Color::TrueColor;
+    if (mode == "256") return Terminal::Color::Palette256;
+    if (mode == "16") return Terminal::Color::Palette16;
+    if (mode == "auto") return std::nullopt;
+
+    auto env = [](const char* name) {
+        const char* v = std::getenv(name);
+        return util::lower(v ? v : "");
+    };
+    if (!env("NO_COLOR").empty()) return std::nullopt;
+    const std::string term = env("TERM");
+    if (term.empty() || term == "dumb" || term == "linux" || term == "vt100" || term == "vt220") return std::nullopt;
+    if (util::startsWith(term, "screen") && env("TMUX").empty()) return Terminal::Color::Palette256;
+    if (env("TERM_PROGRAM").find("apple_terminal") != std::string::npos) return Terminal::Color::Palette256;
+    return Terminal::Color::TrueColor;
+}
+
+// Runs tasks one after the other on its own thread. A task that throws is dropped, the thread goes on.
+class Worker {
+public:
+    Worker() : thread_([this] { loop(); }) {}
+    Worker(const Worker&) = delete;
+    Worker& operator=(const Worker&) = delete;
+    ~Worker() { stop(); }
+
+    void post(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_) return;
+            tasks_.push_back(std::move(task));
+        }
+        cv_.notify_one();
     }
 
-    auto entries = std::make_shared<std::vector<std::string>>();
-    for (const auto& job : *jobs)
-        entries->push_back(job.name + " (" + job.id + ")");
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+            tasks_.clear();
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
 
-    int selected = 0;
-    bool show_help = false;
-    bool show_partitions = false;
-    bool show_debug = false;
-    bool show_logs = false;
-    auto log_show_stderr = std::make_shared<bool>(false);
-    auto log_scroll_y = std::make_shared<float>(0.f);
-    std::string status_message;
+private:
+    void loop() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [&] { return stop_ || !tasks_.empty(); });
+                if (stop_) return;
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            try {
+                task();
+            } catch (...) {
+            }
+        }
+    }
 
-    // Sort state
-    int sort_mode = 0;  // 0=none, 1=id, 2=name, 3=status
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> tasks_;
+    bool stop_ = false;
+    std::thread thread_;   // last: started once the rest is ready
+};
 
-    // History state
-    bool show_history = false;
+std::string base64(const std::string& in) {
+    static const char* chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, bits = -6;
+    for (unsigned char c : in) {
+        val = (val << 8) + c;
+        bits += 8;
+        while (bits >= 0) {
+            out.push_back(chars[(val >> bits) & 0x3F]);
+            bits -= 6;
+        }
+    }
+    if (bits > -6) out.push_back(chars[((val << 8) >> (bits + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
 
-    // Quota state
-    bool show_quota = false;
+struct Options {
+    int refresh = 15;
+    std::string color;
+    bool mouse = true;
+};
 
-    // Cancel confirmation state
-    bool show_cancel_confirm = false;
-    std::string cancel_job_id;
-    std::string cancel_job_name;
+const char* USAGE =
+    "Usage: rsv [options]\n"
+    "  A terminal viewer of your Slurm jobs: where they run, their logs, why they wait, what they used.\n"
+    "\n"
+    "  --refresh N       read the queue every N seconds (default 15, at least 5)\n"
+    "  --color MODE      truecolor, 256, 16 or auto (default: truecolor, see docs/terminals.md)\n"
+    "  --no-mouse        leave the mouse to the terminal (select text with it)\n"
+    "  -V, --version     print the version\n"
+    "  -h, --help        print this help\n"
+    "\n"
+    "  The same as environment variables: RSV_REFRESH, RSV_COLOR, RSV_MOUSE=0\n"
+    "  Keys: ? in RSV. The project: https://github.com/wolf75222/RSV\n";
 
-    auto last_refresh = std::chrono::steady_clock::now();
-    constexpr int AUTO_REFRESH_SECONDS = 30;
+// The command line, over the environment variables
+std::optional<Options> parseOptions(int argc, char* argv[], int& exit_code) {
+    Options o;
+    if (const char* v = std::getenv("RSV_REFRESH"); v && *v) o.refresh = static_cast<int>(util::toLong(v, 15));
+    if (const char* v = std::getenv("RSV_MOUSE"); v && std::string(v) == "0") o.mouse = false;
 
-    auto current_job = std::make_shared<api::DetailedJob>(api::slurm::getJobDetails((*jobs)[selected].id));
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        auto value = [&](const std::string& name) -> std::optional<std::string> {
+            if (util::startsWith(a, name + "=")) return a.substr(name.size() + 1);
+            if (a == name && i + 1 < argc) return std::string(argv[++i]);
+            return std::nullopt;
+        };
+        if (a == "-h" || a == "--help") {
+            std::cout << USAGE;
+            exit_code = 0;
+            return std::nullopt;
+        }
+        if (a == "-V" || a == "--version") {
+            std::cout << "rsv " << VERSION << "\n";
+            exit_code = 0;
+            return std::nullopt;
+        }
+        if (a == "--no-mouse") {
+            o.mouse = false;
+        } else if (auto v = value("--refresh")) {
+            o.refresh = static_cast<int>(util::toLong(*v, -1));
+            if (o.refresh <= 0) {
+                std::cerr << "rsv: --refresh needs a number of seconds\n";
+                exit_code = 2;
+                return std::nullopt;
+            }
+        } else if (auto c = value("--color")) {
+            o.color = *c;
+        } else {
+            std::cerr << "rsv: unknown option " << a << "\n\n" << USAGE;
+            exit_code = 2;
+            return std::nullopt;
+        }
+    }
+    o.refresh = std::max(5, o.refresh);
+    return o;
+}
 
-    ScreenInteractive screen = ScreenInteractive::Fullscreen();
+/* The application: its state lives on the UI thread
+- Slurm commands run on the `slurm` worker, log files are read on the `files` one: the UI never waits for them
+- A worker gives its result back with post(), which runs it on the UI thread and redraws
+*/
+class Viewer {
+public:
+    Viewer(ScreenInteractive& screen, Options opts) : screen_(screen), opts_(std::move(opts)) {
+        user_ = api::currentUser();
+        char host[256] = {0};
+        gethostname(host, sizeof host - 1);
+        who_ = user_ + "@" + std::string(host).substr(0, std::string(host).find('.'));
+        history_.reload = [this] { loadHistory(); };
+        partitions_.reload = [this] { loadPartitions(); };
+        quota_.reload = [this] { loadQuota(); };
+        quota_.user = user_;
+    }
 
-    // Refresh function
-    auto refresh_jobs = [&]() {
-        *jobs = api::slurm::getUserJobs();
-        entries->clear();
-        for (const auto& job : *jobs)
-            entries->push_back(job.name + " (" + job.id + ")");
+    void start() { refresh(); }
 
-        if (jobs->empty()) {
-            status_message = "No jobs";
+    // Stops the workers (and the commands they run) before the rest of the Viewer goes away
+    void stop() {
+        api::stopping() = true;
+        slurm_.stop();
+        files_.stop();
+    }
+
+    // Called every 250 ms by the timer thread, on the UI thread
+    void tick() {
+        const auto now = Clock::now();
+        if (!refreshing_ && now - last_refresh_ >= std::chrono::seconds(opts_.refresh)) refresh();
+        if (view_ == View::Logs && logs_.follow && !log_loading_ && now - last_log_read_ >= std::chrono::seconds(2)) loadLog();
+        if (view_ == View::None) requestPreview();
+        if (!message_.empty() && now > message_until_) {
+            message_.clear();
+            screen_.PostEvent(Event::Custom);
+        }
+    }
+
+    Element render();
+    bool onEvent(Event e);
+
+private:
+    using Clock = std::chrono::steady_clock;
+    enum class View { None, Help, Logs, Debug, History, Partitions, Quota, Cancel };
+
+    // ---------------------------------------------------------------- threads
+
+    // From a worker: runs `fn` on the UI thread, then draws
+    void post(std::function<void()> fn) {
+        screen_.Post(std::move(fn));
+        screen_.PostEvent(Event::Custom);
+    }
+
+    void refresh() {
+        if (refreshing_) return;
+        refreshing_ = true;
+        last_refresh_ = Clock::now();
+        slurm_.post([this, user = user_] {
+            api::Fetched<std::vector<api::Job>> r;
+            try {
+                r = api::fetchJobs(user);
+            } catch (const std::exception& e) {
+                r.error = std::string("squeue: ") + e.what();
+            }
+            post([this, r = std::move(r)]() mutable { onJobs(std::move(r)); });
+        });
+    }
+
+    void onJobs(api::Fetched<std::vector<api::Job>> r) {
+        refreshing_ = false;
+        last_refresh_ = Clock::now();
+        if (!r.error.empty()) {
+            jobs_error_ = r.error;   // the last list stays on screen
             return;
         }
+        jobs_error_.clear();
+        jobs_ = std::move(r.data);
+        jobs_time_ = std::time(nullptr);
+        jobs_clock_ = Clock::now();
 
-        if (selected >= (int)jobs->size()) {
-            selected = jobs->size() - 1;
-        }
-        *current_job = api::slurm::getJobDetails((*jobs)[selected].id);
-        last_refresh = std::chrono::steady_clock::now();
-        status_message = "Refreshed!";
-    };
+        // Forget the details of jobs that left the queue
+        auto listed = [&](const std::string& id) {
+            return std::any_of(jobs_.begin(), jobs_.end(), [&](const api::Job& j) { return j.job_id == id; });
+        };
+        auto prune = [&](auto& by_job) {
+            for (auto it = by_job.begin(); it != by_job.end();) it = listed(it->first) ? std::next(it) : by_job.erase(it);
+        };
+        prune(details_);
+        prune(details_error_);
+        prune(details_time_);
+        prune(previews_);
+        prune(preview_time_);
+        requestDetails(false);
+    }
 
-    Component job_info = Renderer([&] {
-        return ui::jobdetails(*current_job)->Render();
-    });
+    void requestDetails(bool force) {
+        const api::Job* j = selectedJob();
+        if (!j) return;
+        const std::string id = j->job_id;
+        const auto when = details_time_.find(id);
+        if (!force && when != details_time_.end() && Clock::now() - when->second < std::chrono::seconds(opts_.refresh - 1)) return;
+        details_time_[id] = Clock::now();
 
-    Component job_nodes_content = Renderer([&] {
-        return ui::nodedetails(*current_job, screen.dimx())->Render();
-    });
+        const uint64_t generation = ++details_generation_;
+        const bool active = j->active();
+        slurm_.post([this, id, generation, active] {
+            // Moving fast through the list: only the job where it stops is read
+            if (generation != details_generation_) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            if (generation != details_generation_) return;
 
-    float scroll_y = 0.f;
-
-    Component job_nodes_scrollable = Renderer(job_nodes_content, [&] {
-        return job_nodes_content->Render()
-               | focusPositionRelative(0.f, scroll_y)
-               | frame
-               | flex;
-    });
-
-    job_nodes_scrollable =
-        CatchEvent(job_nodes_scrollable, [&](Event e) {
-            constexpr float wheel_step = 0.05f;
-            bool handled = false;
-
-            if (e.is_mouse()) {
-                if (e.mouse().button == Mouse::WheelDown) {
-                    scroll_y += wheel_step;
-                    handled = true;
-                }
-                if (e.mouse().button == Mouse::WheelUp) {
-                    scroll_y -= wheel_step;
-                    handled = true;
-                }
+            api::Fetched<api::JobDetails> d;
+            api::Fetched<std::vector<api::NodeInfo>> n;
+            try {
+                d = api::fetchDetails(id);
+                const std::string list = d.data.get("NodeList");
+                if (d.error.empty() && active && !list.empty() && list != "(null)") n = api::fetchNodes(list);
+            } catch (const std::exception& e) {
+                d.error = std::string("scontrol: ") + e.what();
             }
-
-            if (handled) {
-                scroll_y = std::clamp(scroll_y, 0.f, 1.f);
-                return true;
-            }
-
-            return false;
-        });
-
-    Component job_nodes = Container::Horizontal({
-        job_nodes_scrollable | flex,
-    });
-
-    MenuOption menu_opt;
-    menu_opt.on_change = [&] {
-        if (!jobs->empty() && selected < (int)jobs->size()) {
-            *current_job = api::slurm::getJobDetails((*jobs)[selected].id);
-            scroll_y = 0.f;
-        }
-    };
-
-    Component sidebar =
-        Menu(entries.get(), &selected, menu_opt)
-        | size(WIDTH, EQUAL, 30);
-
-    Component interface_job = Container::Vertical({
-        job_info,
-        job_nodes | flex,
-    });
-
-    Component interface_jobs = Container::Horizontal({
-        sidebar,
-        Renderer([] { return hbox({text("  "), separator(), text("  ")}); }),
-        interface_job | flex,
-    });
-
-    // Status bar with last refresh time
-    Component status_bar = Renderer([&] {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_refresh).count();
-        int next_refresh = AUTO_REFRESH_SECONDS - elapsed;
-
-        return hbox({
-            text(" "),
-            text(status_message) | color(Color::Green),
-            filler(),
-            text("Auto-refresh: " + std::to_string(next_refresh) + "s") | dim,
-            text("  "),
-        });
-    });
-
-    Component main_content = Container::Vertical({
-        ui::title("Romeo Slurm Viewer (RSV) v1.0.0"),
-        interface_jobs | flex,
-        status_bar,
-        Renderer([] { return ui::footer(); }),
-    });
-
-    // Help modal
-    Component help = ui::helpModal([&] { show_help = false; });
-
-    // Partition view
-    Component partition_view = Renderer([&] {
-        return vbox({
-            text("══════════ CLUSTER PARTITIONS ══════════") | bold | center | color(Color::Cyan),
-            text(""),
-            ui::clusterView()->Render(),
-            text(""),
-            text("Press any key to close") | dim | center,
-        }) | border | clear_under | center;
-    });
-
-    partition_view = CatchEvent(partition_view, [&](Event e) {
-        if (e.is_character() || e == Event::Escape || e == Event::Return) {
-            show_partitions = false;
-            return true;
-        }
-        return false;
-    });
-
-    // Debug view (will be created dynamically based on selected job)
-    auto debug_component = std::make_shared<Component>(
-        ui::debugView(current_job->id, [&] { show_debug = false; })
-    );
-
-    // Log view (will be created dynamically based on selected job)
-    auto log_component = std::make_shared<Component>(
-        ui::logView(current_job->id, log_show_stderr, log_scroll_y, [&] { show_logs = false; })
-    );
-
-    // History view
-    auto history_scroll_y = std::make_shared<float>(0.f);
-    auto history_component = std::make_shared<Component>(
-        ui::historyView(history_scroll_y, [&] { show_history = false; })
-    );
-
-    // Quota view
-    auto quota_component = std::make_shared<Component>(
-        ui::quotaView([&] { show_quota = false; })
-    );
-
-    Component interface = Container::Tab({main_content, help, partition_view}, nullptr);
-
-    interface = Renderer(interface, [&] {
-        Element base = main_content->Render();
-
-        if (show_help) {
-            return dbox({
-                base,
-                help->Render() | clear_under | center,
-            });
-        }
-        if (show_partitions) {
-            return dbox({
-                base,
-                partition_view->Render() | clear_under | center,
-            });
-        }
-        if (show_debug) {
-            return dbox({
-                base,
-                (*debug_component)->Render() | clear_under | center,
-            });
-        }
-        if (show_logs) {
-            return dbox({
-                base,
-                (*log_component)->Render() | clear_under | center,
-            });
-        }
-        if (show_history) {
-            return dbox({
-                base,
-                (*history_component)->Render() | clear_under | center,
-            });
-        }
-        if (show_quota) {
-            return dbox({
-                base,
-                (*quota_component)->Render() | clear_under | center,
-            });
-        }
-        if (show_cancel_confirm) {
-            return dbox({
-                base,
-                vbox({
-                    text("") ,
-                    text("  Cancel Job Confirmation  ") | bold | color(Color::Red) | center,
-                    text(""),
-                    separator(),
-                    text(""),
-                    hbox({
-                        text("  Are you sure you want to cancel job "),
-                        text(cancel_job_id) | bold | color(Color::Magenta),
-                        text("?"),
-                    }) | center,
-                    text(""),
-                    hbox({
-                        text("  Name: "),
-                        text(cancel_job_name) | color(Color::Cyan),
-                    }) | center,
-                    text(""),
-                    separator(),
-                    text(""),
-                    hbox({
-                        text("y") | bold | color(Color::Green),
-                        text(": Yes, cancel  ") | dim,
-                        text("n/Esc") | bold | color(Color::Red),
-                        text(": No, keep job") | dim,
-                    }) | center,
-                    text(""),
-                }) | border | clear_under | center,
-            });
-        }
-        return base;
-    });
-
-    // Handle keyboard events
-    interface = CatchEvent(interface, [&](Event e) {
-        // Handle modals first
-        if (show_help) {
-            if (e.is_character() || e == Event::Escape || e == Event::Return) {
-                show_help = false;
-                return true;
-            }
-            return false;
-        }
-        if (show_partitions) {
-            if (e.is_character() || e == Event::Escape || e == Event::Return) {
-                show_partitions = false;
-                return true;
-            }
-            return false;
-        }
-        if (show_debug) {
-            if (e.is_character() || e == Event::Escape || e == Event::Return) {
-                show_debug = false;
-                return true;
-            }
-            return false;
-        }
-        if (show_logs) {
-            // Let the log component handle all events (scrolling, tab, escape)
-            return (*log_component)->OnEvent(e);
-        }
-        if (show_history) {
-            // Let the history component handle all events (scrolling, escape)
-            return (*history_component)->OnEvent(e);
-        }
-        if (show_quota) {
-            // Let the quota component handle its events
-            return (*quota_component)->OnEvent(e);
-        }
-        if (show_cancel_confirm) {
-            // Handle cancel confirmation
-            if (e == Event::Character('y') || e == Event::Character('Y')) {
-                // Confirm cancel
-                if (api::slurm::cancelJob(cancel_job_id)) {
-                    status_message = "Job " + cancel_job_id + " cancelled";
-                    refresh_jobs();
+            post([this, id, d = std::move(d), n = std::move(n)]() mutable {
+                if (!d.error.empty()) {
+                    details_error_[id] = d.error;
                 } else {
-                    status_message = "Cancel failed";
+                    details_error_.erase(id);
+                    details_[id] = std::move(d.data);
                 }
-                show_cancel_confirm = false;
-                return true;
+                for (auto& node : n.data) nodes_[node.name] = std::move(node);
+                if (view_ == View::Debug && debug_job_ == id) fillDebug();
+            });
+        });
+        requestPreview();
+    }
+
+    /* The last lines of the selected job's output, shown under its details
+    - Read again every 5 s at most, and only when the file changed (size or date)
+    */
+    void requestPreview() {
+        const api::Job* j = selectedJob();
+        if (!j || j->pending()) return;
+        const std::string id = j->job_id;
+        const auto when = preview_time_.find(id);
+        if (when != preview_time_.end() && Clock::now() - when->second < std::chrono::seconds(5)) return;
+        preview_time_[id] = Clock::now();
+
+        const std::string path = ui::logPaths(*j, detailsFor(*j)).first;
+        if (path.empty()) return;
+        const auto old = previews_.find(id);
+        const bool same = old != previews_.end() && old->second.path == path;
+        const uintmax_t old_size = same ? old->second.size : UINTMAX_MAX;
+        const std::time_t old_mtime = same ? old->second.mtime : 0;
+        files_.post([this, id, path, old_size, old_mtime] {
+            struct stat st{};
+            if (old_size != UINTMAX_MAX && stat(path.c_str(), &st) == 0 && static_cast<uintmax_t>(st.st_size) == old_size &&
+                st.st_mtime == old_mtime)
+                return;
+            ui::LogData data = ui::readLogTail(path, 64u << 10);
+            if (data.lines.size() > 200) data.lines.erase(data.lines.begin(), data.lines.end() - 200);
+            post([this, id, data = std::move(data)]() mutable { previews_[id] = std::move(data); });
+        });
+    }
+
+    void loadLog() {
+        const std::string path = logs_.path();
+        const uint64_t generation = ++log_generation_;
+        log_loading_ = true;
+        last_log_read_ = Clock::now();
+        const uintmax_t old_size = logs_.data.path == path ? logs_.data.size : UINTMAX_MAX;
+        const std::time_t old_mtime = logs_.data.mtime;
+        files_.post([this, path, generation, old_size, old_mtime] {
+            // Following: the file is only read again when it changed
+            struct stat st{};
+            if (old_size != UINTMAX_MAX && stat(path.c_str(), &st) == 0 && static_cast<uintmax_t>(st.st_size) == old_size &&
+                st.st_mtime == old_mtime) {
+                post([this, generation] {
+                    if (generation == log_generation_) log_loading_ = false;
+                });
+                return;
             }
-            if (e == Event::Character('n') || e == Event::Character('N') ||
-                e == Event::Escape || e == Event::Return) {
-                // Abort cancel
-                status_message = "Cancel aborted";
-                show_cancel_confirm = false;
-                return true;
+            ui::LogData data = ui::readLogTail(path);
+            post([this, generation, data = std::move(data)]() mutable {
+                if (generation != log_generation_) return;
+                log_loading_ = false;
+                if (view_ == View::Logs) logs_.setData(std::move(data));
+            });
+        });
+    }
+
+    void loadHistory() {
+        history_.loading = true;
+        history_time_ = Clock::now();
+        slurm_.post([this, user = user_, days = history_.days] {
+            api::Fetched<std::vector<api::HistoryJob>> r;
+            try {
+                r = api::fetchHistory(user, days);
+            } catch (const std::exception& e) {
+                r.error = std::string("sacct: ") + e.what();
             }
-            return true;  // Consume all other keys
-        }
+            post([this, r = std::move(r)]() mutable { history_.setData(std::move(r.data), r.error); });
+        });
+    }
 
-        // Quit
-        if (e == Event::Character('q') || e == Event::Character('Q') ||
-            e == Event::Escape || e == Event::Character('\x03')) {
-            screen.Exit();
-            return true;
-        }
-
-        // Refresh
-        if (e == Event::Character('r') || e == Event::Character('R')) {
-            refresh_jobs();
-            return true;
-        }
-
-        // Help
-        if (e == Event::Character('h') || e == Event::Character('H') ||
-            e == Event::Character('?')) {
-            show_help = true;
-            return true;
-        }
-
-        // Cancel job - show confirmation
-        if (e == Event::Character('c') || e == Event::Character('C') ||
-            e == Event::Delete) {
-            if (!jobs->empty()) {
-                cancel_job_id = (*jobs)[selected].id;
-                cancel_job_name = (*jobs)[selected].name;
-                show_cancel_confirm = true;
+    void loadPartitions() {
+        partitions_.loading = true;
+        slurm_.post([this] {
+            api::Fetched<std::vector<api::Partition>> r;
+            try {
+                r = api::fetchPartitions();
+            } catch (const std::exception& e) {
+                r.error = std::string("sinfo: ") + e.what();
             }
-            return true;
-        }
+            post([this, r = std::move(r)]() mutable {
+                partitions_.loading = false;
+                partitions_.error = r.error;
+                if (r.error.empty()) partitions_.partitions = std::move(r.data);
+            });
+        });
+    }
 
-        // Partitions view
-        if (e == Event::Character('p') || e == Event::Character('P')) {
-            show_partitions = true;
-            return true;
-        }
-
-        // Debug view
-        if (e == Event::Character('d') || e == Event::Character('D')) {
-            if (!jobs->empty()) {
-                *debug_component = ui::debugView((*jobs)[selected].id, [&] { show_debug = false; });
-                show_debug = true;
+    void loadQuota() {
+        quota_.loading = true;
+        refresh();
+        slurm_.post([this, user = user_] {
+            api::Fetched<std::vector<api::Assoc>> r;
+            try {
+                r = api::fetchAssocs(user);
+            } catch (const std::exception& e) {
+                r.error = std::string("sacctmgr: ") + e.what();
             }
-            return true;
-        }
+            post([this, r = std::move(r)]() mutable {
+                quota_.loading = false;
+                quota_.error = r.error;
+                if (r.error.empty()) quota_.assocs = std::move(r.data);
+            });
+        });
+    }
 
-        // Logs view
-        if (e == Event::Character('l') || e == Event::Character('L')) {
-            if (!jobs->empty()) {
-                *log_show_stderr = false;  // Reset to stdout
-                *log_scroll_y = 0.f;       // Reset scroll
-                *log_component = ui::logView((*jobs)[selected].id, log_show_stderr, log_scroll_y, [&] { show_logs = false; });
-                show_logs = true;
+    void cancelSelected() {
+        const std::string id = cancel_.id;   // as squeue shows it: 812402_[3-40] cancels only these pending tasks
+        view_ = View::None;
+        showMessage("Cancelling job " + id + "...");
+        slurm_.post([this, id] {
+            std::string error;
+            try {
+                error = api::cancelJob(id);
+            } catch (const std::exception& e) {
+                error = std::string("scancel: ") + e.what();
             }
-            return true;
-        }
+            post([this, id, error] {
+                if (error.empty()) showMessage("Job " + id + " cancelled");
+                else showMessage(error, true);
+                refreshing_ = false;
+                refresh();
+            });
+        });
+    }
 
-        // Copy job ID (y for yank)
-        if (e == Event::Character('y') || e == Event::Character('Y')) {
-            if (!jobs->empty()) {
-                std::string job_id = (*jobs)[selected].id;
-                // Use xclip/xsel on Linux, pbcopy on Mac, clip on Windows
-                #ifdef _WIN32
-                std::string cmd = "echo " + job_id + " | clip";
-                #elif __APPLE__
-                std::string cmd = "echo -n " + job_id + " | pbcopy";
-                #else
-                std::string cmd = "echo -n " + job_id + " | xclip -selection clipboard 2>/dev/null || echo -n " + job_id + " | xsel --clipboard 2>/dev/null";
-                #endif
-                system(cmd.c_str());
-                status_message = "Copied: " + job_id;
+    // ---------------------------------------------------------------- list
+
+    // The jobs shown: filtered, then sorted
+    std::vector<const api::Job*> rows() const {
+        std::vector<const api::Job*> out;
+        const std::string f = util::lower(filter_);
+        for (const auto& j : jobs_) {
+            if (!f.empty()) {
+                const std::string hay = util::lower(j.id + " " + j.name + " " + j.state + " " + api::shortState(j.state) +
+                                                    " " + j.partition + " " + j.account + " " + j.reason);
+                if (hay.find(f) == std::string::npos) continue;
             }
-            return true;
+            out.push_back(&j);
         }
 
-        // Sort jobs (s cycles through sort modes)
-        if (e == Event::Character('s') || e == Event::Character('S')) {
-            sort_mode = (sort_mode + 1) % 4;
-            auto& j = *jobs;
-            switch (sort_mode) {
-                case 1:  // Sort by ID
-                    std::sort(j.begin(), j.end(), [](const api::Job& a, const api::Job& b) {
-                        return std::stoi(a.id) < std::stoi(b.id);
-                    });
-                    status_message = "Sort: ID";
-                    break;
-                case 2:  // Sort by name
-                    std::sort(j.begin(), j.end(), [](const api::Job& a, const api::Job& b) {
-                        return a.name < b.name;
-                    });
-                    status_message = "Sort: Name";
-                    break;
-                case 3:  // Sort by entry (original)
-                    std::sort(j.begin(), j.end(), [](const api::Job& a, const api::Job& b) {
-                        return a.entry_name < b.entry_name;
-                    });
-                    status_message = "Sort: Entry";
-                    break;
+        auto group = [](const api::Job* j) { return j->active() ? 0 : j->pending() ? 1 : 2; };
+        auto number = [](const api::Job* j) { return util::toLong(j->id, 0); };
+        auto left = [this](const api::Job* j) {
+            if (j->active() && j->limit > 0) return j->limit - liveUsed(*j);
+            if (j->pending() && j->start > 0) return static_cast<long>(j->start - std::time(nullptr)) + (1L << 40);
+            return 1L << 50;
+        };
+        std::stable_sort(out.begin(), out.end(), [&](const api::Job* a, const api::Job* b) {
+            switch (sort_) {
+                case 1: return number(a) != number(b) ? number(a) > number(b) : a->id > b->id;
+                case 2: return util::lower(a->name) < util::lower(b->name);
+                case 3: return left(a) < left(b);
                 default:
-                    refresh_jobs();  // Reset to original order
-                    status_message = "Sort: Default";
-                    break;
+                    if (group(a) != group(b)) return group(a) < group(b);
+                    return number(a) != number(b) ? number(a) < number(b) : a->id < b->id;
             }
-            // Rebuild entries
-            entries->clear();
-            for (const auto& job : *jobs)
-                entries->push_back(job.name + " (" + job.id + ")");
-            if (!jobs->empty()) {
-                selected = 0;
-                *current_job = api::slurm::getJobDetails((*jobs)[selected].id);
+        });
+        return out;
+    }
+
+    static const char* sortName(int s) {
+        static const char* names[] = {"state", "newest", "name", "time left"};
+        return names[s % 4];
+    }
+
+    const api::Job* selectedJob() const {
+        for (const auto& j : jobs_)
+            if (j.id == selected_id_) return &j;
+        return nullptr;
+    }
+
+    // The selection follows the job (its id) through refreshes and sorts; when it leaves, the row below takes it
+    int selectedIndex(const std::vector<const api::Job*>& list) {
+        for (size_t i = 0; i < list.size(); i++)
+            if (list[i]->id == selected_id_) return selected_pos_ = static_cast<int>(i);
+        if (list.empty()) return -1;
+        selected_pos_ = std::clamp(selected_pos_, 0, static_cast<int>(list.size()) - 1);
+        selected_id_ = list[static_cast<size_t>(selected_pos_)]->id;
+        details_offset_ = 0;
+        requestDetails(false);
+        return selected_pos_;
+    }
+
+    void select(const std::vector<const api::Job*>& list, int index) {
+        if (list.empty()) return;
+        index = std::clamp(index, 0, static_cast<int>(list.size()) - 1);
+        if (list[static_cast<size_t>(index)]->id == selected_id_) return;
+        selected_pos_ = index;
+        selected_id_ = list[static_cast<size_t>(index)]->id;
+        details_offset_ = 0;
+        requestDetails(false);
+    }
+
+    // squeue's run time, plus the time since it was read: the clocks keep going between refreshes
+    long liveUsed(const api::Job& j) const {
+        if (!j.active() || j.used < 0) return j.used;
+        return j.used + static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - jobs_clock_).count());
+    }
+
+    const api::JobDetails* detailsFor(const api::Job& j) const {
+        const auto it = details_.find(j.job_id);
+        return it == details_.end() ? nullptr : &it->second;
+    }
+
+    void showMessage(const std::string& m, bool error = false) {
+        message_ = m;
+        message_error_ = error;
+        message_until_ = Clock::now() + std::chrono::seconds(error ? 8 : 4);
+    }
+
+    /* Copy through the terminal (OSC 52): it reaches the clipboard of the computer in front of the user, over SSH
+    - xclip/xsel would copy on the login node, where there is no display
+    */
+    void copy(const std::string& s, const std::string& what) {
+        std::cout << "\033]52;c;" << base64(s) << "\a" << std::flush;
+        showMessage("Copied " + what + ": " + s);
+    }
+
+    void fillDebug() {
+        const auto it = details_.find(debug_job_);
+        if (it != details_.end()) debug_.setText(it->second.raw);
+        const auto err = details_error_.find(debug_job_);
+        debug_.error = err == details_error_.end() ? "" : err->second;
+        if (it == details_.end() && !debug_.error.empty()) debug_.loading = false;
+    }
+
+    // ---------------------------------------------------------------- views
+
+    void openLogs(const api::Job& j) {
+        const auto [out, err] = ui::logPaths(j, detailsFor(j));
+        logs_ = ui::LogView{};
+        logs_.title = "Log · " + j.id + " " + util::cut(j.name, 40);
+        logs_.paths[0] = out;
+        logs_.paths[1] = err;
+        logs_.follow = true;
+        logs_.loading = true;
+        logs_.reload = [this] { loadLog(); };
+        logs_.copy = [this](const std::string& p) { copy(p, "path"); };
+        view_ = View::Logs;
+        loadLog();
+    }
+
+    void openDebug(const api::Job& j) {
+        debug_ = ui::DebugView{};
+        debug_.title = "scontrol show job " + j.job_id;
+        debug_job_ = j.job_id;
+        view_ = View::Debug;
+        fillDebug();
+        requestDetails(true);
+    }
+
+    bool mainEvent(Event& e);
+    bool filterEvent(Event& e);
+    bool viewEvent(Event& e);
+
+    // ---------------------------------------------------------------- state
+
+    ScreenInteractive& screen_;
+    Options opts_;
+    std::string user_, who_;
+
+    std::vector<api::Job> jobs_;
+    std::string jobs_error_;
+    std::time_t jobs_time_ = 0;
+    Clock::time_point jobs_clock_ = Clock::now();
+    Clock::time_point last_refresh_ = Clock::now();
+    bool refreshing_ = false;
+
+    std::map<std::string, api::JobDetails> details_;           // by Slurm job id
+    std::map<std::string, std::string> details_error_;
+    std::map<std::string, Clock::time_point> details_time_;
+    std::map<std::string, api::NodeInfo> nodes_;
+    std::atomic<uint64_t> details_generation_{0};
+    std::map<std::string, ui::LogData> previews_;              // the end of each job's output
+    std::map<std::string, Clock::time_point> preview_time_;
+
+    std::string selected_id_;
+    int selected_pos_ = 0;
+    int list_offset_ = 0;
+    int details_offset_ = 0;
+    int list_page_ = 10;
+    int details_page_ = 10;
+    int sort_ = 0;
+    std::string filter_;
+    bool editing_filter_ = false;
+    Box list_box_, details_box_;
+
+    View view_ = View::None;
+    ui::LogView logs_;
+    ui::DebugView debug_;
+    std::string debug_job_;
+    ui::HistoryView history_;
+    Clock::time_point history_time_ = Clock::now();
+    ui::PartitionsView partitions_;
+    ui::QuotaView quota_;
+    api::Job cancel_;
+    uint64_t log_generation_ = 0;
+    bool log_loading_ = false;
+    Clock::time_point last_log_read_ = Clock::now();
+
+    std::string message_;
+    bool message_error_ = false;
+    Clock::time_point message_until_ = Clock::now();
+
+    // Last: they stop (and join) first when the Viewer goes away, while the rest is still there
+    Worker slurm_;
+    Worker files_;
+};
+
+Element Viewer::render() {
+    const Dimensions term = Terminal::Size();
+    const int W = term.dimx, H = term.dimy;
+    if (W < 40 || H < 10)
+        return vbox({filler(), text("RSV: terminal too small") | bold | hcenter,
+                     text(std::to_string(W) + "×" + std::to_string(H) + ", 40×10 at least") | dim | hcenter, filler()});
+
+    const auto list = rows();
+    const int sel = selectedIndex(list);
+    const api::Job* job = sel >= 0 ? list[static_cast<size_t>(sel)] : nullptr;
+    const std::time_t now = std::time(nullptr);
+
+    /* Layout
+    - Wide: the list on the left, as wide as its names need, between 34 columns and 45% of the screen
+    - Narrow (< 90 columns): the list above, the details below
+    */
+    const bool side = W >= 90;
+    const int body_h = H - 2;
+    const int id_w = ui::idWidth(list);
+    size_t name_w = 10;
+    for (const auto* j : list) name_w = std::max(name_w, util::width(j->name));
+    const int ideal = ui::STATE_WIDTH + id_w + 1 + static_cast<int>(std::min<size_t>(name_w, 36)) + 1 + ui::TIME_WIDTH + 2;
+    const int list_w = side ? std::clamp(ideal, 34, std::max(34, W * 45 / 100)) : W;
+    const int list_h = side ? body_h : std::clamp(static_cast<int>(list.size()) + 3, 5, std::max(5, body_h / 2));
+    const int details_w = side ? W - list_w : W;
+    const int details_h = side ? body_h : body_h - list_h;
+
+    // Job list, scrolled to keep the selection in view
+    list_page_ = std::max(1, list_h - 3);
+    if (sel >= 0) {
+        if (sel < list_offset_) list_offset_ = sel;
+        if (sel >= list_offset_ + list_page_) list_offset_ = sel - list_page_ + 1;
+    }
+    list_offset_ = std::clamp(list_offset_, 0, std::max(0, static_cast<int>(list.size()) - list_page_));
+    const int row_w = list_w - 2;
+    Elements list_rows = {ui::jobListHeader(row_w, id_w)};
+    if (list.empty()) {
+        if (jobs_time_ == 0 && jobs_error_.empty())
+            list_rows.push_back(text(" Reading squeue...") | dim);
+        else
+            list_rows.push_back(ui::emptyList(!filter_.empty(), jobs_time_ == 0 ? jobs_error_ : ""));
+    } else {
+        for (int i = list_offset_; i < std::min(static_cast<int>(list.size()), list_offset_ + list_page_); i++) {
+            const auto* j = list[static_cast<size_t>(i)];
+            list_rows.push_back(ui::jobRow(*j, row_w, id_w, liveUsed(*j), i == sel, now));
+        }
+    }
+    std::string list_title = "Jobs";
+    if (!filter_.empty() || editing_filter_) list_title += " /" + filter_ + (editing_filter_ ? "_" : "");
+    std::string list_right = list.size() > static_cast<size_t>(list_page_)
+                                 ? std::to_string(sel + 1) + "/" + std::to_string(list.size())
+                                 : std::to_string(list.size());
+    if (sort_) list_right = std::string("by ") + sortName(sort_) + " · " + list_right;
+    Element list_panel = ui::panel(util::cut(list_title, static_cast<size_t>(std::max(4, list_w - 16))),
+                                   vbox(std::move(list_rows)) | flex, editing_filter_ ? ui::theme::yellow() : ui::theme::accent(),
+                                   text(list_right)) |
+                         size(WIDTH, EQUAL, list_w) | size(HEIGHT, EQUAL, list_h) | reflect(list_box_);
+
+    // Details of the selected job
+    Elements info;
+    std::string details_title = "Details";
+    if (job) {
+        details_title = "Job " + job->id;
+        const auto err = details_error_.find(job->job_id);
+        info = ui::jobDetails(*job, detailsFor(*job), nodes_, liveUsed(*job), details_w - 4,
+                              err == details_error_.end() ? "" : err->second);
+    } else if (!jobs_error_.empty() && jobs_time_ == 0) {
+        info = {paragraph(jobs_error_) | color(ui::theme::red())};
+    } else if (jobs_time_ == 0) {
+        info = {text("Reading squeue...") | dim};
+    }
+    /* The details scroll by lines (J/K, wheel): node cells are several lines high, a frame shows the right ones
+    - FTXUI centers the frame on the focus: aiming at the middle of the window puts `details_offset_` at its top
+    */
+    details_page_ = std::max(1, details_h - 2);
+    auto height = [](const Elements& lines) {
+        Element e = vbox(lines);
+        e->ComputeRequirement();
+        return e->requirement().min_y;
+    };
+
+    // The end of its output, in the room left
+    if (job) {
+        const auto p = previews_.find(job->job_id);
+        const int room = details_page_ - height(info) - 2;
+        if (p != previews_.end() && p->second.error.empty() && room >= 3) {
+            std::vector<std::string> last = p->second.lines;
+            while (!last.empty() && util::trim(last.back()).empty()) last.pop_back();
+            if (!last.empty()) {
+                info.push_back(text(""));
+                info.push_back(hbox({text("Output") | bold, text("  last lines · l for the whole log") | dim}));
+                const size_t n = std::min(last.size(), static_cast<size_t>(room));
+                for (size_t i = last.size() - n; i < last.size(); i++)
+                    info.push_back(text(util::cut(last[i], static_cast<size_t>(std::max(1, details_w - 4)))) | color(ui::theme::gray()));
             }
+        }
+    }
+    const int details_total = height(info);
+    details_offset_ = std::clamp(details_offset_, 0, std::max(0, details_total - details_page_));
+    Element details_content = vbox(std::move(info));
+    if (details_total > details_page_) {
+        // A blank line above and below: the frames of cut node cells would merge with the panel's (┴)
+        const int page = std::max(1, details_page_ - 2);
+        details_offset_ = std::clamp(details_offset_, 0, std::max(0, details_total - page));
+        details_content = vbox({text(""), details_content | focusPosition(0, details_offset_ + (page - 1) / 2) |
+                                              vscroll_indicator | yframe | flex,
+                                text("")});
+    }
+    Element details_panel = ui::panel(details_title, details_content | flex, ui::theme::gray()) |
+                            size(WIDTH, EQUAL, details_w) | size(HEIGHT, EQUAL, details_h) | reflect(details_box_);
+
+    Element body = side ? hbox({list_panel, details_panel}) : vbox({list_panel, details_panel});
+    Element base = vbox({
+        ui::title(who_, jobs_, jobs_time_, refreshing_, jobs_error_, W),
+        body,
+        ui::footer(W, editing_filter_ ? "Filter: type, Enter to keep it, Esc to clear it" : message_, message_error_),
+    });
+
+    // Overlays
+    Element over;
+    const int ow = std::min(W - 2, 140), oh = H - 2;   // the margin takes the 2 others
+    switch (view_) {
+        case View::Help: over = ui::helpView(W - 2, opts_.refresh); break;
+        case View::Logs: over = logs_.render(ow, oh); break;
+        case View::Debug: over = debug_.render(std::min(W - 2, 120), oh); break;
+        case View::History: over = history_.render(std::min(W - 2, 130), oh); break;
+        case View::Partitions: over = partitions_.render(W - 2); break;
+        case View::Quota: over = quota_.render(W - 2, jobs_); break;
+        case View::Cancel: {
+            Elements lines = {
+                hbox({text("Cancel job "), text(cancel_.id) | bold, text(" ?")}),
+                text(util::cut(cancel_.name, 60)) | dim,
+                hbox({text(cancel_.state) | color(ui::stateColor(cancel_.state)),
+                      text(cancel_.active() ? " on " + std::to_string(cancel_.nodes) + (cancel_.nodes == 1 ? " node" : " nodes") + ", for " + util::duration(liveUsed(cancel_))
+                                            : "")}),
+                text(""),
+                hbox({text("y") | bold | color(ui::theme::red()), text(" cancel it    "), text("n") | bold, text(" / Esc keep it") | dim}),
+            };
+            if (cancel_.id.find("_[") != std::string::npos)
+                lines.insert(lines.begin() + 2, text("(only these pending tasks of the array)") | dim);
+            over = ui::panel("scancel", vbox(std::move(lines)) | size(WIDTH, GREATER_THAN, 40), ui::theme::red());
+            break;
+        }
+        case View::None: break;
+    }
+    if (!over) return base;
+    // A blank margin around the view: its frame would otherwise merge with the frames behind it (┴, ╭╭)
+    return dbox({base, over | borderEmpty | clear_under | center});
+}
+
+bool Viewer::onEvent(Event e) {
+    if (e == Event::Custom) return false;
+    if (e.is_mouse() && e.mouse().motion == Mouse::Moved) return true;
+    if (view_ != View::None) return viewEvent(e);
+    if (editing_filter_) return filterEvent(e);
+    return mainEvent(e);
+}
+
+bool Viewer::filterEvent(Event& e) {
+    if (e == Event::Escape) {
+        filter_.clear();
+        editing_filter_ = false;
+    } else if (e == Event::Return || e == Event::ArrowDown || e == Event::ArrowUp || e == Event::Tab) {
+        editing_filter_ = false;
+    } else if (e == Event::Backspace) {
+        if (!filter_.empty()) {
+            size_t i = filter_.size() - 1;
+            while (i > 0 && (static_cast<unsigned char>(filter_[i]) & 0xC0) == 0x80) i--;   // a whole UTF-8 character
+            filter_.erase(i);
+        }
+    } else if (e.is_character()) {
+        if (filter_.size() < 64) filter_ += e.character();
+    } else {
+        return e.is_mouse();
+    }
+    selected_pos_ = 0;
+    list_offset_ = 0;
+    return true;
+}
+
+bool Viewer::viewEvent(Event& e) {
+    bool close = false;
+    bool handled = true;
+    switch (view_) {
+        case View::Help:
+            close = !e.is_mouse();
+            break;
+        case View::Logs: handled = logs_.onEvent(e, close); break;
+        case View::Debug: handled = debug_.onEvent(e, close); break;
+        case View::History: handled = history_.onEvent(e, close); break;
+        case View::Partitions: handled = partitions_.onEvent(e, close); break;
+        case View::Quota: handled = quota_.onEvent(e, close); break;
+        case View::Cancel:
+            if (e == Event::Character('y') || e == Event::Character('Y')) {
+                cancelSelected();
+                return true;
+            }
+            close = !e.is_mouse();
+            break;
+        case View::None: return false;
+    }
+    if (close) {
+        if (view_ == View::Cancel) showMessage("Not cancelled");
+        view_ = View::None;
+    }
+    (void)handled;
+    return true;   // a view takes every key: nothing reaches the list behind it
+}
+
+bool Viewer::mainEvent(Event& e) {
+    const auto list = rows();
+    const int sel = selectedIndex(list);
+    const api::Job* job = sel >= 0 ? list[static_cast<size_t>(sel)] : nullptr;
+
+    if (e.is_mouse()) {
+        Mouse& m = e.mouse();
+        const bool wheel_down = m.button == Mouse::WheelDown, wheel_up = m.button == Mouse::WheelUp;
+        if (details_box_.Contain(m.x, m.y) && (wheel_down || wheel_up)) {
+            details_offset_ = std::max(0, details_offset_ + (wheel_down ? 3 : -3));
+        } else if (list_box_.Contain(m.x, m.y)) {
+            if (wheel_down || wheel_up) select(list, sel + (wheel_down ? 1 : -1));
+            else if (m.button == Mouse::Left && m.motion == Mouse::Pressed) {
+                const int row = m.y - list_box_.y_min - 2;   // border and header
+                if (row >= 0 && row < list_page_) select(list, list_offset_ + row);
+            }
+        }
+        return true;
+    }
+
+    if (e == Event::Character('q') || e == Event::Escape) {
+        if (e == Event::Escape && !filter_.empty()) {
+            filter_.clear();
             return true;
         }
-
-        // History view (a for archive/history)
-        if (e == Event::Character('a') || e == Event::Character('A')) {
-            *history_scroll_y = 0.f;
-            *history_component = ui::historyView(history_scroll_y, [&] { show_history = false; });
-            show_history = true;
-            return true;
+        screen_.Exit();
+        return true;
+    }
+    if (e == Event::ArrowDown || e == Event::Character('j')) select(list, sel + 1);
+    else if (e == Event::ArrowUp || e == Event::Character('k')) select(list, sel - 1);
+    else if (e == Event::PageDown || e == Event::CtrlD) select(list, sel + std::max(1, list_page_ - 1));
+    else if (e == Event::PageUp || e == Event::CtrlU) select(list, sel - std::max(1, list_page_ - 1));
+    else if (e == Event::Home || e == Event::Character('g')) select(list, 0);
+    else if (e == Event::End || e == Event::Character('G')) select(list, static_cast<int>(list.size()) - 1);
+    else if (e == Event::Character('J')) details_offset_ += 3;
+    else if (e == Event::Character('K')) details_offset_ = std::max(0, details_offset_ - 3);
+    else if (e == Event::Character('/')) editing_filter_ = true;
+    else if (e == Event::Character('s')) {
+        sort_ = (sort_ + 1) % 4;
+        showMessage(std::string("Sorted by ") + sortName(sort_));
+    } else if (e == Event::Character('r')) {
+        refresh();
+        requestDetails(true);
+    } else if (e == Event::Character('?') || e == Event::Character('h')) view_ = View::Help;
+    else if (e == Event::Character('a')) {
+        view_ = View::History;
+        // sacct can take seconds: what was read less than a minute ago is shown as it is (r reads again)
+        if (history_.jobs.empty() || !history_.error.empty() || Clock::now() - history_time_ > std::chrono::minutes(1))
+            loadHistory();
+    } else if (e == Event::Character('p')) {
+        view_ = View::Partitions;
+        loadPartitions();
+    } else if (e == Event::Character('u')) {
+        view_ = View::Quota;
+        loadQuota();
+    } else if (!job) {
+        return e.is_character();
+    } else if (e == Event::Character('l') || e == Event::Return) openLogs(*job);
+    else if (e == Event::Character('d')) openDebug(*job);
+    else if (e == Event::Character('y')) copy(job->id, "job id");
+    else if (e == Event::Character('Y')) {
+        const auto [out, err] = ui::logPaths(*job, detailsFor(*job));
+        if (out.empty()) showMessage("No output file known for job " + job->id, true);
+        else copy(out, "path");
+    } else if (e == Event::Character('c') || e == Event::Delete) {
+        if (job->finished()) {
+            showMessage("Job " + job->id + " has already ended", true);
+        } else {
+            cancel_ = *job;
+            view_ = View::Cancel;
         }
-
-        // Quota view (u for user quota)
-        if (e == Event::Character('u') || e == Event::Character('U')) {
-            *quota_component = ui::quotaView([&] { show_quota = false; });
-            show_quota = true;
-            return true;
-        }
-
+    } else {
         return false;
-    });
+    }
+    return true;
+}
 
-    // Auto-refresh loop using PostEvent
-    std::atomic<bool> running{true};
-    std::thread refresh_thread([&]() {
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    int exit_code = 0;
+    const auto opts = parseOptions(argc, argv, exit_code);
+    if (!opts) return exit_code;
+
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        std::cerr << "rsv: needs a terminal (stdin and stdout)\n";
+        return 1;
+    }
+
+    // Set now, and again once FTXUI has made its own choice when its loop starts (see the renderer below)
+    const auto colors = chooseColors(opts->color);
+    if (colors) Terminal::SetColorSupport(*colors);
+
+    auto screen = ScreenInteractive::Fullscreen();
+    if (!opts->mouse) screen.TrackMouse(false);
+
+    Viewer app(screen, *opts);
+
+    auto root = Renderer([&] {
+        if (colors && Terminal::ColorSupport() != *colors) Terminal::SetColorSupport(*colors);
+        // Mouse: clicks and wheel only. Reporting every move redraws the whole screen for each one, over SSH.
+        if (opts->mouse) std::cout << "\033[?1003l" << std::flush;
+        return app.render();
+    });
+    root = CatchEvent(root, [&](Event e) { return app.onEvent(e); });
+
+    /* Timer and hangup watchdog
+    - Every 250 ms: refresh when it is time, follow the log, redraw the clocks every 5 s
+    - When the SSH connection drops, FTXUI keeps its loop running on a terminal that is gone and the program stays
+      on the login node. The hangup shows on stdin: the loop is then asked to stop, like with q.
+    */
+    std::mutex timer_mutex;
+    std::condition_variable timer_cv;
+    bool running = true;
+    std::thread timer([&] {
+        auto last_redraw = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(timer_mutex);
         while (running) {
-            std::this_thread::sleep_for(std::chrono::seconds(AUTO_REFRESH_SECONDS));
-            if (running) {
-                screen.Post([&] { refresh_jobs(); });
-                screen.Post(Event::Custom);
+            // POLLIN asked: macOS only reports POLLHUP with it (Linux does in any case)
+            pollfd input{STDIN_FILENO, POLLIN, 0};
+            if (poll(&input, 1, 0) > 0 && (input.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+                api::stopping() = true;
+                screen.Exit();
+                return;
             }
+            screen.Post([&app] { app.tick(); });
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_redraw >= std::chrono::seconds(5)) {
+                screen.PostEvent(Event::Custom);
+                last_redraw = now;
+            }
+            timer_cv.wait_for(lock, std::chrono::milliseconds(250), [&] { return !running; });
         }
     });
 
-    screen.Loop(interface);
+    app.start();
+    screen.Loop(root);
 
-    running = false;
-    refresh_thread.join();
-
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex);
+        running = false;
+    }
+    timer_cv.notify_all();
+    timer.join();
+    app.stop();
     return 0;
 }

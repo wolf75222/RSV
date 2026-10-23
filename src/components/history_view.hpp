@@ -1,278 +1,188 @@
 #pragma once
 
-#include <ftxui/component/component.hpp>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
-#include <sstream>
-#include <algorithm>
+
 #include "../api/slurmjobs.hpp"
+#include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
 
-struct HistoryJob {
-    std::string id;
-    std::string name;
-    std::string state;
-    std::string start;
-    std::string end;
-    std::string elapsed;
-    std::string exit_code;
-    std::string max_rss;      // Peak memory usage
-    std::string cpu_time;     // Total CPU time
-    std::string ncpus;        // Number of CPUs
-    std::string nnodes;       // Number of nodes
-    std::string partition;
-    std::string account;
+/* History (a): the jobs of the last days, from sacct, with what they really used
+- CPU: CPU time used / CPU time allocated. MEM: largest memory used / memory per node. TIME: run time / --time.
+- Low values mean the job asked for more than it needed: it waited longer in the queue for nothing
+- Filtered on the screen (←/→): sacct runs once, not once per filter
+*/
+struct HistoryView {
+    std::vector<api::HistoryJob> jobs;
+    std::string error;
+    bool loading = true;
+    int days = 7;
+    int filter = 0;
+    int selected = 0;
+    int offset = 0;
+    int page = 20;
+    std::function<void()> reload;
+
+    static const std::vector<std::string>& filters() {
+        static const std::vector<std::string> f = {"all", "completed", "failed", "timeout", "cancelled", "active"};
+        return f;
+    }
+
+    static bool matches(const api::HistoryJob& j, int filter) {
+        switch (filter) {
+            case 1: return j.state == "COMPLETED";
+            case 2: return api::isFailure(j.state) && j.state != "TIMEOUT";
+            case 3: return j.state == "TIMEOUT";
+            case 4: return j.state == "CANCELLED";
+            case 5: return api::isActive(j.state) || api::isPending(j.state);
+            default: return true;
+        }
+    }
+
+    std::vector<const api::HistoryJob*> shown() const {
+        std::vector<const api::HistoryJob*> out;
+        for (const auto& j : jobs)
+            if (matches(j, filter)) out.push_back(&j);
+        return out;
+    }
+
+    void setData(std::vector<api::HistoryJob> data, const std::string& err) {
+        jobs = std::move(data);
+        error = err;
+        loading = false;
+        selected = std::clamp(selected, 0, std::max(0, static_cast<int>(shown().size()) - 1));
+    }
+
+    bool onEvent(Event e, bool& close) {
+        const int count = static_cast<int>(shown().size());
+        if (e == Event::Escape || e == Event::Character('q') || e == Event::Character('a')) close = true;
+        else if (e == Event::ArrowDown || e == Event::Character('j')) selected++;
+        else if (e == Event::ArrowUp || e == Event::Character('k')) selected--;
+        else if (e == Event::PageDown || e == Event::CtrlD) selected += page;
+        else if (e == Event::PageUp || e == Event::CtrlU) selected -= page;
+        else if (e == Event::Home || e == Event::Character('g')) selected = 0;
+        else if (e == Event::End || e == Event::Character('G')) selected = count - 1;
+        else if (e == Event::ArrowRight || e == Event::Character('l') || e == Event::Tab) {
+            filter = (filter + 1) % static_cast<int>(filters().size());
+            selected = offset = 0;
+        } else if (e == Event::ArrowLeft || e == Event::Character('h') || e == Event::TabReverse) {
+            filter = (filter + static_cast<int>(filters().size()) - 1) % static_cast<int>(filters().size());
+            selected = offset = 0;
+        } else if (e == Event::Character('r')) {
+            loading = true;
+            if (reload) reload();
+        } else if (e.is_mouse() && e.mouse().button == Mouse::WheelDown) selected += 3;
+        else if (e.is_mouse() && e.mouse().button == Mouse::WheelUp) selected -= 3;
+        else return false;
+        selected = std::clamp(selected, 0, std::max(0, count - 1));
+        return true;
+    }
+
+    // Advice from what the job used, the most useful first
+    static std::string advice(const api::HistoryJob& j) {
+        if (j.state == "OUT_OF_MEMORY") return "Ran out of memory: ask for more (--mem)";
+        if (j.state == "TIMEOUT") return "Reached its time limit: ask for more --time, or save checkpoints";
+        if (api::isActive(j.state) || api::isPending(j.state)) return "";
+        const double cpu = j.cpuEfficiency(), mem = j.memEfficiency(), t = j.timeUsed();
+        if (j.elapsed >= 300 && cpu >= 0 && cpu < 0.5)
+            return "Used " + percent(cpu) + " of its CPUs: fewer CPUs would do, or check the parallelism";
+        if (j.elapsed >= 300 && mem >= 0 && mem < 0.25)
+            return "Used " + percent(mem) + " of its memory: a smaller --mem starts sooner";
+        if (j.state == "COMPLETED" && t >= 0 && t < 0.25 && j.limit >= 3600)
+            return "Used " + percent(t) + " of its --time: a shorter one starts sooner (backfill)";
+        return "";
+    }
+
+    Element render(int width, int height) {
+        const int inner = std::max(20, width - 4);
+        page = std::max(1, height - 9);
+        const auto rows = shown();
+        selected = std::clamp(selected, 0, std::max(0, static_cast<int>(rows.size()) - 1));
+        if (selected < offset) offset = selected;
+        if (selected >= offset + page) offset = selected - page + 1;
+        offset = std::clamp(offset, 0, std::max(0, static_cast<int>(rows.size()) - page));
+
+        // Columns that fit, from the most useful
+        size_t id_w = 6;
+        for (const auto* j : rows) id_w = std::max(id_w, util::width(j->id));
+        id_w = std::min<size_t>(id_w, 16);
+        const bool show_end = inner >= 99, show_time = inner >= 84, show_exit = inner >= 76, show_mem = inner >= 66;
+        int fixed = static_cast<int>(id_w) + 1 + 11 + 8 + 5;
+        if (show_mem) fixed += 6;
+        if (show_time) fixed += 6;
+        if (show_exit) fixed += 6;
+        if (show_end) fixed += 13;
+        const size_t name_w = static_cast<size_t>(std::max(6, inner - fixed));
+
+        auto cell = [](const std::string& s, size_t w, bool right = false) {
+            return text(right ? util::padLeft(s, w - 1) + " " : util::padRight(s, w));
+        };
+        auto eff = [&](double v, size_t w) {
+            return v < 0 ? cell("-", w, true) | dim : cell(percent(v), w, true) | color(efficiencyColor(v));
+        };
+
+        Elements header = {cell("JOBID", id_w + 1), cell("NAME", name_w), cell("STATE", 11), cell("ELAPSED", 8, true),
+                           cell("CPU", 5, true)};
+        if (show_mem) header.push_back(cell("MEM", 6, true));
+        if (show_time) header.push_back(cell("TIME", 6, true));
+        if (show_exit) header.push_back(cell("EXIT", 6, true));
+        if (show_end) header.push_back(cell("END", 13, true));
+
+        Elements lines = {hbox(std::move(header)) | dim};
+        const std::time_t now = std::time(nullptr);
+        for (int i = offset; i < std::min(static_cast<int>(rows.size()), offset + page); i++) {
+            const auto& j = *rows[static_cast<size_t>(i)];
+            Elements row = {cell(j.id, id_w + 1), cell(j.name, name_w),
+                            cell(j.state == "OUT_OF_MEMORY" ? "OOM" : j.state, 11) | color(stateColor(j.state)), cell(util::duration(j.elapsed), 8, true),
+                            eff(j.cpuEfficiency(), 5)};
+            if (show_mem) row.push_back(eff(j.memEfficiency(), 6));
+            if (show_time) row.push_back(eff(j.timeUsed(), 6));
+            if (show_exit)
+                row.push_back(cell(j.exit_code, 6, true) | (j.exit_code == "0:0" ? Decorator(dim) : color(theme::red())));
+            if (show_end) row.push_back(cell(j.end ? util::clock(j.end, now) : "-", 13, true) | dim);
+            Element r = hbox(std::move(row));
+            lines.push_back(i == selected ? r | inverted : r);
+        }
+        if (loading && jobs.empty()) lines.push_back(text("Reading sacct...") | dim);
+        else if (!error.empty()) lines.push_back(paragraph(error) | color(theme::red()));
+        else if (rows.empty()) lines.push_back(text("No job") | dim);
+        while (static_cast<int>(lines.size()) < page + 1) lines.push_back(text(""));
+
+        // Filters, and counts
+        Elements tabs;
+        for (int i = 0; i < static_cast<int>(filters().size()); i++) {
+            int n = 0;
+            for (const auto& j : jobs) n += matches(j, i);
+            const std::string label = " " + filters()[static_cast<size_t>(i)] + " " + std::to_string(n) + " ";
+            tabs.push_back(i == filter ? text(label) | inverted | bold : text(label) | dim);
+        }
+
+        // The selected job, in one line, with advice
+        Element info = text("");
+        Element tip = text("");
+        if (!rows.empty()) {
+            const auto& j = *rows[static_cast<size_t>(selected)];
+            std::string s = j.id + "  " + j.state_detail + " · " + std::to_string(j.nodes) + "n " + std::to_string(j.cpus) + "c";
+            if (!j.nodelist.empty() && j.nodelist != "None assigned") s += " on " + j.nodelist;
+            if (j.max_rss_mib > 0) s += " · peak " + util::mib(j.max_rss_mib) + " of " + util::mib(j.mem_mib) + (j.nodes > 1 ? "/node" : "");
+            if (j.limit > 0) s += " · limit " + util::duration(j.limit);
+            info = text(util::cut(s, static_cast<size_t>(inner)));
+            const std::string a = advice(j);
+            if (!a.empty()) tip = text(util::cut("> " + a, static_cast<size_t>(inner))) | color(theme::yellow());
+        }
+
+        return panel("History · last " + std::to_string(days) + " days",
+                     vbox({hbox(std::move(tabs)), separator() | dim, vbox(std::move(lines)) | flex, separator() | dim, info, tip,
+                           hbox(keyHints({{"←/→", "filter"}, {"j/k", "move"}, {"r", "refresh"}, {"q", "close"}}))}) |
+                         size(WIDTH, EQUAL, width - 2) | size(HEIGHT, EQUAL, height - 2),
+                     theme::accent(), text(loading ? "reading..." : std::to_string(rows.size()) + " jobs"));
+    }
 };
 
-inline std::vector<HistoryJob> getJobHistory(const std::string& filter = "") {
-    std::vector<HistoryJob> history;
-
-    const char* user = std::getenv("USER");
-    if (!user) user = "unknown";
-
-    // Use sacct to get job history with more details
-    std::string cmd = "sacct -u " + std::string(user) +
-                      " --starttime=now-7days"
-                      " --format=JobID,JobName%30,State,Start,End,Elapsed,ExitCode,MaxRSS,CPUTime,NCPUs,NNodes,Partition,Account"
-                      " --noheader -P 2>/dev/null";
-
-    // Add state filter if specified
-    if (!filter.empty()) {
-        cmd = "sacct -u " + std::string(user) +
-              " --starttime=now-7days -s " + filter +
-              " --format=JobID,JobName%30,State,Start,End,Elapsed,ExitCode,MaxRSS,CPUTime,NCPUs,NNodes,Partition,Account"
-              " --noheader -P 2>/dev/null";
-    }
-
-    std::array<char, 512> buffer;
-    std::unique_ptr<FILE, int(*)(FILE*)> pipe(
-        popen(cmd.c_str(), "r"),
-        static_cast<int(*)(FILE*)>(pclose)
-    );
-
-    if (!pipe) return history;
-
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        std::string line = buffer.data();
-        if (line.empty() || line[0] == '\n') continue;
-
-        if (!line.empty() && line.back() == '\n') line.pop_back();
-
-        std::istringstream iss(line);
-        std::string field;
-        std::vector<std::string> fields;
-
-        while (std::getline(iss, field, '|')) {
-            fields.push_back(field);
-        }
-
-        if (fields.size() >= 7) {
-            // Skip step entries (those with . in JobID like 12345.batch)
-            if (fields[0].find('.') != std::string::npos) continue;
-
-            HistoryJob job;
-            job.id = fields[0];
-            job.name = fields[1];
-            job.state = fields[2];
-            job.start = fields[3];
-            job.end = fields[4];
-            job.elapsed = fields[5];
-            job.exit_code = fields[6];
-            if (fields.size() > 7) job.max_rss = fields[7];
-            if (fields.size() > 8) job.cpu_time = fields[8];
-            if (fields.size() > 9) job.ncpus = fields[9];
-            if (fields.size() > 10) job.nnodes = fields[10];
-            if (fields.size() > 11) job.partition = fields[11];
-            if (fields.size() > 12) job.account = fields[12];
-            history.push_back(job);
-        }
-    }
-
-    std::reverse(history.begin(), history.end());
-    return history;
-}
-
-inline Color getStateColor(const std::string& state) {
-    if (state.find("COMPLETED") != std::string::npos) return Color::Green;
-    if (state.find("RUNNING") != std::string::npos) return Color::Cyan;
-    if (state.find("PENDING") != std::string::npos) return Color::Yellow;
-    if (state.find("FAILED") != std::string::npos) return Color::Red;
-    if (state.find("CANCELLED") != std::string::npos) return Color::Magenta;
-    if (state.find("TIMEOUT") != std::string::npos) return Color::Red;
-    if (state.find("OUT_OF_ME") != std::string::npos) return Color::Red;  // OUT_OF_MEMORY
-    return Color::White;
-}
-
-inline std::string formatMemory(const std::string& mem) {
-    if (mem.empty()) return "-";
-    // Already formatted like "1234K" or "512M"
-    return mem;
-}
-
-inline Component historyView(std::shared_ptr<float> scroll_y, std::shared_ptr<int> filter_mode,
-                             std::function<void()> on_close) {
-    auto history = std::make_shared<std::vector<HistoryJob>>();
-    auto selected_job = std::make_shared<int>(-1);  // -1 = no selection, show list
-
-    // Filter options
-    static const std::vector<std::pair<std::string, std::string>> filters = {
-        {"", "ALL"},
-        {"r", "RUNNING"},
-        {"pd", "PENDING"},
-        {"cd", "COMPLETED"},
-        {"f", "FAILED"},
-        {"ca", "CANCELLED"},
-        {"to", "TIMEOUT"},
-    };
-
-    auto reload_history = [=]() {
-        *history = getJobHistory(filters[*filter_mode].first);
-    };
-
-    reload_history();
-
-    auto list_content = Renderer([=] {
-        std::vector<Element> rows;
-
-        // Header
-        rows.push_back(
-            hbox({
-                text("ID") | bold | size(WIDTH, EQUAL, 10),
-                text("NAME") | bold | size(WIDTH, EQUAL, 20),
-                text("STATE") | bold | size(WIDTH, EQUAL, 12),
-                text("ELAPSED") | bold | size(WIDTH, EQUAL, 10),
-                text("CPU") | bold | size(WIDTH, EQUAL, 6),
-                text("MEM") | bold | size(WIDTH, EQUAL, 10),
-                text("EXIT") | bold | size(WIDTH, EQUAL, 6),
-            })
-        );
-        rows.push_back(separator());
-
-        for (const auto& job : *history) {
-            std::string name = job.name;
-            if (name.length() > 18) name = name.substr(0, 15) + "...";
-
-            rows.push_back(hbox({
-                text(job.id) | size(WIDTH, EQUAL, 10),
-                text(name) | size(WIDTH, EQUAL, 20),
-                text(job.state) | color(getStateColor(job.state)) | size(WIDTH, EQUAL, 12),
-                text(job.elapsed) | color(Color::Cyan) | size(WIDTH, EQUAL, 10),
-                text(job.ncpus.empty() ? "-" : job.ncpus) | size(WIDTH, EQUAL, 6),
-                text(formatMemory(job.max_rss)) | color(Color::Yellow) | size(WIDTH, EQUAL, 10),
-                text(job.exit_code) | (job.exit_code == "0:0" ? color(Color::Green) : color(Color::Red)) | size(WIDTH, EQUAL, 6),
-            }));
-        }
-
-        return vbox(rows);
-    });
-
-    auto scrollable = Renderer(list_content, [=] {
-        return list_content->Render()
-               | focusPositionRelative(0.f, *scroll_y)
-               | frame
-               | size(HEIGHT, LESS_THAN, 20);
-    });
-
-    auto full_view = Renderer(scrollable, [=] {
-        int total_jobs = history->size();
-        int scroll_percent = (int)(*scroll_y * 100);
-
-        // Filter tabs
-        std::vector<Element> filter_tabs;
-        for (size_t i = 0; i < filters.size(); i++) {
-            if ((int)i == *filter_mode) {
-                filter_tabs.push_back(text("[" + filters[i].second + "]") | bold | color(Color::Cyan));
-            } else {
-                filter_tabs.push_back(text(" " + filters[i].second + " ") | dim);
-            }
-        }
-
-        return vbox({
-            text("═══════════ JOB HISTORY (last 7 days) ═══════════") | bold | center | color(Color::Cyan),
-            separator(),
-            hbox(filter_tabs) | center,
-            separator(),
-            hbox({
-                text(std::to_string(total_jobs) + " jobs") | dim,
-                filler(),
-                text(std::to_string(scroll_percent) + "%") | color(Color::Yellow),
-            }),
-            separator(),
-            scrollable->Render() | flex,
-            separator(),
-            hbox({
-                text("←→") | bold | color(Color::Yellow),
-                text(": filter  ") | dim,
-                text("↑↓") | bold | color(Color::Yellow),
-                text(": scroll  ") | dim,
-                text("r") | bold | color(Color::Yellow),
-                text(": refresh  ") | dim,
-                text("Esc") | bold | color(Color::Yellow),
-                text(": close") | dim,
-            }) | center,
-        }) | border | size(WIDTH, LESS_THAN, 95);
-    });
-
-    return CatchEvent(full_view, [=](Event e) {
-        constexpr float scroll_step = 0.05f;
-
-        // Mouse wheel scrolling
-        if (e.is_mouse()) {
-            if (e.mouse().button == Mouse::WheelDown) {
-                *scroll_y = std::min(*scroll_y + scroll_step, 1.f);
-                return true;
-            }
-            if (e.mouse().button == Mouse::WheelUp) {
-                *scroll_y = std::max(*scroll_y - scroll_step, 0.f);
-                return true;
-            }
-        }
-
-        // Arrow keys for scrolling
-        if (e == Event::ArrowDown) {
-            *scroll_y = std::min(*scroll_y + scroll_step, 1.f);
-            return true;
-        }
-        if (e == Event::ArrowUp) {
-            *scroll_y = std::max(*scroll_y - scroll_step, 0.f);
-            return true;
-        }
-
-        // Arrow keys for filter cycling
-        if (e == Event::ArrowRight) {
-            *filter_mode = (*filter_mode + 1) % filters.size();
-            *scroll_y = 0.f;
-            reload_history();
-            return true;
-        }
-        if (e == Event::ArrowLeft) {
-            *filter_mode = (*filter_mode - 1 + filters.size()) % filters.size();
-            *scroll_y = 0.f;
-            reload_history();
-            return true;
-        }
-
-        // Refresh
-        if (e == Event::Character('r') || e == Event::Character('R')) {
-            reload_history();
-            return true;
-        }
-
-        // Close
-        if (e == Event::Escape || e == Event::Return) {
-            on_close();
-            return true;
-        }
-
-        return false;
-    });
-}
-
-// Overload for backward compatibility
-inline Component historyView(std::shared_ptr<float> scroll_y, std::function<void()> on_close) {
-    auto filter_mode = std::make_shared<int>(0);
-    return historyView(scroll_y, filter_mode, on_close);
-}
-
-}
+}  // namespace ui

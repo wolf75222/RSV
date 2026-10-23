@@ -1,268 +1,130 @@
 #pragma once
 
-#include <ftxui/component/component.hpp>
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
+
+#include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
-#include <sstream>
-#include <regex>
-#include <cstdlib>
+
 #include "../api/slurmjobs.hpp"
+#include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
 
-struct UserQuota {
-    std::string user;
-    std::string account;
-    int max_cpus = 0;
-    int max_nodes = 0;
-    int max_jobs = 0;
-    int used_cpus = 0;
-    int used_nodes = 0;
-    int running_jobs = 0;
-    int pending_jobs = 0;
-};
-
-inline std::string execCmd(const std::string& cmd) {
-    std::array<char, 256> buffer;
-    std::string result;
-    std::unique_ptr<FILE, int(*)(FILE*)> pipe(
-        popen(cmd.c_str(), "r"),
-        static_cast<int(*)(FILE*)>(pclose)
-    );
-    if (!pipe) return "";
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
-    }
-    return result;
+// Number of jobs a squeue line stands for: 812402_[3-40%4] is 38 pending tasks
+inline int taskCount(const std::string& id) {
+    const size_t open = id.find("_[");
+    if (open == std::string::npos) return 1;
+    std::string ranges = id.substr(open + 2, id.find(']', open) - open - 2);
+    ranges = ranges.substr(0, ranges.find('%'));
+    const int n = static_cast<int>(api::parseIdList(ranges).size());
+    return std::max(1, n);
 }
 
-inline UserQuota getUserQuota() {
-    UserQuota quota;
+/* Limits (u): for each of your accounts, its limits (sacctmgr) and what your jobs use now (squeue)
+- Every account is shown: on ROMEO "default" allows no job (MaxSubmit=0), --account is needed
+*/
+struct QuotaView {
+    std::vector<api::Assoc> assocs;
+    std::string user, error;
+    bool loading = true;
+    std::function<void()> reload;
 
-    const char* user = std::getenv("USER");
-    if (!user) user = "unknown";
-    quota.user = user;
+    bool onEvent(Event e, bool& close) {
+        if (e == Event::Character('r')) {
+            loading = true;
+            if (reload) reload();
+            return true;
+        }
+        if (e.is_mouse()) return true;
+        close = true;
+        return true;
+    }
 
-    // Get association limits from sacctmgr
-    std::string cmd = "sacctmgr show Association where user=" + std::string(user) +
-                      " format=User,Account,GrpTRES,MaxTRES,GrpJobs,MaxJobs -P --noheader 2>/dev/null";
-    std::string out = execCmd(cmd);
+    Element render(int max_width, const std::vector<api::Job>& jobs) {
+        const int width = std::min(max_width, 80);
+        const int inner = width - 4;
+        const int bar_w = std::clamp(inner - 36, 6, 30);
 
-    // Parse output (format: user|account|grptres|maxtres|grpjobs|maxjobs)
-    std::istringstream iss(out);
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (line.empty()) continue;
-
-        std::vector<std::string> fields;
-        std::istringstream lss(line);
-        std::string field;
-        while (std::getline(lss, field, '|')) {
-            fields.push_back(field);
+        struct Use {
+            long cpus = 0, gpus = 0, nodes = 0, running = 0, submitted = 0;
+        };
+        std::map<std::string, Use> use;
+        for (const auto& j : jobs) {
+            Use& u = use[j.account];
+            if (j.active()) {
+                u.cpus += j.cpus;
+                u.gpus += j.gpus;
+                u.nodes += j.nodes;
+                u.running++;
+            }
+            if (j.active() || j.pending()) u.submitted += taskCount(j.id);
         }
 
-        if (fields.size() >= 2) {
-            quota.account = fields[1];
-        }
-
-        // Parse TRES limits (cpu=X,node=Y,...)
-        auto parseTRES = [](const std::string& tres, int& cpus, int& nodes) {
-            std::regex cpu_re(R"(cpu=(\d+))");
-            std::regex node_re(R"(node=(\d+))");
-            std::smatch m;
-            if (std::regex_search(tres, m, cpu_re)) cpus = std::stoi(m[1]);
-            if (std::regex_search(tres, m, node_re)) nodes = std::stoi(m[1]);
+        auto gauge_line = [&](const std::string& label, long used, double limit, const std::string& unit) {
+            const double ratio = limit > 0 ? used / limit : 0;
+            return hbox({text("  " + util::padRight(label, 11)) | dim, bar(ratio, bar_w, usageColor(ratio)),
+                         text(" " + util::padLeft(std::to_string(used), 5) + " / " + std::to_string(static_cast<long>(limit)) +
+                              " " + unit)});
         };
 
-        if (fields.size() >= 3) parseTRES(fields[2], quota.max_cpus, quota.max_nodes);
-        if (fields.size() >= 4) parseTRES(fields[3], quota.max_cpus, quota.max_nodes);
+        Elements rows;
+        rows.push_back(hbox({text("User ") | dim, text(user) | bold}));
+        for (const auto& a : assocs) {
+            const Use& u = use.count(a.account) ? use.at(a.account) : Use{};
+            rows.push_back(text(""));
+            Elements head = {text(a.account) | bold | color(theme::cyan())};
+            if (!a.partition.empty()) head.push_back(text("  partition " + a.partition) | dim);
+            if (!a.qos.empty()) head.push_back(text("  QOS " + a.qos) | dim);
+            rows.push_back(hbox(std::move(head)));
 
-        // Parse job limits
-        if (fields.size() >= 5 && !fields[4].empty()) {
-            try { quota.max_jobs = std::stoi(fields[4]); } catch (...) {}
+            bool any = false;
+            if (a.max_submit == 0 || a.max_jobs == 0) {
+                rows.push_back(text("  No job allowed with this account: give --account=<another one>") | color(theme::yellow()));
+                continue;
+            }
+            const auto limit = [&](const char* key) {
+                if (a.grp_tres.count(key)) return a.grp_tres.at(key);
+                return 0.0;
+            };
+            if (limit("cpu") > 0) {
+                rows.push_back(gauge_line("CPUs", u.cpus, limit("cpu"), "running"));
+                any = true;
+            }
+            if (limit("gres/gpu") > 0) {
+                rows.push_back(gauge_line("GPUs", u.gpus, limit("gres/gpu"), "running"));
+                any = true;
+            }
+            if (limit("node") > 0) {
+                rows.push_back(gauge_line("Nodes", u.nodes, limit("node"), "running"));
+                any = true;
+            }
+            if (a.max_jobs > 0 || a.grp_jobs > 0) {
+                rows.push_back(gauge_line("Jobs", u.running, a.max_jobs > 0 ? a.max_jobs : a.grp_jobs, "running"));
+                any = true;
+            }
+            if (a.max_submit > 0) {
+                rows.push_back(gauge_line("Submitted", u.submitted, a.max_submit, "max"));
+                any = true;
+            }
+            if (a.max_wall > 0) {
+                rows.push_back(hbox({text("  " + util::padRight("Time", 11)) | dim, text(util::duration(a.max_wall) + " per job at most")}));
+                any = true;
+            }
+            if (!any) rows.push_back(text("  No limit set for you here (the QOS and partitions still have theirs)") | dim);
         }
-        if (fields.size() >= 6 && !fields[5].empty()) {
-            try { quota.max_jobs = std::max(quota.max_jobs, std::stoi(fields[5])); } catch (...) {}
-        }
+        if (loading && assocs.empty()) rows.push_back(text("Reading sacctmgr...") | dim);
+        if (!error.empty()) rows.push_back(paragraph(error) | color(theme::red()));
+        if (!loading && error.empty() && assocs.empty()) rows.push_back(text("No account found for you in Slurm") | dim);
+
+        rows.push_back(text(""));
+        rows.push_back(text("Running counts come from your jobs in the queue now.") | dim);
+        rows.push_back(hbox(keyHints({{"r", "refresh"}, {"any key", "close"}})));
+        return panel("Accounts and limits", vbox(std::move(rows)) | size(WIDTH, EQUAL, width - 2));
     }
+};
 
-    // Get current usage from squeue
-    cmd = "squeue -u " + std::string(user) + " -o \"%T %C\" --noheader 2>/dev/null";
-    out = execCmd(cmd);
-
-    std::istringstream iss2(out);
-    while (std::getline(iss2, line)) {
-        if (line.empty()) continue;
-
-        std::istringstream lss(line);
-        std::string state;
-        int cpus = 0;
-        lss >> state >> cpus;
-
-        if (state == "RUNNING") {
-            quota.used_cpus += cpus;
-            quota.running_jobs++;
-        } else if (state == "PENDING") {
-            quota.pending_jobs++;
-        }
-    }
-
-    // Get node count for running jobs
-    cmd = "squeue -u " + std::string(user) + " -t RUNNING -o \"%D\" --noheader 2>/dev/null";
-    out = execCmd(cmd);
-
-    std::istringstream iss3(out);
-    while (std::getline(iss3, line)) {
-        if (line.empty()) continue;
-        try { quota.used_nodes += std::stoi(line); } catch (...) {}
-    }
-
-    return quota;
-}
-
-inline Element renderQuotaBar(int used, int max, Color base_color) {
-    if (max <= 0) return text("N/A") | dim;
-
-    float ratio = (float)used / max;
-    int bar_width = 30;
-    int filled = (int)(ratio * bar_width);
-    filled = std::min(filled, bar_width);
-
-    std::string bar = "";
-    for (int i = 0; i < filled; i++) bar += "█";
-    for (int i = filled; i < bar_width; i++) bar += "░";
-
-    Color bar_color = base_color;
-    if (ratio >= 0.9) bar_color = Color::Red;
-    else if (ratio >= 0.7) bar_color = Color::Yellow;
-
-    return hbox({
-        text(bar) | color(bar_color),
-        text(" "),
-        text(std::to_string(used) + "/" + std::to_string(max)) | bold,
-        text(" (" + std::to_string((int)(ratio * 100)) + "%)") | dim,
-    });
-}
-
-inline Component quotaView(std::function<void()> on_close) {
-    auto quota = std::make_shared<UserQuota>(getUserQuota());
-
-    auto content = Renderer([=] {
-        int remaining_cpus = quota->max_cpus > 0 ? quota->max_cpus - quota->used_cpus : -1;
-        int remaining_nodes = quota->max_nodes > 0 ? quota->max_nodes - quota->used_nodes : -1;
-
-        std::vector<Element> elements;
-
-        elements.push_back(
-            text("═══════════ USER QUOTA ═══════════") | bold | center | color(Color::Cyan)
-        );
-        elements.push_back(separator());
-
-        // User info
-        elements.push_back(hbox({
-            text("User: ") | dim,
-            text(quota->user) | bold | color(Color::Magenta),
-            text("  Account: ") | dim,
-            text(quota->account.empty() ? "default" : quota->account) | color(Color::Cyan),
-        }));
-        elements.push_back(separator());
-
-        // CPU quota
-        elements.push_back(text("CPU Cores") | bold | color(Color::Yellow));
-        if (quota->max_cpus > 0) {
-            elements.push_back(hbox({
-                text("  Used:      "),
-                renderQuotaBar(quota->used_cpus, quota->max_cpus, Color::Green),
-            }));
-            elements.push_back(hbox({
-                text("  Remaining: "),
-                text(std::to_string(remaining_cpus)) | bold |
-                    color(remaining_cpus > 0 ? Color::Green : Color::Red),
-                text(" cores available") | dim,
-            }));
-        } else {
-            elements.push_back(hbox({
-                text("  "),
-                text("No CPU limit configured") | dim,
-                text(" (using " + std::to_string(quota->used_cpus) + " cores)") | color(Color::Cyan),
-            }));
-        }
-        elements.push_back(text(""));
-
-        // Node quota
-        elements.push_back(text("Nodes") | bold | color(Color::Yellow));
-        if (quota->max_nodes > 0) {
-            elements.push_back(hbox({
-                text("  Used:      "),
-                renderQuotaBar(quota->used_nodes, quota->max_nodes, Color::Blue),
-            }));
-            elements.push_back(hbox({
-                text("  Remaining: "),
-                text(std::to_string(remaining_nodes)) | bold |
-                    color(remaining_nodes > 0 ? Color::Green : Color::Red),
-                text(" nodes available") | dim,
-            }));
-        } else {
-            elements.push_back(hbox({
-                text("  "),
-                text("No node limit configured") | dim,
-                text(" (using " + std::to_string(quota->used_nodes) + " nodes)") | color(Color::Cyan),
-            }));
-        }
-        elements.push_back(text(""));
-
-        // Job quota
-        elements.push_back(text("Jobs") | bold | color(Color::Yellow));
-        int total_jobs = quota->running_jobs + quota->pending_jobs;
-        if (quota->max_jobs > 0) {
-            elements.push_back(hbox({
-                text("  Active:    "),
-                renderQuotaBar(total_jobs, quota->max_jobs, Color::Magenta),
-            }));
-        }
-        elements.push_back(hbox({
-            text("  Running: ") | dim,
-            text(std::to_string(quota->running_jobs)) | color(Color::Green),
-            text("  Pending: ") | dim,
-            text(std::to_string(quota->pending_jobs)) | color(Color::Yellow),
-        }));
-
-        // Warning if at limit
-        if (remaining_cpus == 0 || remaining_nodes == 0) {
-            elements.push_back(text(""));
-            elements.push_back(
-                hbox({
-                    text("⚠ ") | color(Color::Red),
-                    text("You are at your resource limit!") | bold | color(Color::Red),
-                }) | center
-            );
-            elements.push_back(
-                text("Jobs pending with AssocGrp*Limit will start when resources free up.") | dim | center
-            );
-        }
-
-        elements.push_back(separator());
-        elements.push_back(hbox({
-            text("r") | bold | color(Color::Yellow),
-            text(": refresh  ") | dim,
-            text("Esc") | bold | color(Color::Yellow),
-            text(": close") | dim,
-        }) | center);
-
-        return vbox(elements) | border | size(WIDTH, LESS_THAN, 70);
-    });
-
-    return CatchEvent(content, [=](Event e) {
-        if (e == Event::Character('r') || e == Event::Character('R')) {
-            *quota = getUserQuota();
-            return true;
-        }
-        if (e == Event::Escape || e == Event::Return || e.is_character()) {
-            on_close();
-            return true;
-        }
-        return false;
-    });
-}
-
-}
+}  // namespace ui

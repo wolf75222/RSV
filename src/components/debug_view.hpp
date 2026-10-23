@@ -1,91 +1,88 @@
 #pragma once
 
-#include <ftxui/component/component.hpp>
-#include <ftxui/dom/elements.hpp>
-#include <sstream>
 #include <set>
-#include "../api/slurmjobs.hpp"
+#include <string>
+#include <vector>
+
+#include <ftxui/component/event.hpp>
+#include <ftxui/dom/elements.hpp>
+
+#include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
 
-// Important fields to highlight in debug view
-inline std::set<std::string> important_fields = {
-    "JobId", "JobName", "UserId", "Account", "Partition",
-    "TimeLimit", "RunTime", "SubmitTime", "StartTime",
-    "NumNodes", "NumCPUs", "NumTasks", "CPUs/Task",
-    "MinMemoryNode", "ReqMem", "Features", "Gres",
-    "StdOut", "StdErr", "WorkDir", "Command",
-    "JobState", "Reason", "Priority"
+/* Raw view (d): everything scontrol says about the job, the important fields highlighted
+- Scrolls, and long lines are cut to the window (it was drawn whole and cut by the screen)
+*/
+struct DebugView {
+    std::string title;
+    std::vector<std::string> lines;
+    std::string error;
+    bool loading = true;
+    int offset = 0;
+    int page = 20;
+
+    void setText(const std::string& raw) {
+        lines = util::lines(raw);
+        loading = false;
+    }
+
+    bool onEvent(Event e, bool& close) {
+        const int max = std::max(0, static_cast<int>(lines.size()) - page);
+        if (e == Event::Escape || e == Event::Character('q') || e == Event::Character('d')) close = true;
+        else if (e == Event::ArrowDown || e == Event::Character('j')) offset++;
+        else if (e == Event::ArrowUp || e == Event::Character('k')) offset--;
+        else if (e == Event::PageDown || e == Event::Character(' ')) offset += page - 1;
+        else if (e == Event::PageUp || e == Event::Character('b')) offset -= page - 1;
+        else if (e == Event::Home || e == Event::Character('g')) offset = 0;
+        else if (e == Event::End || e == Event::Character('G')) offset = max;
+        else if (e.is_mouse() && e.mouse().button == Mouse::WheelDown) offset += 3;
+        else if (e.is_mouse() && e.mouse().button == Mouse::WheelUp) offset -= 3;
+        else return false;
+        offset = std::clamp(offset, 0, max);
+        return true;
+    }
+
+    static Element highlight(const std::string& line, int width) {
+        static const std::set<std::string> important = {
+            "JobId", "JobName", "UserId", "Account", "QOS", "JobState", "Reason", "Dependency", "RunTime", "TimeLimit",
+            "SubmitTime", "StartTime", "EndTime", "Partition", "NodeList", "NumNodes", "NumCPUs", "NumTasks",
+            "CPUs/Task", "TRES", "ReqTRES", "AllocTRES", "MinMemoryNode", "MinMemoryCPU", "Features", "Nodes",
+            "CPU_IDs", "GRES", "JOB_GRES", "Mem", "TresPerNode", "Command", "WorkDir", "StdOut", "StdErr", "ExitCode"};
+        Elements parts;
+        int used = 0;
+        size_t i = 0;
+        while (i < line.size() && used < width) {
+            size_t end = line.find(' ', i);
+            if (end == std::string::npos) end = line.size();
+            const std::string word = line.substr(i, end - i + (end < line.size() ? 1 : 0));
+            const std::string shown = util::cut(word, static_cast<size_t>(width - used));
+            const size_t eq = shown.find('=');
+            if (eq != std::string::npos && important.count(shown.substr(0, eq)))
+                parts.push_back(hbox({text(shown.substr(0, eq)) | bold | color(theme::yellow()), text("="),
+                                      text(shown.substr(eq + 1)) | color(theme::cyan())}));
+            else if (eq != std::string::npos)
+                parts.push_back(hbox({text(shown.substr(0, eq)) | dim, text(shown.substr(eq))}));
+            else
+                parts.push_back(text(shown));
+            used += static_cast<int>(util::width(shown));
+            i = end + 1;
+        }
+        return hbox(std::move(parts));
+    }
+
+    Element render(int width, int height) {
+        page = std::max(1, height - 4);
+        const int inner = std::max(10, width - 4);
+        Elements all;
+        if (loading) all.push_back(text("Reading...") | dim);
+        if (!error.empty()) all.push_back(paragraph(error) | color(theme::red()));
+        for (const auto& l : lines) all.push_back(highlight(util::sanitize(l), inner - 1));
+        return panel(title, vbox({scrollWindow(all, offset, page) | flex, separator() | dim,
+                                  hbox(keyHints({{"j/k", "scroll"}, {"g/G", "top/end"}, {"q", "close"}}))}) |
+                                size(WIDTH, EQUAL, width - 2) | size(HEIGHT, EQUAL, height - 2));
+    }
 };
 
-inline Component debugView(const std::string& job_id, std::function<void()> on_close) {
-    auto raw = std::make_shared<std::string>(api::slurm::getRawJobDetails(job_id));
-
-    auto content = Renderer([raw, job_id] {
-        std::vector<Element> lines;
-
-        lines.push_back(
-            hbox({
-                text("═══ DEBUG: scontrol show job ") | color(Color::Cyan),
-                text(job_id) | bold | color(Color::Magenta),
-                text(" ═══") | color(Color::Cyan),
-            }) | center
-        );
-        lines.push_back(separator());
-
-        // Parse and display with highlighting
-        std::istringstream iss(*raw);
-        std::string line;
-        while (std::getline(iss, line)) {
-            std::vector<Element> line_elements;
-
-            // Split by spaces and highlight key=value pairs
-            std::istringstream lss(line);
-            std::string token;
-            while (lss >> token) {
-                size_t eq_pos = token.find('=');
-                if (eq_pos != std::string::npos) {
-                    std::string key = token.substr(0, eq_pos);
-                    std::string val = token.substr(eq_pos + 1);
-
-                    bool is_important = important_fields.count(key) > 0;
-
-                    if (is_important) {
-                        line_elements.push_back(text(key) | bold | color(Color::Yellow));
-                    } else {
-                        line_elements.push_back(text(key) | dim);
-                    }
-                    line_elements.push_back(text("="));
-                    if (is_important) {
-                        line_elements.push_back(text(val) | color(Color::Cyan));
-                    } else {
-                        line_elements.push_back(text(val));
-                    }
-                    line_elements.push_back(text(" "));
-                } else {
-                    line_elements.push_back(text(token + " "));
-                }
-            }
-
-            if (!line_elements.empty()) {
-                lines.push_back(hbox(line_elements));
-            }
-        }
-
-        lines.push_back(separator());
-        lines.push_back(text("Press any key to close") | dim | center);
-
-        return vbox(lines) | border | size(WIDTH, LESS_THAN, 100);
-    });
-
-    return CatchEvent(content, [on_close](Event e) {
-        if (e.is_character() || e == Event::Escape || e == Event::Return) {
-            on_close();
-            return true;
-        }
-        return false;
-    });
-}
-
-}
+}  // namespace ui

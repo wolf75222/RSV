@@ -1,11 +1,12 @@
 #!/bin/bash
 # Script de développement pour RSV
-# Usage: ./dev.sh [clean|build|run|all]
+# Usage: ./dev.sh [clean|configure|build|run|test|demo|all|help]
 
 set -e
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
+FAKE_BIN="$ROOT_DIR/tests/fake-slurm/bin"
 
 # Couleurs
 RED='\033[0;31m'
@@ -26,6 +27,19 @@ print_error() {
     echo -e "${RED}✗ $1${NC}"
 }
 
+# cmake n'est pas installé sur ROMEO hors Spack: même recherche que install.sh
+find_cmake() {
+    command -v cmake >/dev/null 2>&1 && return
+    type romeo_load_x64cpu_env >/dev/null 2>&1 || source /etc/profile.d/spack_bash_functions.sh 2>/dev/null || true
+    if type romeo_load_x64cpu_env >/dev/null 2>&1; then
+        romeo_load_x64cpu_env >/dev/null 2>&1 || true
+        local prefix
+        prefix=$(spack find --format '{prefix}' cmake 2>/dev/null | tail -n 1 || true)
+        [ -n "$prefix" ] && export PATH="$prefix/bin:$PATH"
+    fi
+    command -v cmake >/dev/null 2>&1 || { print_error "cmake introuvable"; exit 1; }
+}
+
 do_clean() {
     print_step "Nettoyage du build"
     rm -rf "$BUILD_DIR"
@@ -34,20 +48,25 @@ do_clean() {
 
 do_configure() {
     print_step "Configuration CMake"
-    mkdir -p "$BUILD_DIR"
-    cd "$BUILD_DIR"
-    cmake ..
+    find_cmake
+    cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DRSV_TESTS=ON
     print_success "Configuration terminée"
 }
 
 do_build() {
     print_step "Compilation"
-    if [ ! -d "$BUILD_DIR" ]; then
+    find_cmake
+    if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
         do_configure
     fi
-    cd "$BUILD_DIR"
-    cmake --build . -j$(nproc 2>/dev/null || echo 4)
+    cmake --build "$BUILD_DIR" -j "$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
     print_success "Compilation terminée"
+}
+
+do_test() {
+    do_build
+    print_step "Tests du parsing Slurm"
+    "$BUILD_DIR/parse_test"
 }
 
 do_run() {
@@ -55,8 +74,16 @@ do_run() {
         print_error "Exécutable non trouvé. Lance d'abord: ./dev.sh build"
         exit 1
     fi
-    cd "$BUILD_DIR"
-    ./rsv
+    "$BUILD_DIR/rsv" "$@"
+}
+
+# Avec un faux Slurm (jobs inventés): partout, même sans cluster
+do_demo() {
+    do_build
+    local state="${TMPDIR:-/tmp}/rsv-demo-$USER"
+    rm -rf "$state"
+    PATH="$FAKE_BIN:$PATH" FAKE_SLURM_STATE="$state" FAKE_SLURM_HOME="$state/home" HOME="$state/home" \
+        USER=demo "$BUILD_DIR/rsv" "$@"
 }
 
 show_help() {
@@ -69,10 +96,12 @@ show_help() {
     echo "  configure Configure CMake (télécharge FTXUI si nécessaire)"
     echo "  build     Compile le projet (configure si nécessaire)"
     echo "  run       Lance l'application"
-    echo "  all       Clean + Build + affiche la commande pour lancer"
+    echo "  test      Compile et lance les tests du parsing"
+    echo "  demo      Lance l'application avec un faux Slurm (jobs inventés)"
+    echo "  all       Clean + Build + Tests"
     echo "  help      Affiche cette aide"
     echo ""
-    echo "Sans argument: build + affiche la commande pour lancer"
+    echo "Sans argument: build. Pour installer dans ~/.local/bin: ./install.sh"
 }
 
 case "${1:-}" in
@@ -86,17 +115,21 @@ case "${1:-}" in
         do_build
         ;;
     run)
-        do_run
+        shift
+        do_run "$@"
+        ;;
+    test)
+        do_test
+        ;;
+    demo)
+        shift
+        do_demo "$@"
         ;;
     all)
         do_clean
-        do_build
+        do_test
         echo ""
         print_success "Build complet terminé!"
-        echo -e "${YELLOW}Pour lancer l'application:${NC}"
-        echo -e "  cd $BUILD_DIR && ./rsv"
-        echo -e "  ${BLUE}ou${NC}"
-        echo -e "  ./dev.sh run"
         ;;
     help|--help|-h)
         show_help
@@ -104,11 +137,7 @@ case "${1:-}" in
     "")
         do_build
         echo ""
-        print_success "Compilation terminée!"
-        echo -e "${YELLOW}Pour lancer l'application:${NC}"
-        echo -e "  cd $BUILD_DIR && ./rsv"
-        echo -e "  ${BLUE}ou${NC}"
-        echo -e "  ./dev.sh run"
+        echo -e "${YELLOW}Pour lancer l'application:${NC} ./dev.sh run   ${BLUE}ou${NC}   ./dev.sh demo"
         ;;
     *)
         print_error "Commande inconnue: $1"

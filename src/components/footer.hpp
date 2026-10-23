@@ -1,89 +1,82 @@
 #pragma once
 
-#include <ftxui/component/component.hpp>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include <ftxui/dom/elements.hpp>
+
+#include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
 
-inline Element footer() {
-    return hbox({
-        text(" q") | bold | color(Color::Yellow),
-        text(":Quit") | dim,
-        text(" "),
-        text("r") | bold | color(Color::Yellow),
-        text(":Refresh") | dim,
-        text(" "),
-        text("h") | bold | color(Color::Yellow),
-        text(":Help") | dim,
-        text(" "),
-        text("c") | bold | color(Color::Yellow),
-        text(":Cancel") | dim,
-        text(" "),
-        text("y") | bold | color(Color::Yellow),
-        text(":Copy") | dim,
-        text(" "),
-        text("s") | bold | color(Color::Yellow),
-        text(":Sort") | dim,
-        text(" "),
-        text("p") | bold | color(Color::Yellow),
-        text(":Parts") | dim,
-        text(" "),
-        text("d") | bold | color(Color::Yellow),
-        text(":Debug") | dim,
-        text(" "),
-        text("l") | bold | color(Color::Yellow),
-        text(":Logs") | dim,
-        text(" "),
-        text("a") | bold | color(Color::Yellow),
-        text(":History") | dim,
-        text(" "),
-        text("u") | bold | color(Color::Yellow),
-        text(":Quota") | dim,
-        text(" "),
-        filler(),
-    }) | border;
+/* The key line at the bottom: as many keys as fit, the most useful first
+- A message (copied, cancelled, an error) takes its place for a few seconds
+*/
+inline Element footer(int width, const std::string& message, bool message_is_error) {
+    if (!message.empty())
+        return hbox({text(" "), text(util::cut(message, static_cast<size_t>(std::max(1, width - 2)))) |
+                                    color(message_is_error ? theme::red() : theme::green())});
+
+    static const std::vector<std::pair<std::string, std::string>> keys = {
+        {"?", "help"}, {"q", "quit"}, {"l", "log"}, {"c", "cancel"}, {"/", "filter"}, {"a", "history"},
+        {"d", "details"}, {"p", "partitions"}, {"u", "limits"}, {"s", "sort"}, {"y", "copy id"}, {"r", "refresh"}};
+    Elements hints = {text(" ")};
+    int used = 1;
+    for (const auto& [k, l] : keys) {
+        const int w = static_cast<int>(util::width(k) + 1 + util::width(l) + 2);
+        if (used + w > width) break;
+        hints.push_back(keyHint(k, l));
+        used += w;
+    }
+    return hbox(std::move(hints));
 }
 
-inline Component helpModal(std::function<void()> on_close) {
-    auto content = Renderer([&] {
-        return vbox({
-            text("══════════════════ RSV HELP ══════════════════") | bold | center | color(Color::Cyan),
-            text(""),
-            text("Navigation") | bold | color(Color::Yellow),
-            hbox({text("  Up / Down       ") | color(Color::Cyan), text("Navigate job list")}),
-            hbox({text("  Mouse wheel     ") | color(Color::Cyan), text("Scroll details/logs")}),
-            text(""),
-            text("Actions") | bold | color(Color::Yellow),
-            hbox({text("  r               ") | color(Color::Cyan), text("Refresh jobs")}),
-            hbox({text("  c               ") | color(Color::Cyan), text("Cancel job (with confirmation)")}),
-            hbox({text("  y               ") | color(Color::Cyan), text("Copy job ID to clipboard (yank)")}),
-            hbox({text("  s               ") | color(Color::Cyan), text("Sort jobs (cycle: ID/Name/Entry)")}),
-            text(""),
-            text("Views") | bold | color(Color::Yellow),
-            hbox({text("  p               ") | color(Color::Cyan), text("Partitions view (sinfo)")}),
-            hbox({text("  d               ") | color(Color::Cyan), text("Debug view (scontrol show job)")}),
-            hbox({text("  l               ") | color(Color::Cyan), text("Logs view (stdout/stderr, scrollable)")}),
-            hbox({text("  a               ") | color(Color::Cyan), text("History (sacct) - filter with ←→")}),
-            hbox({text("  u               ") | color(Color::Cyan), text("User quota (sacctmgr limits)")}),
-            text(""),
-            text("Other") | bold | color(Color::Yellow),
-            hbox({text("  h / ?           ") | color(Color::Cyan), text("Show this help")}),
-            hbox({text("  q / Escape      ") | color(Color::Cyan), text("Quit application")}),
-            text(""),
-            text("════════════════════════════════════════════════") | color(Color::Cyan),
-            text(""),
-            text("Press any key to close") | dim | center,
-        }) | border | clear_under | center;
-    });
+inline Element helpView(int max_width, int refresh_seconds) {
+    const int width = std::min(max_width, 78);
+    auto row = [](const std::string& keys, const std::string& what) {
+        return hbox({text("  " + util::padRight(keys, 14)) | bold | color(theme::accent()), text(what)});
+    };
+    auto title = [](const std::string& s) { return text(s) | bold; };
+    auto legend = [](const std::string& code, const std::string& state, const std::string& label) {
+        return hbox({text(code) | bold | color(stateColor(state)), text(" " + label + "  ") | dim});
+    };
 
-    return CatchEvent(content, [on_close](Event e) {
-        if (e.is_character() || e == Event::Escape || e == Event::Return) {
-            on_close();
-            return true;
-        }
-        return false;
-    });
+    Elements lines = {
+        title("Jobs"),
+        row("j k  ↑ ↓", "move (PgUp PgDn: a page, g G: first, last)"),
+        row("/", "filter by name, id, state, partition or account"),
+        row("s", "sort: state, id, name, time left"),
+        row("J K", "scroll the details (or the mouse wheel over them)"),
+        text(""),
+        title("Selected job"),
+        row("l", "its log, followed as it grows (Tab: errors)"),
+        row("d", "everything scontrol says about it"),
+        row("c", "cancel it (asks first)"),
+        row("y  Y", "copy its id, or its output path"),
+        text(""),
+        title("Views"),
+        row("a", "history of the last 7 days, with CPU and memory used"),
+        row("p", "partitions: free nodes, CPUs and GPUs"),
+        row("u", "your accounts and their limits"),
+        text(""),
+        title("Other"),
+        row("r", "refresh now (every " + std::to_string(refresh_seconds) + " s otherwise)"),
+        row("q  Ctrl-C", "quit"),
+        text(""),
+        title("Legend"),
+        hbox({text("  "), legend("R", "RUNNING", "running"), legend("PD", "PENDING", "pending"),
+              legend("CD", "COMPLETED", "completed"), legend("F", "FAILED", "failed"), legend("CA", "CANCELLED", "cancelled")}),
+        hbox({text("  CPU ") | dim, text("███") | color(theme::green()), text("░░░") | color(theme::gray()) | dim,
+              text("  yours / not yours, one bar per socket") | dim}),
+        hbox({text("  GPU ") | dim, text("0 1 ") | bold | color(theme::green()), text("2 3") | dim,
+              text("  yours in color") | dim}),
+        hbox({text("  LEFT ") | dim, text("time left, or ~ when a pending job should start") | dim}),
+        text(""),
+        text("y copies through the terminal (OSC 52): over SSH too, in most terminals.") | dim,
+    };
+    return panel("RSV help", vbox(std::move(lines)) | size(WIDTH, EQUAL, width - 2));
 }
 
-}
+}  // namespace ui

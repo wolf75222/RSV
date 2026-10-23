@@ -3,10 +3,13 @@ myjobs.v3.sh
 
 # Build files
 build/
+build-*/
 
 # Extras
 *.mkv
+__pycache__/
 
 # IDE/Tools
 .claude/
 .vscode/
+.cache/

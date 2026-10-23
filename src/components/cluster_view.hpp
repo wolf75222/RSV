@@ -1,81 +1,82 @@
 #pragma once
 
-#include <ftxui/component/component.hpp>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
+
 #include "../api/slurmjobs.hpp"
+#include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
 
-inline Element renderPartitionBar(const api::PartitionInfo& p) {
-    int total = p.nodes_total;
-    if (total == 0) total = 1;
+/* Partitions (p): what is free right now, from sinfo
+- Read once when opened (it was read again at every frame), r reads again
+- CPUs and GPUs are counted node by node, so a partition's GPUs in use are exact
+*/
+struct PartitionsView {
+    std::vector<api::Partition> partitions;
+    std::string error;
+    bool loading = true;
+    std::function<void()> reload;
 
-    // Create visual bar
-    const int bar_width = 30;
-    int idle_w = (p.nodes_idle * bar_width) / total;
-    int mix_w = (p.nodes_mix * bar_width) / total;
-    int alloc_w = (p.nodes_alloc * bar_width) / total;
-    int down_w = bar_width - idle_w - mix_w - alloc_w;
-    if (down_w < 0) down_w = 0;
+    bool onEvent(Event e, bool& close) {
+        if (e == Event::Character('r')) {
+            loading = true;
+            if (reload) reload();
+            return true;
+        }
+        if (e.is_mouse()) return true;
+        close = true;   // any other key closes
+        return true;
+    }
 
-    std::vector<Element> bar_parts;
-    if (idle_w > 0) bar_parts.push_back(text(std::string(idle_w, '=')) | color(Color::Green));
-    if (mix_w > 0) bar_parts.push_back(text(std::string(mix_w, '=')) | color(Color::Yellow));
-    if (alloc_w > 0) bar_parts.push_back(text(std::string(alloc_w, '=')) | color(Color::Red));
-    if (down_w > 0) bar_parts.push_back(text(std::string(down_w, 'x')) | color(Color::GrayDark));
+    Element render(int max_width) {
+        const int width = std::min(max_width, 100);
+        const int inner = width - 4;
+        const bool show_gpu = inner >= 70, show_limit = inner >= 64;
+        const int fixed = 11 + (show_limit ? 12 : 0) + 6 * 4 + 1 + 12 + (show_gpu ? 10 : 0);
+        const int bar_w = std::clamp(inner - fixed, 6, 30);
 
-    return hbox(bar_parts);
-}
-
-inline Component clusterView() {
-    return Renderer([] {
-        auto partitions = api::slurm::getPartitions();
-
-        std::vector<Element> rows;
-
-        // Header
-        rows.push_back(
-            hbox({
-                text("PARTITION") | bold | size(WIDTH, EQUAL, 15),
-                text("NODES") | bold | size(WIDTH, EQUAL, 8),
-                text("IDLE") | bold | color(Color::Green) | size(WIDTH, EQUAL, 6),
-                text("MIX") | bold | color(Color::Yellow) | size(WIDTH, EQUAL, 6),
-                text("ALLOC") | bold | color(Color::Red) | size(WIDTH, EQUAL, 6),
-                text("DOWN") | bold | color(Color::GrayDark) | size(WIDTH, EQUAL, 6),
-                text("LIMIT") | bold | size(WIDTH, EQUAL, 12),
-                text("USAGE") | bold,
-            })
-        );
-        rows.push_back(separator());
+        auto cell = [](const std::string& s, int w, bool right = false) {
+            return text(right ? util::padLeft(s, static_cast<size_t>(w) - 1) + " " : util::padRight(s, static_cast<size_t>(w)));
+        };
+        Elements header = {cell("PARTITION", 11), show_limit ? cell("TIME LIMIT", 12) : text(""), cell("IDLE", 6, true) | color(theme::green()),
+                           cell("MIX", 6, true) | color(theme::yellow()), cell("ALLOC", 6, true), cell("DOWN", 6, true),
+                           text(" "), cell("CPUS IN USE", bar_w + 12)};
+        if (show_gpu) header.push_back(cell("GPUS", 10, true));
+        Elements rows = {hbox(std::move(header)) | dim};
 
         for (const auto& p : partitions) {
-            Color state_color = (p.state == "up") ? Color::Green : Color::Red;
-
-            rows.push_back(hbox({
-                text(p.name) | color(state_color) | size(WIDTH, EQUAL, 15),
-                text(std::to_string(p.nodes_total)) | size(WIDTH, EQUAL, 8),
-                text(std::to_string(p.nodes_idle)) | color(Color::Green) | size(WIDTH, EQUAL, 6),
-                text(std::to_string(p.nodes_mix)) | color(Color::Yellow) | size(WIDTH, EQUAL, 6),
-                text(std::to_string(p.nodes_alloc)) | color(Color::Red) | size(WIDTH, EQUAL, 6),
-                text(std::to_string(p.nodes_down)) | color(Color::GrayDark) | size(WIDTH, EQUAL, 6),
-                text(p.timelimit) | dim | size(WIDTH, EQUAL, 12),
-                renderPartitionBar(p),
-            }));
+            const double used = p.cpus_total > 0 ? double(p.cpus_alloc) / p.cpus_total : 0;
+            Elements row = {
+                cell(p.name + (p.is_default ? "*" : ""), 11) | bold | color(p.avail == "up" ? theme::green() : theme::red()),
+                show_limit ? cell(p.timelimit, 12) | dim : text(""),
+                cell(std::to_string(p.idle), 6, true) | color(theme::green()),
+                cell(std::to_string(p.mixed), 6, true) | color(theme::yellow()),
+                cell(std::to_string(p.allocated), 6, true),
+                cell(std::to_string(p.unavailable), 6, true) | (p.unavailable ? color(theme::red()) : Decorator(dim)),
+                text(" "),
+                bar(used, bar_w, usageColor(used)),
+                cell(" " + percent(used), 6, true),
+                cell(std::to_string(p.cpus_total), 6, true) | dim,
+            };
+            if (show_gpu)
+                row.push_back(p.gpus_total > 0 ? cell(std::to_string(p.gpus_used) + "/" + std::to_string(p.gpus_total), 10, true)
+                                               : cell("-", 10, true) | dim);
+            rows.push_back(hbox(std::move(row)));
         }
+        if (loading && partitions.empty()) rows.push_back(text("Reading sinfo...") | dim);
+        if (!error.empty()) rows.push_back(paragraph(error) | color(theme::red()));
 
-        // Legend
         rows.push_back(text(""));
-        rows.push_back(hbox({
-            text("Legend: ") | dim,
-            text("=") | color(Color::Green), text(" idle  ") | dim,
-            text("=") | color(Color::Yellow), text(" mix  ") | dim,
-            text("=") | color(Color::Red), text(" alloc  ") | dim,
-            text("x") | color(Color::GrayDark), text(" down") | dim,
-        }));
+        rows.push_back(text("* default partition. DOWN: down, drained or not responding.") | dim);
+        rows.push_back(hbox(keyHints({{"r", "refresh"}, {"any key", "close"}})));
+        return panel("Partitions", vbox(std::move(rows)) | size(WIDTH, EQUAL, width - 2));
+    }
+};
 
-        return vbox(rows) | border;
-    });
-}
-
-}
+}  // namespace ui
