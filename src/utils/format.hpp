@@ -211,11 +211,22 @@ inline std::string sanitize(const std::string& in) {
             i++;
             continue;
         }
-        // UTF-8: check the length and the continuation bytes
-        const size_t len = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 0;
+        // UTF-8 as RFC 3629 allows it: no overlong form, no surrogate, nothing past U+10FFFF, no F5..FF.
+        // FTXUI and terminals disagree on the width of anything else, which shifts the rest of the line.
+        size_t len = 0;
+        unsigned char lo = 0x80, hi = 0xBF;   // allowed range of the second byte
+        if (c >= 0xC2 && c <= 0xDF) len = 2;
+        else if (c == 0xE0) len = 3, lo = 0xA0;
+        else if ((c >= 0xE1 && c <= 0xEC) || c == 0xEE || c == 0xEF) len = 3;
+        else if (c == 0xED) len = 3, hi = 0x9F;
+        else if (c == 0xF0) len = 4, lo = 0x90;
+        else if (c >= 0xF1 && c <= 0xF3) len = 4;
+        else if (c == 0xF4) len = 4, hi = 0x8F;
         bool valid = len > 0 && i + len <= s.size();
-        for (size_t k = 1; valid && k < len; k++)
-            valid = (static_cast<unsigned char>(s[i + k]) & 0xC0) == 0x80;
+        for (size_t k = 1; valid && k < len; k++) {
+            const unsigned char b = static_cast<unsigned char>(s[i + k]);
+            valid = k == 1 ? b >= lo && b <= hi : (b & 0xC0) == 0x80;
+        }
         if (!valid) {
             out += '?';
             col++;
@@ -333,7 +344,8 @@ inline std::string clock(std::time_t t, std::time_t now = std::time(nullptr)) {
 inline std::string relative(std::time_t t, std::time_t now = std::time(nullptr)) {
     if (t <= 0) return "";
     const long d = static_cast<long>(std::difftime(t, now));
-    if (d >= 0) return "in " + duration(d);
+    if (d > 0) return "in " + duration(d);
+    if (d == 0) return "now";
     return duration(-d) + " ago";
 }
 

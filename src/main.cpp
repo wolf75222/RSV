@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <deque>
 #include <functional>
@@ -39,6 +40,13 @@ using namespace ftxui;
 namespace {
 
 constexpr const char* VERSION = "2.0.0";
+
+// The signal that asked RSV to end (kill, hangup), handled once FTXUI's loop has returned: see main()
+volatile std::sig_atomic_t quit_signal = 0;
+
+extern "C" void recordQuitSignal(int signal) {
+    quit_signal = signal;
+}
 
 /* Colors
 - FTXUI decides between 24 bit and 256 colors itself, when its loop starts. TERM=xterm-256color makes it
@@ -299,13 +307,19 @@ private:
         requestDetails(false);
     }
 
+    /* Details of the selected job (scontrol), read again once per refresh
+    - A job counts as fresh only once its answer is there: moving fast through the list skips jobs, they are read
+      when the selection comes back to them
+    - One request at a time for the same job, however often the screen is drawn
+    */
     void requestDetails(bool force) {
         const api::Job* j = selectedJob();
         if (!j) return;
         const std::string id = j->job_id;
         const auto when = details_time_.find(id);
         if (!force && when != details_time_.end() && Clock::now() - when->second < std::chrono::seconds(opts_.refresh - 1)) return;
-        details_time_[id] = Clock::now();
+        if (!force && details_pending_ == id) return;
+        details_pending_ = id;
 
         const uint64_t generation = ++details_generation_;
         const bool active = j->active();
@@ -325,6 +339,8 @@ private:
                 d.error = std::string("scontrol: ") + e.what();
             }
             post([this, id, d = std::move(d), n = std::move(n)]() mutable {
+                details_time_[id] = Clock::now();   // an error too: asked again at the next refresh, not in a loop
+                if (details_pending_ == id) details_pending_.clear();
                 if (!d.error.empty()) {
                     details_error_[id] = d.error;
                 } else {
@@ -442,7 +458,11 @@ private:
     }
 
     void cancelSelected() {
-        const std::string id = cancel_.id;   // as squeue shows it: 812402_[3-40] cancels only these pending tasks
+        // As squeue shows it: 812402_[3-40] cancels only these pending tasks. A throttle (812402_[3-40%4]) isn't an id.
+        std::string id = cancel_.id;
+        const size_t percent = id.find('%');
+        const size_t bracket = id.find(']', percent == std::string::npos ? 0 : percent);
+        if (percent != std::string::npos && bracket != std::string::npos) id.erase(percent, bracket - percent);
         view_ = View::None;
         showMessage("Cancelling job " + id + "...");
         slurm_.post([this, id] {
@@ -609,6 +629,7 @@ private:
     std::map<std::string, Clock::time_point> details_time_;
     std::map<std::string, api::NodeInfo> nodes_;
     std::atomic<uint64_t> details_generation_{0};
+    std::string details_pending_;                               // the job whose details were asked last, until they come
     std::map<std::string, ui::LogData> previews_;              // the end of each job's output
     std::map<std::string, Clock::time_point> preview_time_;
 
@@ -797,6 +818,10 @@ Element Viewer::render() {
 
 bool Viewer::onEvent(Event e) {
     if (e == Event::Custom) return false;
+    if (e == Event::CtrlC) {   // like q, from any view (FTXUI would turn it into SIGINT, see main())
+        screen_.Exit();
+        return true;
+    }
     if (e.is_mouse() && e.mouse().motion == Mouse::Moved) return true;
     if (view_ != View::None) return viewEvent(e);
     if (editing_filter_) return filterEvent(e);
@@ -947,7 +972,22 @@ int main(int argc, char* argv[]) {
     const auto colors = chooseColors(opts->color);
     if (colors) Terminal::SetColorSupport(*colors);
 
+    /* Signals
+    - FTXUI ends its loop on SIGINT, SIGTERM, SIGHUP and SIGQUIT, then raises the signal again with the handler that
+      was there before it. With the default one RSV died inside the loop, and the Slurm command running then (in its
+      own process group) was left behind. With this one, the loop returns, the workers stop their commands, then RSV
+      ends by the same signal.
+    - An ignored SIGCHLD is inherited through exec: children would be reaped by the system, and every command would
+      look successful
+    */
+    std::signal(SIGCHLD, SIG_DFL);
+    struct sigaction on_quit {};
+    on_quit.sa_handler = recordQuitSignal;
+    sigemptyset(&on_quit.sa_mask);
+    for (int s : {SIGINT, SIGTERM, SIGHUP, SIGQUIT}) sigaction(s, &on_quit, nullptr);
+
     auto screen = ScreenInteractive::Fullscreen();
+    screen.ForceHandleCtrlC(false);   // Ctrl-C is a key that quits (Viewer::onEvent), not a signal
     if (!opts->mouse) screen.TrackMouse(false);
 
     Viewer app(screen, *opts);
@@ -974,7 +1014,7 @@ int main(int argc, char* argv[]) {
         while (running) {
             // POLLIN asked: macOS only reports POLLHUP with it (Linux does in any case)
             pollfd input{STDIN_FILENO, POLLIN, 0};
-            if (poll(&input, 1, 0) > 0 && (input.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+            if (quit_signal || (poll(&input, 1, 0) > 0 && (input.revents & (POLLHUP | POLLERR | POLLNVAL)))) {
                 api::stopping() = true;
                 screen.Exit();
                 return;
@@ -999,5 +1039,10 @@ int main(int argc, char* argv[]) {
     timer_cv.notify_all();
     timer.join();
     app.stop();
+
+    if (quit_signal) {
+        std::signal(quit_signal, SIG_DFL);
+        std::raise(quit_signal);
+    }
     return 0;
 }

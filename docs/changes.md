@@ -4,7 +4,7 @@
 
 - Node view: the CPUs of a job were split between its nodes. `scontrol` gives the CPU ids used on *each* node of a group (`Nodes=romeo-a[031-032] CPU_IDs=0-15,72-87,144-159,216-231`): a 2-node job with 64 cores per node showed 32 on each. GPUs were the job's total divided by the nodes, and the first ones were colored instead of the ones used (`IDX:1,3`). Only the first group of nodes was read: a job with different allocations per node showed the first one everywhere.
 - The UI froze while Slurm answered: every move in the list ran `scontrol` for the job, then once per node, on the UI thread, and the refresh every 30 s too. With Slurm answering in 2 s, a key took 6 s to show. Commands now run in the background, with a time limit, and the UI answers at once.
-- Quitting took up to 30 s (the refresh thread slept 30 s before it could stop). It is now immediate, and a command still running is stopped.
+- Quitting took up to 30 s (the refresh thread slept 30 s before it could stop). It is now immediate, and a command still running is stopped, also on Ctrl-C, `kill` or a hangup.
 - The partitions view ran `sinfo` at every frame (each key, each mouse move).
 - No job: RSV printed "No jobs found" and quit, so the history, partitions and limits couldn't be seen. Jobs that ended while RSV was open left stale details.
 - Job names with spaces were cut at the first one (`train resnet50 (fp16)` showed `train`).

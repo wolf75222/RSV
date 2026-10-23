@@ -230,7 +230,12 @@ struct Job {
     bool finished() const { return !active() && !pending(); }
 };
 
-// The fields asked to squeue -O, in this order. The name is last: it may contain '|'.
+/* Separator of the fields asked to squeue and sacct: the unit separator (0x1F), which no name or path has.
+- '|' isn't safe: it can be in a job name, a directory, an output path (they then shifted the fields after them)
+*/
+constexpr char SEP = '\x1f';
+
+// The fields asked to squeue -O, in this order. The name is last: it may even contain the separator.
 inline const std::vector<std::string>& squeueFields() {
     static const std::vector<std::string> fields = {
         "JobArrayID", "JobID", "State", "Partition", "Account", "QOS", "NumNodes", "NumCPUs", "tres-alloc",
@@ -241,7 +246,7 @@ inline const std::vector<std::string>& squeueFields() {
 
 inline std::string squeueFormat() {
     std::string format;
-    for (const auto& f : squeueFields()) format += (format.empty() ? "" : ",") + f + ":|";
+    for (const auto& f : squeueFields()) format += (format.empty() ? "" : ",") + f + ":" + SEP;
     return format;
 }
 
@@ -255,14 +260,14 @@ inline std::vector<Job> parseSqueue(const std::string& out) {
         std::vector<std::string> f;
         size_t start = 0;
         while (f.size() + 1 < n) {
-            const size_t bar = line.find('|', start);
-            if (bar == std::string::npos) break;
-            f.push_back(util::trim(line.substr(start, bar - start)));
-            start = bar + 1;
+            const size_t sep = line.find(SEP, start);
+            if (sep == std::string::npos) break;
+            f.push_back(util::trim(line.substr(start, sep - start)));
+            start = sep + 1;
         }
         if (f.size() + 1 < n) continue;   // not one of our lines (a warning...)
         std::string name = line.substr(start);
-        if (!name.empty() && name.back() == '|') name.pop_back();
+        if (!name.empty() && name.back() == SEP) name.pop_back();
         f.push_back(name);
 
         Job j;
@@ -533,7 +538,7 @@ inline const std::vector<std::string>& sacctFields() {
     return fields;
 }
 
-/* sacct -P output, one line per job and per step (812301, 812301.batch, 812301.extern, 812301.0...)
+/* sacct -P output (fields separated by SEP), one line per job and per step (812301, 812301.batch, 812301.0...)
 - MaxRSS is only known for the steps: the largest one is kept
 - Newest first
 */
@@ -547,10 +552,10 @@ inline std::vector<HistoryJob> parseSacct(const std::string& out) {
         std::vector<std::string> f;
         size_t start = 0;
         while (f.size() + 1 < n) {
-            const size_t bar = line.find('|', start);
-            if (bar == std::string::npos) break;
-            f.push_back(line.substr(start, bar - start));
-            start = bar + 1;
+            const size_t sep = line.find(SEP, start);
+            if (sep == std::string::npos) break;
+            f.push_back(line.substr(start, sep - start));
+            start = sep + 1;
         }
         if (f.size() + 1 < n) continue;
         f.push_back(line.substr(start));
@@ -609,7 +614,7 @@ inline Fetched<std::vector<HistoryJob>> fetchHistory(const std::string& user, in
     std::string format;
     for (const auto& f : sacctFields()) format += (format.empty() ? "" : ",") + f;
     const RunResult res = run({"sacct", "-u", user, "-S", "now-" + std::to_string(days) + "days", "-n", "-P",
-                               "--format=" + format}, 30);
+                               std::string("--delimiter=") + SEP, "--format=" + format}, 30);
     if (!res.ok()) {
         r.error = res.error("sacct");
         return r;

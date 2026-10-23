@@ -77,7 +77,7 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
         } else if (j.pending() && j.submit > 0) {
             line.push_back(text("  for " + util::duration(static_cast<long>(std::difftime(now, j.submit)))) | dim);
         } else if (j.finished() && j.end > 0) {
-            line.push_back(text("  " + util::relative(j.end, now)) | dim);
+            line.push_back(text("  ended " + util::duration(std::max(0L, static_cast<long>(std::difftime(now, j.end)))) + " ago") | dim);
         }
         out.push_back(field("State", hbox(std::move(line))));
     }

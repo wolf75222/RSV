@@ -28,6 +28,16 @@ static int failures = 0;
         }                                                                                           \
     } while (0)
 
+// The fixtures are written with '|' for reading: squeue and sacct are asked for the unit separator (0x1F).
+// '^' stands for a real '|' (in a name).
+static std::string sep(std::string s) {
+    for (char& c : s) {
+        if (c == '|') c = api::SEP;
+        else if (c == '^') c = '|';
+    }
+    return s;
+}
+
 static void durations() {
     CHECK_EQ(util::parseDuration("45:10"), 45 * 60 + 10);
     CHECK_EQ(util::parseDuration("1:02:03"), 3723);
@@ -59,6 +69,12 @@ static void widths() {
     CHECK_EQ(util::sanitize("10%\r50%\r100%"), std::string("100%"));
     CHECK_EQ(util::sanitize(std::string("bad \xff byte")), std::string("bad ? byte"));
     CHECK_EQ(util::dropStart("abcdef", 2), std::string("cdef"));
+    // Malformed UTF-8: each bad byte is one '?', so FTXUI and the terminal agree on the width
+    CHECK_EQ(util::sanitize("A\xF5\x80\x80" "B"), std::string("A???B"));
+    CHECK_EQ(util::sanitize("A\xE0\x81\x81" "B"), std::string("A???B"));   // overlong
+    CHECK_EQ(util::sanitize("A\xED\xA0\x80" "B"), std::string("A???B"));   // surrogate
+    CHECK_EQ(util::sanitize("A\xF4\x90\x80\x80" "B"), std::string("A????B"));   // past U+10FFFF
+    CHECK_EQ(util::sanitize("\xF0\x9F\x9A\x80"), std::string("\xF0\x9F\x9A\x80"));   // a valid emoji stays
     CHECK_EQ(util::sanitize("a\xe2\x80\x8b" "b\xe2\x80\xae" "c\xef\xbb\xbf"), std::string("abc"));   // invisible: FTXUI would give them a column
     CHECK_EQ(util::sanitize("\u2764\ufe0f"), std::string("\u2764"));
     CHECK_EQ(util::width(util::sanitize("\U0001F468\u200D\U0001F469")), 4u);
@@ -81,13 +97,13 @@ static void squeue() {
     const std::string out =
         "900101|900101|RUNNING|long|proj-a|normal|2|128|cpu=128,mem=1500G,node=2,billing=128,gres/gpu=8|1-11:56:54|"
         "2-22:34:00|1-10:37:06|2026-10-22T10:39:59|2026-10-25T08:13:59|2026-10-22T10:39:59|None|romeo-a[031-032]|(null)|"
-        "/gpfs/home/demo/run/slurm-900101.out|/gpfs/home/demo/run|my job | with a bar|\n"
+        "/gpfs/home/demo/run/slurm-900101.out|/gpfs/home/demo/run|my job ^ with a bar|\n"
         "900200_1|900202|RUNNING|long|proj-b|normal|1|16|cpu=16,mem=64G,node=1,billing=16|1-09:22:51|7-00:00:00|5-14:37:09|"
         "2026-10-22T13:14:02|2026-10-29T12:14:02|2026-10-22T13:14:01|None|romeo-c002|(null)|/home/demo/a.out|/home/demo|sim|\n"
         "812402_[3-40%4]|812402|PENDING|instant|proj-b|normal|1|8|cpu=8,mem=16G,node=1,billing=8|0:00|01:00:00|01:00:00|"
         "N/A|N/A|2026-10-22T13:14:01|QOSMaxJobsPerUserLimit||afterok:1(unfulfilled)|/home/demo/s.out|/home/demo|sweep|\n"
         "slurm_load_jobs error: something\n";
-    const auto jobs = api::parseSqueue(out);
+    const auto jobs = api::parseSqueue(sep(out));
     CHECK_EQ(jobs.size(), 3u);
     if (jobs.size() < 3) return;
     CHECK_EQ(jobs[0].name, std::string("my job | with a bar"));   // spaces and bars in names
@@ -102,6 +118,19 @@ static void squeue() {
     CHECK_EQ(jobs[2].start, 0);
     CHECK_EQ(jobs[2].dependency, std::string("afterok:1(unfulfilled)"));
     CHECK_EQ(ui::taskCount(jobs[2].id), 38);
+
+    // A '|' in a path no longer shifts the fields after it
+    std::string line = sep("1|1|RUNNING|short|p|normal|1|1|cpu=1|0:01|1:00|0:59|N/A|N/A|N/A|None|n1|(null)|/w/a.out|");
+    line += "/home/demo/a|b";
+    line += api::SEP;
+    line += "my job";
+    line += api::SEP;
+    const auto odd = api::parseSqueue(line);
+    CHECK_EQ(odd.size(), 1u);
+    if (!odd.empty()) {
+        CHECK_EQ(odd[0].workdir, std::string("/home/demo/a|b"));
+        CHECK_EQ(odd[0].name, std::string("my job"));
+    }
 }
 
 static void details() {
@@ -194,14 +223,14 @@ static void partitions() {
 static void sacct() {
     const std::string out =
         "900300_12|COMPLETED|instant|proj-a|2026-10-23T10:00:00|2026-10-23T10:00:01|2026-10-23T10:00:14|00:00:13|01:00:00|1|1|8G|"
-        "billing=1,cpu=1,mem=8G,node=1|00:11.237|13||0:0|romeo-c001|my | job\n"
+        "billing=1,cpu=1,mem=8G,node=1|00:11.237|13||0:0|romeo-c001|my ^ job\n"
         "900300_12.batch|COMPLETED||proj-a|2026-10-23T10:00:01|2026-10-23T10:00:01|2026-10-23T10:00:14|00:00:13||1|1||"
         "cpu=1,mem=8G,node=1|00:11.236|13|324M|0:0|romeo-c001|batch\n"
         "900300_12.extern|COMPLETED||proj-a|2026-10-23T10:00:01|2026-10-23T10:00:01|2026-10-23T10:00:14|00:00:13||1|1||"
         "cpu=1,mem=8G,node=1|00:00.001|13|0|0:0|romeo-c001|extern\n"
         "900310|CANCELLED by 4242|short|proj-a|2026-10-23T11:00:00|None|2026-10-23T11:05:00|00:00:00|02:00:00|1|16|64G|"
         "billing=16,cpu=16,mem=64G,node=1|00:00:00|0||0:0|None assigned|later\n";
-    const auto h = api::parseSacct(out);
+    const auto h = api::parseSacct(sep(out));
     CHECK_EQ(h.size(), 2u);
     if (h.size() < 2) return;
     CHECK_EQ(h[0].id, std::string("900310"));   // newest first

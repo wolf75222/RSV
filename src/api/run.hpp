@@ -61,10 +61,15 @@ inline bool makePipe(int fds[2]) {
 }
 
 // Waits for the process to end, at most `ms` milliseconds. True if it ended (and was reaped).
+// Its status is lost when the system reaped it (SIGCHLD ignored): exit status 255 then, never a success.
 inline bool waitFor(pid_t pid, int& status, int ms) {
     for (int waited = 0;; waited += 10) {
         const pid_t r = waitpid(pid, &status, WNOHANG);
-        if (r == pid || (r < 0 && errno != EINTR)) return true;
+        if (r == pid) return true;
+        if (r < 0 && errno != EINTR) {
+            status = 255 << 8;
+            return true;
+        }
         if (waited >= ms) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -181,7 +186,12 @@ inline RunResult run(const std::vector<std::string>& args, int timeout_seconds =
         kill(-pid, SIGTERM);
         if (!detail::waitFor(pid, status, stopping() ? 200 : 2000)) {
             kill(-pid, SIGKILL);
-            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            while (waitpid(pid, &status, 0) < 0) {
+                if (errno != EINTR) {
+                    status = 255 << 8;
+                    break;
+                }
+            }
         }
     }
 
