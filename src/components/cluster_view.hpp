@@ -192,7 +192,22 @@ struct ClusterView {
         return {0, 0};
     }
 
-    // Nodes tab: the arrows (or h/j/k/l) move the cursor over the map or the table, Enter zooms on its node
+    /* The keys that change tabs, the same on every tab and in the zoom: ← → (h l), Tab, Shift-Tab, 1 to 4
+    - The Nodes tab once moved its cursor with ← →: Hardware, after it, couldn't be reached with the arrows
+    */
+    bool tabKey(const Event& e, int n) {
+        const std::string c = e.is_character() ? e.character() : "";
+        if (e == Event::ArrowRight || e == Event::Character('l') || e == Event::Tab) showTab(tab + 1);
+        else if (e == Event::ArrowLeft || e == Event::Character('h') || e == Event::TabReverse) showTab(tab - 1);
+        else if (c.size() == 1 && c[0] >= '1' && c[0] < '1' + n) showTab(c[0] - '1');
+        else return false;
+        zoom_open = false;
+        return true;
+    }
+
+    /* Nodes tab: the cursor over the map or the table, Enter zooms on its node
+    - ↑ ↓ (j k) go from node to node in the map's order, PgUp PgDn a row of the map up or down, g G the first and last
+    */
     bool mapEvent(const Event& e) {
         if (map_rows.empty()) return false;
         const auto place = cursorPlace();
@@ -204,15 +219,15 @@ struct ClusterView {
             cursor = map_rows[static_cast<size_t>(r)][static_cast<size_t>(std::clamp(c, 0, width(r) - 1))];
             follow_cursor = true;
         };
-        if (e == Event::ArrowRight || e == Event::Character('l')) {
+        if (e == Event::ArrowDown || e == Event::Character('j')) {
             if (col + 1 < width(row)) go(row, col + 1);
             else if (row + 1 < rows) go(row + 1, 0);
-        } else if (e == Event::ArrowLeft || e == Event::Character('h')) {
+        } else if (e == Event::ArrowUp || e == Event::Character('k')) {
             if (col > 0) go(row, col - 1);
             else if (row > 0) go(row - 1, width(row - 1) - 1);
-        } else if (e == Event::ArrowDown || e == Event::Character('j')) {
+        } else if (e == Event::PageDown || e == Event::Character(' ') || e == Event::CtrlD) {
             go(row + 1, col);
-        } else if (e == Event::ArrowUp || e == Event::Character('k')) {
+        } else if (e == Event::PageUp || e == Event::Character('b') || e == Event::CtrlU) {
             go(row - 1, col);
         } else if (e == Event::Home || e == Event::Character('g')) {
             go(0, 0);
@@ -228,17 +243,19 @@ struct ClusterView {
         return true;
     }
 
-    // The zoom: Esc goes back to the map, ←/→ to the node before or after it, p closes the view
+    // The zoom on a node: n N the next and previous node, j k scroll its jobs, ← → still change tabs
     bool zoomEvent(Event e, bool& close) {
-        const bool next = e == Event::ArrowRight || e == Event::Character('l');
-        if (e == Event::Character('p')) {
+        const bool next = e == Event::Character('n');
+        if (tabKey(e, static_cast<int>(tabs().size()))) {
+            return true;
+        } else if (e == Event::Character('p')) {
             close = true;
         } else if (e == Event::Escape || e == Event::Character('q') || e == Event::Return || e == Event::Backspace) {
             zoom_open = false;
             follow_cursor = true;
         } else if (e == Event::Character('r')) {
             openZoom(zoom_name);
-        } else if (next || e == Event::ArrowLeft || e == Event::Character('h')) {
+        } else if (next || e == Event::Character('N')) {
             std::vector<std::string> all;
             for (const auto& r : map_rows) all.insert(all.end(), r.begin(), r.end());
             if (!all.empty()) {
@@ -268,22 +285,19 @@ struct ClusterView {
     bool onEvent(Event e, bool& close) {
         if (zoom_open) return zoomEvent(e, close);
         const int n = static_cast<int>(tabs().size());
-        const std::string c = e.is_character() ? e.character() : "";
         if (e == Event::Escape || e == Event::Character('q') || e == Event::Character('p')) close = true;
         else if (e == Event::Character('r')) {
             loading = true;
             if (reload) reload();
             if (tab == 3) requestHardware();
-        } else if (e == Event::Tab) showTab(tab + 1);
-        else if (e == Event::TabReverse) showTab(tab - 1);
-        else if (c.size() == 1 && c[0] >= '1' && c[0] < '1' + n) showTab(c[0] - '1');
-        else if (tab == 2 && mapEvent(e)) return true;   // the arrows move the cursor there
-        else if (e == Event::ArrowRight || e == Event::Character('l')) showTab(tab + 1);
-        else if (e == Event::ArrowLeft || e == Event::Character('h')) showTab(tab - 1);
-        else if (e == Event::Character('t')) {
+        } else if (tabKey(e, n)) {
+            return true;
+        } else if (tab == 2 && mapEvent(e)) {
+            return true;   // ↑ ↓ move the cursor there
+        } else if (tab == 2 && e == Event::Character('t')) {
             table = !table;
             follow_cursor = true;
-        } else if (e == Event::Character('a')) by_account = !by_account;
+        } else if (tab == 1 && e == Event::Character('a')) by_account = !by_account;
         else if (e == Event::ArrowDown || e == Event::Character('j')) offset++;
         else if (e == Event::ArrowUp || e == Event::Character('k')) offset--;
         else if (e == Event::PageDown || e == Event::Character(' ') || e == Event::CtrlD) offset += page - 1;
@@ -971,11 +985,13 @@ struct ClusterView {
         }
         std::vector<std::pair<std::string, std::string>> hints;
         if (zoom_open) {
-            hints = {{"Esc", "back to the map"}, {"←/→", "other node"}, {"j/k", "scroll"}, {"r", "refresh"}, {"p", "close"}};
+            hints = {{"Esc", "back to the map"}, {"n/N", "other node"}, {"j/k", "scroll"}, {"←/→", "tabs"}, {"r", "refresh"},
+                     {"p", "close"}};
         } else {
-            hints = {{"Tab", "next"}};
+            hints = {{"←/→", "tabs"}};
             if (tab == 2) {
-                hints.push_back({"↑↓←→", "move"});
+                hints.push_back({"↑/↓", "node"});
+                hints.push_back({"PgUp/PgDn", "row"});
                 hints.push_back({"Enter", cursor.empty() ? "zoom" : "zoom on " + cursor});
                 hints.push_back({"t", table ? "map" : "table"});
             } else {

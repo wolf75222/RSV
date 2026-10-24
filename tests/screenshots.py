@@ -92,7 +92,7 @@ def main():
     shot(2.6, "2", 0.8)             # queue
     shot(3.0, "3", 0.8)             # nodes: why down, the map
     nodes_png = t.snapshot()
-    shot(2.6, "down,down,down,right,right,enter", 1.5)   # zoom on a node: its jobs
+    shot(2.6, "down,down,down,down,down,enter", 1.5)   # zoom on a node: its jobs
     zoom_png = t.snapshot()
     shot(3.0, "esc,4", 1.5)         # the hardware
     hardware_png = t.snapshot()

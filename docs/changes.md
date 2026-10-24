@@ -12,12 +12,14 @@
 - Paths are links to VS Code (Remote-SSH).
 - Slower refreshes when Slurm is slow, by themselves.
 
-**Fixes** (found with a real job on ROMEO)
+**Fixes** (found with real jobs on ROMEO)
 
 - `Now` (CPU busy) drifted down between two readings, from 97% to 73% in 3 s for a job using its 4 cores: the CPU time of one reading was divided by the time running until now. It is now measured between two readings.
 - `Now` showed `CPU 0% · memory 0` while a job was completing.
 - "1 GPUs".
 - The node cells were half in French.
+- Cluster view: on the Nodes tab `←` `→` moved the node cursor, so Hardware couldn't be reached with the arrows. `←` `→` now change tabs everywhere in the view (the zoom too), `↑` `↓` move the cursor.
+- The limits, GPU and help views closed on any key, an arrow too: they scroll now, `q` closes them.
 
 # Changes in RSV 2
 

@@ -26,19 +26,21 @@ struct QuotaView {
     std::string user, error, disk_error;
     bool loading = true;
     std::function<void()> reload;
+    int offset = 0;
+    int page = 20;
 
+    // r reads again, the arrows scroll (with many accounts and quotas it doesn't fit), q or Esc closes
     bool onEvent(Event e, bool& close) {
         if (e == Event::Character('r')) {
             loading = true;
             if (reload) reload();
-            return true;
+        } else if (!scrollKey(e, offset, page) && !e.is_mouse()) {
+            close = e == Event::Escape || e == Event::Character('q') || e == Event::Character('u');
         }
-        if (e.is_mouse()) return true;
-        close = true;
         return true;
     }
 
-    Element render(int max_width, const std::vector<api::Job>& jobs) {
+    Element render(int max_width, int max_height, const std::vector<api::Job>& jobs) {
         const int width = std::min(max_width, 90);
         const int inner = width - 4;
         const int bar_w = std::clamp(inner - 56, 6, 24);
@@ -149,8 +151,9 @@ struct QuotaView {
 
         rows.push_back(text(""));
         rows.push_back(text("Running counts come from your jobs in the queue now.") | dim);
-        rows.push_back(hbox(keyHints({{"r", "refresh"}, {"any key", "close"}})));
-        return panel("Accounts, limits and quotas", vbox(std::move(rows)) | size(WIDTH, EQUAL, width - 2));
+        page = std::max(1, max_height - 3);   // the frame and the keys
+        Element keys = hbox(keyHints({{"j/k", "scroll"}, {"r", "refresh"}, {"q", "close"}}));
+        return panel("Accounts, limits and quotas", vbox({fitOrScroll(rows, offset, page), keys}) | size(WIDTH, EQUAL, width - 2));
     }
 };
 

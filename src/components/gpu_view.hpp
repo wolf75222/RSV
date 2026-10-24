@@ -22,21 +22,23 @@ struct GpuView {
     std::string error;
     bool loading = true;
     std::function<void()> reload;
+    int offset = 0;
+    int page = 20;
 
+    // n or r runs nvidia-smi again, the arrows scroll (a job on 16 nodes has 64 GPUs), q or Esc closes
     bool onEvent(Event e, bool& close) {
         if (e == Event::Character('r') || e == Event::Character('n')) {
             if (!loading && reload) {
                 loading = true;
                 reload();
             }
-            return true;
+        } else if (!scrollKey(e, offset, page) && !e.is_mouse()) {
+            close = e == Event::Escape || e == Event::Character('q');
         }
-        if (e.is_mouse()) return true;
-        close = true;
         return true;
     }
 
-    Element render(int max_width) {
+    Element render(int max_width, int max_height) {
         const int width = std::min(max_width, 96);
         const int bar_w = std::clamp(width - 70, 6, 20);
         auto cell = [](const std::string& s, int w, bool right = false) {
@@ -64,8 +66,9 @@ struct GpuView {
                                 color(theme::yellow()));
         }
         lines.push_back(text(""));
-        lines.push_back(hbox(keyHints({{"n", "again"}, {"any key", "close"}})));
-        return panel(title, vbox(std::move(lines)) | size(WIDTH, EQUAL, width - 2));
+        page = std::max(1, max_height - 3);
+        Element keys = hbox(keyHints({{"n", "again"}, {"j/k", "scroll"}, {"q", "close"}}));
+        return panel(title, vbox({fitOrScroll(lines, offset, page), keys}) | size(WIDTH, EQUAL, width - 2));
     }
 };
 

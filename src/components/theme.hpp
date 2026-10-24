@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
 
 #include "../api/slurmjobs.hpp"
@@ -151,6 +152,30 @@ inline Element scrollWindow(const Elements& all, int offset, int height) {
     for (int i = 0; i < height; i++)
         track.push_back(i >= pos && i < pos + thumb ? text("┃") | color(theme::gray()) : text("│") | dim);
     return hbox({content, vbox(std::move(track))});
+}
+
+// A view's lines in `height` lines at most: all of them, or a window that scrolls (`offset` is clamped here)
+inline Element fitOrScroll(const Elements& lines, int& offset, int height) {
+    height = std::max(1, height);
+    const int total = static_cast<int>(lines.size());
+    offset = std::clamp(offset, 0, std::max(0, total - height));
+    if (total <= height) return vbox(lines);
+    return scrollWindow(lines, offset, height);
+}
+
+// The scrolling keys of the views: ↑ ↓ j k a line, PgUp PgDn (space, b) a page, g G Home End, the wheel
+inline bool scrollKey(Event e, int& offset, int page) {   // a copy: FTXUI's mouse() isn't const
+    if (e == Event::ArrowDown || e == Event::Character('j')) offset++;
+    else if (e == Event::ArrowUp || e == Event::Character('k')) offset--;
+    else if (e == Event::PageDown || e == Event::Character(' ') || e == Event::CtrlD) offset += std::max(1, page - 1);
+    else if (e == Event::PageUp || e == Event::Character('b') || e == Event::CtrlU) offset -= std::max(1, page - 1);
+    else if (e == Event::Home || e == Event::Character('g')) offset = 0;
+    else if (e == Event::End || e == Event::Character('G')) offset = 1 << 20;
+    else if (e.is_mouse() && e.mouse().button == Mouse::WheelDown) offset += 3;
+    else if (e.is_mouse() && e.mouse().button == Mouse::WheelUp) offset -= 3;
+    else return false;
+    offset = std::max(0, offset);
+    return true;
 }
 
 /* A framed box with a title in its top line, drawn over what is behind it

@@ -43,7 +43,7 @@ inline Element footer(int width, const std::string& message, bool message_is_err
 /* Help (?): every key, in two columns when the screen is wide enough
 - One column on a narrow screen: what doesn't fit is cut, the essentials come first
 */
-inline Element helpView(int max_width, int refresh_seconds) {
+inline Element helpView(int max_width, int max_height, int refresh_seconds, int& offset) {
     const bool two = max_width >= 136;
     auto row = [](const std::string& keys, const std::string& what) {
         return hbox({text("  " + util::padRight(keys, 12)) | bold | color(theme::accent()), text(what)});
@@ -96,15 +96,19 @@ inline Element helpView(int max_width, int refresh_seconds) {
         text("y copies through the terminal (OSC 52), over SSH too.") | dim,
         text("Paths are links to VS Code (Remote-SSH): Cmd or Ctrl-click.") | dim,
     };
-    Element content;
+    // As rows, so that a short screen scrolls them (↑ ↓): side by side when wide enough, one after the other else
+    Elements rows;
     if (two) {
-        content = hbox({vbox(std::move(left)) | size(WIDTH, EQUAL, 66), text("  "), vbox(std::move(right))});
+        for (size_t i = 0; i < std::max(left.size(), right.size()); i++)
+            rows.push_back(hbox({(i < left.size() ? left[i] : text("")) | size(WIDTH, EQUAL, 66), text("  "),
+                                 i < right.size() ? right[i] : text("")}));
     } else {
-        left.push_back(text(""));
-        for (auto& e : right) left.push_back(std::move(e));
-        content = vbox(std::move(left));
+        rows = std::move(left);
+        rows.push_back(text(""));
+        for (auto& e : right) rows.push_back(std::move(e));
     }
-    return panel("RSV help", content | size(WIDTH, EQUAL, std::min(max_width, two ? 136 : 78) - 2));
+    const int page = std::max(1, max_height - 2);
+    return panel("RSV help", fitOrScroll(rows, offset, page) | size(WIDTH, EQUAL, std::min(max_width, two ? 136 : 78) - 2));
 }
 
 }  // namespace ui

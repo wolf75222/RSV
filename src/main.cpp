@@ -1097,6 +1097,7 @@ private:
     std::set<std::string> marked_;                              // rows marked with Space: job ids, 812402_*
     bool project_ = false;                                      // o: everyone's jobs in your accounts
     bool hold_refused_ = false;                                 // Slurm refused H once: it says why at once now
+    int help_offset_ = 0;                                       // the help scrolls on a short screen
     std::vector<std::string> accounts_;
     uint64_t scope_ = 0;                                        // one more at each switch between the two
     int interval_ = 15;                                         // seconds between two readings of the queue
@@ -1284,14 +1285,14 @@ Element Viewer::render() {
     Element over;
     const int ow = std::min(W - 2, 140), oh = H - 2;   // the margin takes the 2 others
     switch (view_) {
-        case View::Help: over = ui::helpView(W - 2, opts_.refresh); break;
+        case View::Help: over = ui::helpView(W - 2, oh, opts_.refresh, help_offset_); break;
         case View::Logs: over = logs_.render(ow, oh); break;
         case View::Debug: over = debug_.render(std::min(W - 2, 120), oh); break;
         case View::Script: over = script_.render(std::min(W - 2, 120), oh); break;
         case View::History: over = history_.render(std::min(W - 2, 130), oh); break;
         case View::Partitions: over = cluster_.render(std::min(W - 2, 140), oh, myNodes()); break;
-        case View::Quota: over = quota_.render(W - 2, project_ ? ownJobs() : jobs_); break;
-        case View::Gpu: over = gpu_.render(W - 2); break;
+        case View::Quota: over = quota_.render(W - 2, oh, project_ ? ownJobs() : jobs_); break;
+        case View::Gpu: over = gpu_.render(W - 2, oh); break;
         case View::Plan: over = plan_.render(W - 2); break;
         case View::Confirm: over = confirmView(); break;
         case View::None: break;
@@ -1377,7 +1378,8 @@ bool Viewer::viewEvent(Event& e) {
     bool handled = true;
     switch (view_) {
         case View::Help:
-            close = !e.is_mouse();
+            // The arrows scroll it on a short screen, any other key closes it
+            if (!ui::scrollKey(e, help_offset_, Terminal::Size().dimy - 4)) close = !e.is_mouse();
             break;
         case View::Logs: handled = logs_.onEvent(e, close); break;
         case View::Debug: handled = debug_.onEvent(e, close); break;
@@ -1454,7 +1456,10 @@ bool Viewer::mainEvent(Event& e) {
     } else if (e == Event::Character('r')) {
         refresh();
         requestDetails(true);
-    } else if (e == Event::Character('?') || e == Event::Character('h')) view_ = View::Help;
+    } else if (e == Event::Character('?') || e == Event::Character('h')) {
+        view_ = View::Help;
+        help_offset_ = 0;
+    }
     else if (e == Event::Character('a')) {
         view_ = View::History;
         // sacct can take seconds: what was read less than a minute ago is shown as it is (r reads again)
@@ -1467,6 +1472,7 @@ bool Viewer::mainEvent(Event& e) {
         loadCluster(true);
     } else if (e == Event::Character('u')) {
         view_ = View::Quota;
+        quota_.offset = 0;
         loadQuota();
     } else if (e == Event::Character('t')) {
         openPlan();
