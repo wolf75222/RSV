@@ -713,6 +713,16 @@ private:
         return "";
     }
 
+    /* Why H can't work on ROMEO (tried on its Slurm 23.11 in October 2026)
+    - Its submit plugin refuses any change of a job that doesn't give a time limit: scontrol hold, uhold and release
+      give none, and are refused ("Requested time limit is invalid")
+    - A hold goes through with one (scontrol update TimeLimit=... Priority=0), but nothing releases the job then: a
+      user can only release with scontrol release. RSV doesn't hold jobs that way: they would stay held.
+    */
+    static std::string holdRefused() {
+        return "ROMEO refuses hold and release to users (no time limit in the change): cancel (c) and submit again";
+    }
+
     static std::string about(const ui::JobArray& a) {
         std::string s;
         if (a.progress.running) s = std::to_string(a.progress.running) + " running";
@@ -726,6 +736,10 @@ private:
       A running job can't be paused by its user (scontrol suspend is for admins).
     */
     void openAction(Action::Kind kind, const Row* selected) {
+        if (kind != Action::Cancel && hold_refused_) {
+            showMessage(holdRefused(), true);
+            return;
+        }
         std::vector<std::string> keys(marked_.begin(), marked_.end());
         if (keys.empty() && selected) keys.push_back(selected->key());
         if (kind != Action::Cancel) {
@@ -807,6 +821,14 @@ private:
                 error = std::string(kind == Action::Cancel ? "scancel: " : "scontrol: ") + e.what();
             }
             post([this, kind, what, error] {
+                // ROMEO's submit plugin refuses every change without a time limit: hold and release among them
+                if (kind != Action::Cancel && error.find("time limit is invalid") != std::string::npos) {
+                    hold_refused_ = true;
+                    showMessage(holdRefused(), true);
+                    refreshing_ = false;
+                    refresh();
+                    return;
+                }
                 if (error.empty()) {
                     showMessage(what + (kind == Action::Cancel ? " cancelled" : kind == Action::Hold ? " held" : " released"));
                     marked_.clear();
@@ -1074,6 +1096,7 @@ private:
     std::set<std::string> open_arrays_;                         // arrays shown with their tasks (Enter)
     std::set<std::string> marked_;                              // rows marked with Space: job ids, 812402_*
     bool project_ = false;                                      // o: everyone's jobs in your accounts
+    bool hold_refused_ = false;                                 // Slurm refused H once: it says why at once now
     std::vector<std::string> accounts_;
     uint64_t scope_ = 0;                                        // one more at each switch between the two
     int interval_ = 15;                                         // seconds between two readings of the queue

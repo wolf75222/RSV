@@ -23,7 +23,7 @@ Your jobs, running first, then pending, then the ones that just ended (Slurm for
 | `/` | filter: type, `Enter` keeps it, `Esc` clears it. Matches the id, name, state, partition, account and pending reason |
 | `s` | sort: state, newest first, name, time left |
 | `J` `K` | scroll the details (or the mouse wheel over them) |
-| `Space` | mark the job (or array) and go to the next one: `c` and `H` then act on all the marked ones, `Esc` unmarks them |
+| `Space` | mark the job (or array) and go to the next one: `c` then cancels all the marked ones, `Esc` unmarks them |
 | `Enter`, `→` `←` | on an array: show its tasks under it, fold them |
 | `o` | the project view: everyone's jobs in your accounts, read-only (`o` again: yours) |
 | `r` | refresh now |
@@ -32,6 +32,8 @@ Your jobs, running first, then pending, then the ones that just ended (Slurm for
 The selection follows the job through refreshes and sorts.
 
 **Arrays.** All the tasks of an array are one row, `812402_*`, with a bar of its tasks (done, failed, cancelled, running, waiting) and how many have ended out of how many. Its details say how many tasks are done, running, waiting, failed (with their exit codes), on which nodes the running ones are, why the others wait and when they should start. `Enter` shows its tasks under it, each with its own details, log and script. Slurm forgets a task 5 minutes after it ended: the older ones come from `sacct`, read once a minute.
+
+**Hold and release on ROMEO.** ROMEO's submit plugin refuses every change of a job that doesn't give a time limit. `scontrol hold`, `uhold` and `release` give none: they are all refused with "Requested time limit is invalid", and `H` says so. A hold does go through with one (`scontrol update jobid=<id> TimeLimit=<its limit> Priority=0`), but then nothing lets a user release the job: `scontrol release` is refused the same way, and a user can't raise a priority. RSV doesn't hold jobs that way. A job submitted with `--hold` can only be released by the support team: cancel it and submit it again. (Tried on two test jobs, October 2026.)
 
 **Project.** `o` shows the jobs of everyone in your accounts (those that can run jobs, from `sacctmgr`), with a `USER` column: ROMEO lets every user see the queue (`PrivateData = none`). Read-only: nothing can be cancelled or held there. The details and the logs work when the files can be read.
 
@@ -51,7 +53,7 @@ Under it, when there is room, the last lines of the job's output.
 | `b` | Script | The script the job was submitted with (`scontrol write batch_script`), `#SBATCH` lines highlighted, `y` copies it. Slurm keeps it while the job waits or runs: ROMEO doesn't store the scripts of ended jobs (`AccountingStoreFlags` has no `job_script`). |
 | `d` | scontrol | Everything Slurm says about the job, the important fields highlighted. |
 | `c` | Cancel | The marked jobs, or the selected one, listed first (`y` to cancel, anything else keeps them). On an array's row, all its tasks; on `812402_[159-200]`, only the tasks still waiting when you confirm (`scancel --state=PENDING`). |
-| `H` | Hold | Holds the waiting jobs (they keep waiting but don't start), or releases them when they are all held already (`scontrol hold`, `release`). For an array, its tasks still waiting when you confirm. A running job can't be paused by its user. |
+| `H` | Hold | Holds the waiting jobs (they keep waiting but don't start), or releases them when they are all held already (`scontrol hold`, `release`). For an array, its tasks still waiting when you confirm. A running job can't be paused by its user. **ROMEO refuses both** (see below). |
 | `a` | History | Your jobs of the last 7 days (`sacct`), what they used, see below. `←` `→` filter by state, `s` sort, `r` read again. |
 | `p` | Cluster | All of ROMEO, read again every 15 s while open, in four tabs (`Tab`, or `1` to `4`). See below. |
 | `t` | Start time | When would a job start? Account, partition, constraint, nodes, cores, GPUs, memory and time: `Enter` asks Slurm (`sbatch --test-only`, nothing is submitted) and shows when and where, or why it can't. |

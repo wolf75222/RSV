@@ -25,8 +25,8 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 | `d` | everything `scontrol` says about the job |
 | `n` | the job's GPUs now: use and memory |
 | `c` | cancel the job, or a whole array (asks first) |
-| `H` | hold a waiting job, or release it |
-| `Space` | mark jobs: `c` and `H` then act on all of them |
+| `H` | hold or release a waiting job (ROMEO refuses both to users, RSV says why) |
+| `Space` | mark jobs: `c` then cancels all of them |
 | `y` | copy the job id |
 | `/` | filter |
 | `s` | sort |
@@ -48,7 +48,7 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 - Running jobs: how busy their CPUs are and their memory now, GPUs on demand. Pending ones: their priority and rank in the queue.
 - History with CPU, memory and time efficiency, CPU and GPU hours, what was reserved but idle and the time asked but not used.
 - Your project: your colleagues' jobs in your accounts, read-only.
-- Several jobs at once: mark them, then cancel or hold them, after a confirmation that lists them.
+- Several jobs at once: mark them, then cancel them, after a confirmation that lists them.
 - The whole cluster, live: CPUs, GPUs, load, memory and storage in use with their curve since you opened it, reservations and maintenances, partitions and their rules, everyone's queue and why it waits, the nodes down and why, a map of every node (yours marked) with a zoom on one, and the hardware of each kind of node.
 - When would a job start? Slurm's own estimate for the job you describe, without submitting it.
 - Your accounts: their limits, fairshare and disk quotas.

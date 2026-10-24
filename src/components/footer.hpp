@@ -21,14 +21,14 @@ inline Element footer(int width, const std::string& message, bool message_is_err
     // Rows marked with Space: what can be done with them
     if (marked > 0) {
         Elements hints = {text(" " + std::to_string(marked) + " marked  ") | bold | color(theme::yellow())};
-        for (auto& h : keyHints({{"c", "cancel"}, {"H", "hold/release"}, {"Space", "mark"}, {"Esc", "unmark"}})) hints.push_back(h);
+        for (auto& h : keyHints({{"c", "cancel"}, {"Space", "mark"}, {"Esc", "unmark"}})) hints.push_back(h);
         return hbox(std::move(hints));
     }
 
     static const std::vector<std::pair<std::string, std::string>> keys = {
         {"?", "help"},    {"q", "quit"},       {"l", "log"},     {"p", "cluster"}, {"c", "cancel"},   {"/", "filter"},
         {"a", "history"}, {"o", "project"},    {"b", "script"},  {"Space", "mark"}, {"t", "start time"}, {"u", "limits"},
-        {"d", "details"}, {"n", "GPUs"},       {"H", "hold"},    {"s", "sort"},    {"y", "copy id"},  {"r", "refresh"}};
+        {"d", "details"}, {"n", "GPUs"},       {"s", "sort"},    {"y", "copy id"},  {"r", "refresh"}};
     Elements hints = {text(" ")};
     int used = 1;
     for (const auto& [k, l] : keys) {
@@ -59,7 +59,7 @@ inline Element helpView(int max_width, int refresh_seconds) {
         row("/", "filter by name, id, state, partition, account, user"),
         row("s", "sort: state, id, name, time left"),
         row("J K", "scroll the details (or the mouse wheel over them)"),
-        row("Space", "mark: c and H then act on all marked (Esc unmarks)"),
+        row("Space", "mark: c then cancels all marked (Esc unmarks)"),
         row("Enter  → ←", "an array: show its tasks under it, or fold them"),
         row("o", "your project: everyone's jobs in your accounts"),
         text(""),
@@ -69,7 +69,7 @@ inline Element helpView(int max_width, int refresh_seconds) {
         row("d", "everything scontrol says about it"),
         row("n", "its GPUs now: use and memory"),
         row("c", "cancel it, or a whole array (asks first)"),
-        row("H", "hold it (waits, won't start) or release it"),
+        row("H", "hold or release it (ROMEO refuses both to users)"),
         row("y  Y", "copy its id, or its output path"),
     };
     Elements right = {
