@@ -59,6 +59,24 @@ if CMD in os.environ.get("FAKE_SLURM_FAIL", "").split(","):
     fail("%s: error: Socket timed out on send/recv operation" % CMD)
 
 
+def anchor():
+    """When this fake cluster was first asked: running jobs started before it, so their run and CPU times grow"""
+    path = os.path.join(STATE, "anchor")
+    try:
+        with open(path) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        try:
+            with open(path, "w") as f:
+                f.write(str(NOW))
+        except OSError:
+            pass
+        return NOW
+
+
+ANCHOR = anchor()
+
+
 # ---------------------------------------------------------------- hostlists
 
 def expand(hostlist):
@@ -172,7 +190,7 @@ def job(**kw):
     j.update(kw)
     j["job_id"] = j["job_id"] or j["id"]
     if j["state"] in ("RUNNING", "COMPLETING") and not j["start"]:
-        j["start"] = NOW - j["elapsed"]
+        j["start"] = ANCHOR - j["elapsed"]
     if j["start"] and j["state"] != "PENDING":
         j["submit"] = min(j["submit"], j["start"] - 5 * MIN)
     if j["state"] == "RUNNING":
