@@ -811,7 +811,8 @@ private:
                     showMessage(what + (kind == Action::Cancel ? " cancelled" : kind == Action::Hold ? " held" : " released"));
                     marked_.clear();
                 } else {
-                    showMessage(error, true);
+                    showMessage(std::string(kind == Action::Cancel ? "Not cancelled: " : kind == Action::Hold ? "Not held: " : "Not released: ") + error,
+                                true);
                 }
                 refreshing_ = false;
                 refresh();

@@ -153,7 +153,7 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
                                            (j.account.empty() ? "" : " · " + j.account) +
                                            (features.empty() || features == "(null)" ? "" : " · " + features))));
 
-    std::string res = std::to_string(j.nodes) + (j.nodes == 1 ? " node" : " nodes") + " · " + std::to_string(j.cpus) + " CPUs";
+    std::string res = std::to_string(j.nodes) + (j.nodes == 1 ? " node" : " nodes") + " · " + std::to_string(j.cpus) + (j.cpus == 1 ? " CPU" : " CPUs");
     if (j.gpus > 0) res += " · " + std::to_string(j.gpus) + (j.gpus == 1 ? " GPU" : " GPUs");
     if (j.mem_mib > 0) res += " · " + util::mib(j.mem_mib);
     out.push_back(field(j.pending() ? "Asks" : "Uses", value(res)));
@@ -268,13 +268,14 @@ inline Elements arrayDetails(const JobArray& a, int width, const std::string& pa
         const ui::ReasonInfo info = decodeReason(w->reason);
         out.push_back(field("Waiting", value(std::to_string(api::taskCount(w->id)) + (api::taskCount(w->id) == 1 ? " task · " : " tasks · ") + w->reason) | color(theme::yellow())));
         out.push_back(field("", value(info.description)));
+        if (!info.suggestion.empty()) out.push_back(field("", text(util::cut("> " + info.suggestion, static_cast<size_t>(value_width))) | dim));
         if (w->start > now)
             out.push_back(field("Starts", hbox({text("~" + util::clock(w->start, now)), text("  " + util::relative(w->start, now)) | dim})));
     }
 
     out.push_back(field("Partition", value(f.partition + (f.qos.empty() ? "" : " · QOS " + f.qos) +
                                            (f.account.empty() ? "" : " · " + f.account))));
-    std::string res = std::to_string(f.nodes) + (f.nodes == 1 ? " node" : " nodes") + " · " + std::to_string(f.cpus) + " CPUs";
+    std::string res = std::to_string(f.nodes) + (f.nodes == 1 ? " node" : " nodes") + " · " + std::to_string(f.cpus) + (f.cpus == 1 ? " CPU" : " CPUs");
     if (f.gpus > 0) res += " · " + std::to_string(f.gpus) + (f.gpus == 1 ? " GPU" : " GPUs");
     if (f.mem_mib > 0) res += " · " + util::mib(f.mem_mib);
     if (f.limit > 0) res += " · " + util::duration(f.limit);
