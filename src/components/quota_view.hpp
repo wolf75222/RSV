@@ -8,22 +8,13 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
 
+#include "../api/arrays.hpp"
 #include "../api/slurmjobs.hpp"
 #include "../api/usage.hpp"
 #include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
-
-// Number of jobs a squeue line stands for: 812402_[3-40%4] is 38 pending tasks
-inline int taskCount(const std::string& id) {
-    const size_t open = id.find("_[");
-    if (open == std::string::npos) return 1;
-    std::string ranges = id.substr(open + 2, id.find(']', open) - open - 2);
-    ranges = ranges.substr(0, ranges.find('%'));
-    const int n = static_cast<int>(api::parseIdList(ranges).size());
-    return std::max(1, n);
-}
 
 /* Limits (u): for each of your accounts, its limits (sacctmgr) and what your jobs use now (squeue)
 - Every account is shown: on ROMEO "default" allows no job (MaxSubmit=0), --account is needed
@@ -64,7 +55,7 @@ struct QuotaView {
                 u.nodes += j.nodes;
                 u.running++;
             }
-            if (j.active() || j.pending()) u.submitted += taskCount(j.id);
+            if (j.active() || j.pending()) u.submitted += api::taskCount(j.id);
         }
 
         auto gauge_line = [&](const std::string& label, long used, double limit, const std::string& unit) {

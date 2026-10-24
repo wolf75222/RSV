@@ -10,7 +10,7 @@
 ## Layout
 
 - `src/main.cpp`: options, colors, the `Viewer` (UI state, keys, layout), the workers, the hangup watchdog.
-- `src/api/run.hpp`: runs a command without a shell, with a time limit; `src/api/slurmjobs.hpp`: what RSV asks Slurm and the parsing of its answers.
+- `src/api/run.hpp`: runs a command without a shell, with a time limit; `src/api/slurmjobs.hpp`: what RSV asks Slurm about jobs and the parsing of its answers; `arrays.hpp`: arrays and their progress; `cluster.hpp`: the cluster view's data; `usage.hpp`: live use, priority, shares, quotas, the start-time estimate.
 - `src/components/`: the views (list, details, node cells, log, history, partitions, limits, help).
 - `src/utils/format.hpp`: widths, cutting, durations, sizes.
 
@@ -19,6 +19,6 @@ Threads: the UI state belongs to FTXUI's thread. Slurm commands run on one worke
 ## Tests
 
 - `tests/parse_test.cpp`: the parsers on Slurm output recorded on ROMEO (made-up names): `cmake -DRSV_TESTS=ON`, then `ctest` or `./build/parse_test`.
-- `tests/fake-slurm/`: `squeue`, `scontrol`, `sinfo`, `sacct`, `sacctmgr` and `scancel` with made-up jobs. Put `tests/fake-slurm/bin` first in `PATH`. `FAKE_SLURM_SCENARIO=empty|many|unicode`, `FAKE_SLURM_DELAY=20` (a hung slurmctld), `FAKE_SLURM_FAIL=squeue`. Its `scancel` cancels nothing real.
+- `tests/fake-slurm/`: `squeue`, `scontrol`, `sinfo`, `sacct`, `sacctmgr`, `scancel`, `sstat`, `sprio`, `sshare`, `mmlsquota`, `srun`, `sbatch` and `sdiag` with made-up jobs: an array of 200 tasks, colleagues in the same accounts for the project view, logs with errors. Put `tests/fake-slurm/bin` first in `PATH`. `FAKE_SLURM_SCENARIO=empty|many|unicode`, `FAKE_SLURM_DELAY=20` (a hung slurmctld; a `delay` file in the state folder slows it while a test runs), `FAKE_SLURM_FAIL=squeue`. Its `scancel` and `scontrol hold` change nothing real: they mark the jobs in its state folder.
 - `tests/tui.py`: runs a program in a pseudo-terminal, answers the terminal queries, sends keys, keeps the screen with `pyte` and draws it with Pillow (`pip install pyte pillow`).
 - `tests/screenshots.py`: the GIF and screenshots of the README, from the fake Slurm. `--ssh romeo --dir '~/RSV'` runs RSV on ROMEO and draws it here.

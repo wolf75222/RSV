@@ -5,7 +5,7 @@
     python3 tests/screenshots.py --ssh romeo --dir '~/RSV'   # on ROMEO (built there), drawn here
 
 Needs pyte and Pillow where it runs (pip install pyte pillow), only the standard library on the remote side.
-Writes img/rsv.gif, img/history.png, img/log.png, img/cluster.png and img/nodes.png.
+Writes img/rsv.gif, img/history.png, img/log.png, img/cluster.png, img/nodes.png, img/node.png and img/hardware.png.
 """
 
 import argparse
@@ -33,7 +33,7 @@ def command(args):
     script = ("S=/tmp/rsv-screenshots-$(id -un); ROOT={root}; BIN={binary}; rm -rf {state}; "
               "export PATH=$ROOT/tests/fake-slurm/bin:$PATH USER=demo FAKE_SLURM_STATE={state} "
               "FAKE_SLURM_HOME={state}/home HOME={state}/home RSV_COLOR=truecolor; "
-              "squeue -h -O JobID >/dev/null; {grow} $BIN; rm -rf {state}").format(
+              "squeue -h -O JobID >/dev/null; {grow} $BIN --refresh 5; rm -rf {state}").format(
         state=state, root=root, grow=grow, binary=args.binary or (root + "/build/rsv"))
     if args.ssh:
         return ["ssh", "-q", "-tt", args.ssh, "bash -c " + shlex.quote(script)]
@@ -66,27 +66,41 @@ def main():
         sys.exit("RSV didn't start")
     t.sleep(2.5)
     shot(3.0)                       # main view, 2 GPU nodes
-    shot(1.8, "j")                  # 1 node, 2 GPUs
-    shot(2.4, "j")                  # 4 CPU nodes
-    shot(2.6, "j,j,j", 1.2)         # pending array: reason, expected start
-    shot(1.6, "j")                  # dependency
+    shot(2.0, "j")                  # 1 node, 2 GPUs, an error in red in its last lines
+    shot(2.0, "j")                  # 4 CPU nodes
+    shot(3.0, "j", 1.0)             # an array of 200 tasks on one row, its progress
+    shot(2.6, "enter", 0.8)         # its tasks
+    shot(1.6, "left,j", 0.8)        # folded again; a job waiting for another one
     shot(1.0, "g", 0.5)
     shot(1.2, "l", 1.0)             # log, followed
-    for _ in range(4):
+    for _ in range(3):
         shot(0.6, None, 0.6)
+    shot(1.2, "q,j,l", 1.0)         # another log: its error in red
+    shot(1.6, "e", 0.6)             # e: the next error
+    shot(1.8, "/,l,o,s,s,enter", 0.6)   # / search, n next
     log_png = t.snapshot()
-    shot(1.0, "q,a", 2.0)           # history with efficiency
-    shot(2.6, "j,j,j", 0.6)
+    shot(2.4, "q,b", 1.2)           # the script it was submitted with
+    shot(1.2, "q,a", 2.0)           # history: what each job used, CPU and GPU hours, what was wasted
+    shot(2.8, "j,j,j", 0.6)
     history_png = t.snapshot()
-    shot(3.0, "q,p", 2.0)           # cluster: overview
+    t.send("q")
+    t.sleep(0.3)
+    t.send("p")
+    t.sleep(26)                     # a few readings for the curves (--refresh 5)
+    shot(3.0, None, 0.2)            # cluster: overview
     cluster_png = t.snapshot()
     shot(2.6, "2", 0.8)             # queue
     shot(3.0, "3", 0.8)             # nodes: why down, the map
     nodes_png = t.snapshot()
-    shot(2.6, "q,t", 1.5)           # when would it start
-    shot(2.6, "\r", 1.5)
-    shot(2.4, "\x1b,u", 2.5)        # limits, fairshare, disk
-    shot(2.6, "q,?", 0.8)           # help
+    shot(2.6, "down,down,down,right,right,enter", 1.5)   # zoom on a node: its jobs
+    zoom_png = t.snapshot()
+    shot(3.0, "esc,4", 1.5)         # the hardware
+    hardware_png = t.snapshot()
+    shot(2.6, "q,o", 2.0)           # the project: colleagues' jobs, read-only
+    shot(1.0, "o", 1.5)
+    shot(2.4, " , ,c", 0.8)         # two jobs marked, c lists them
+    shot(1.0, "esc,esc", 0.6)
+    shot(2.6, "?", 0.8)             # help
     shot(1.5, "q,/,s,w,e,e,p", 0.8)  # filter
     t.send("\x1b")
     t.sleep(0.3)
@@ -101,7 +115,9 @@ def main():
     render_png(log_png, os.path.join(args.out, "log.png"))
     render_png(cluster_png, os.path.join(args.out, "cluster.png"))
     render_png(nodes_png, os.path.join(args.out, "nodes.png"))
-    for name in ("rsv.gif", "history.png", "log.png", "cluster.png", "nodes.png"):
+    render_png(zoom_png, os.path.join(args.out, "node.png"))
+    render_png(hardware_png, os.path.join(args.out, "hardware.png"))
+    for name in ("rsv.gif", "history.png", "log.png", "cluster.png", "nodes.png", "node.png", "hardware.png"):
         path = os.path.join(args.out, name)
         print("%s: %d KB" % (path, os.path.getsize(path) // 1024))
 

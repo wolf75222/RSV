@@ -1,3 +1,24 @@
+# Changes in RSV 2.1
+
+**New**
+
+- Arrays: one row per array with its progress (done, running, waiting, failed, cancelled), the failed tasks with their exit codes, `Enter` for its tasks. The tasks ended more than 5 minutes ago come from `sacct`.
+- Several jobs at once: `Space` marks them, `c` cancels them and `H` holds or releases them, after a confirmation that lists them all.
+- `b`: the script a job was submitted with.
+- `o`: the project view, everyone's jobs in your accounts, read-only.
+- Log view: search (`/`, `n` `N`), error lines in red (`e` `E` to jump to them), and the same red in the last lines under the details.
+- History: CPU and GPU hours per job and over the week, the CPU hours reserved but idle, the time asked but not used.
+- Cluster view: a curve of the CPUs and GPUs in use since it was opened, the hardware of each kind of node, a zoom on a node of the map.
+- Paths are links to VS Code (Remote-SSH).
+- Slower refreshes when Slurm is slow, by themselves.
+
+**Fixes** (found with a real job on ROMEO)
+
+- `Now` (CPU busy) drifted down between two readings, from 97% to 73% in 3 s for a job using its 4 cores: the CPU time of one reading was divided by the time running until now. It is now measured between two readings.
+- `Now` showed `CPU 0% · memory 0` while a job was completing.
+- "1 GPUs".
+- The node cells were half in French.
+
 # Changes in RSV 2
 
 **Fixes**

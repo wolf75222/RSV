@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <map>
@@ -15,7 +16,8 @@
 
 /* The whole cluster: nodes, partitions, everyone's queue, reservations, the controller and the scheduler
 - On ROMEO every user sees all of it (PrivateData = none)
-- The cheap commands are read at each refresh of the cluster view, sdiag and the partition limits when it opens
+- The cheap commands are read at each refresh of the cluster view, sdiag and the partition limits when it opens,
+  the nodes' hardware the first time its tab is shown, one node's jobs while the view zooms on it
 */
 namespace api {
 
@@ -175,6 +177,148 @@ inline std::vector<NodeType> nodeTypes(const std::vector<ClusterNode>& nodes) {
         types[index[key]].add(n);
     }
     return types;
+}
+
+/* The other way from expandHostlist: romeo-a001 romeo-a002 romeo-a003 romeo-c101 -> romeo-a[001-003],romeo-c101
+- By prefix and width of the number, in the order the prefixes first come; a name without a number stays as it is
+*/
+inline std::string compressHostlist(const std::vector<std::string>& hosts) {
+    std::vector<std::pair<std::string, size_t>> keys;   // prefix, digits of the number
+    std::map<std::pair<std::string, size_t>, std::vector<long>> numbers;
+    for (const auto& h : hosts) {
+        size_t end = h.size();
+        while (end > 0 && std::isdigit(static_cast<unsigned char>(h[end - 1]))) end--;
+        const auto key = std::make_pair(h.substr(0, end), h.size() - end);
+        if (!numbers.count(key)) keys.push_back(key);
+        auto& list = numbers[key];
+        if (key.second > 0) list.push_back(util::toLong(h.substr(end)));
+    }
+    std::string out;
+    for (const auto& key : keys) {
+        const auto& [prefix, digits] = key;
+        std::vector<long> nums = numbers[key];
+        std::sort(nums.begin(), nums.end());
+        nums.erase(std::unique(nums.begin(), nums.end()), nums.end());
+        auto padded = [width = digits](long v) {
+            std::string s = std::to_string(v);
+            return s.size() < width ? std::string(width - s.size(), '0') + s : s;
+        };
+        std::string part = prefix;
+        if (nums.size() == 1) {
+            part += padded(nums[0]);
+        } else if (!nums.empty()) {
+            std::string ranges;
+            for (size_t i = 0; i < nums.size();) {
+                size_t j = i;
+                while (j + 1 < nums.size() && nums[j + 1] == nums[j] + 1) j++;
+                ranges += (ranges.empty() ? "" : ",") + padded(nums[i]) + (j > i ? "-" + padded(nums[j]) : "");
+                i = j + 1;
+            }
+            part += "[" + ranges + "]";
+        }
+        out += (out.empty() ? "" : ",") + part;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- hardware (scontrol -o show node)
+
+struct NodeHardware {
+    std::string name, arch, features, gpu_type;
+    int cpus = 0, sockets = 1, cores = 0, threads = 1, gpus = 0;   // cores per socket, threads per core
+    double mem_mib = 0, mem_spec_mib = 0, tmp_disk_mib = 0;        // MemSpecLimit: kept for the system
+    std::vector<std::string> partitions;
+};
+
+inline std::vector<NodeHardware> parseHardware(const std::string& out) {
+    std::vector<NodeHardware> r;
+    for (const auto& raw : util::lines(out)) {
+        const std::string line = util::trim(raw);
+        if (!util::startsWith(line, "NodeName=")) continue;   // -o: one line per node
+        std::map<std::string, std::string> f;
+        parseFields(line, f);
+        NodeHardware n;
+        n.name = f["NodeName"];
+        n.arch = f["Arch"];
+        n.features = f["AvailableFeatures"] == "(null)" ? "" : f["AvailableFeatures"];
+        n.cpus = static_cast<int>(util::toLong(f["CPUTot"]));
+        n.sockets = std::max(1, static_cast<int>(util::toLong(f["Sockets"], 1)));
+        n.cores = static_cast<int>(util::toLong(f["CoresPerSocket"]));
+        n.threads = std::max(1, static_cast<int>(util::toLong(f["ThreadsPerCore"], 1)));
+        const Gpus g = parseGpus(f["Gres"]);
+        n.gpus = g.count;
+        n.gpu_type = g.type;
+        n.mem_mib = util::toDouble(f["RealMemory"]);
+        n.mem_spec_mib = util::toDouble(f["MemSpecLimit"]);
+        n.tmp_disk_mib = util::toDouble(f["TmpDisk"]);
+        for (const auto& p : util::split(f["Partitions"], ','))
+            if (!p.empty() && p != "(null)") n.partitions.push_back(p);
+        if (!n.name.empty()) r.push_back(n);
+    }
+    return r;
+}
+
+/* Nodes with the same hardware: armgpu (romeo-a), x64cpu (romeo-c), the x64cpu nodes with more memory apart
+- A node that doesn't answer has no Arch: the architecture isn't part of the kind, any node of it gives it
+*/
+struct HardwareKind {
+    NodeHardware like;                        // the first of them
+    std::vector<std::string> nodes;
+    std::map<std::string, int> partitions;    // how many of them each partition has
+};
+
+inline std::vector<HardwareKind> hardwareKinds(const std::vector<NodeHardware>& nodes) {
+    std::vector<HardwareKind> kinds;
+    std::map<std::string, size_t> index;
+    for (const auto& n : nodes) {
+        const std::string key = n.features + "|" + std::to_string(n.sockets) + "x" + std::to_string(n.cores) + "x" +
+                                std::to_string(n.threads) + "|" + std::to_string(n.cpus) + "|" + std::to_string(std::lround(n.mem_mib)) +
+                                "|" + std::to_string(std::lround(n.mem_spec_mib)) + "|" + std::to_string(n.gpus) + n.gpu_type + "|" +
+                                std::to_string(std::lround(n.tmp_disk_mib));
+        if (!index.count(key)) {
+            index[key] = kinds.size();
+            kinds.push_back(HardwareKind{n, {}, {}});
+        }
+        HardwareKind& k = kinds[index[key]];
+        if (k.like.arch.empty()) k.like.arch = n.arch;
+        k.nodes.push_back(n.name);
+        for (const auto& p : n.partitions) k.partitions[p]++;
+    }
+    return kinds;
+}
+
+/* What Slurm doesn't say: the models of ROMEO's processors and GPUs, and how much memory a GPU has
+- Checked on ROMEO: lscpu on the login node (AMD EPYC 9654, the same 2 × 96 cores as the x64cpu nodes), the
+  architectures ROMEO's Spack builds for (zen4, neoverse_v2), nvidia-smi in a job on an armgpu node (NVIDIA GH200
+  120GB, 96 GB each), ROMEO's documentation (GH200 Grace Hopper, 384 GB of HBM3 per node)
+- Other nodes, another cluster: only what Slurm says
+*/
+struct KnownModel {
+    std::string cpu, gpu, gpu_memory;
+};
+
+inline KnownModel knownModel(const NodeHardware& n) {
+    KnownModel m;
+    if (!util::startsWith(n.name, "romeo-")) return m;
+    if (n.arch == "x86_64" && n.sockets == 2 && n.cores == 96) m.cpu = "AMD EPYC 9654 (Zen 4)";
+    if (n.arch == "aarch64" && n.sockets == 4 && n.cores == 72) m.cpu = "NVIDIA Grace (Arm Neoverse V2)";
+    if (n.arch == "aarch64" && util::lower(n.gpu_type) == "h100" && n.gpus == 4) {
+        m.gpu = "NVIDIA GH200 120GB";
+        m.gpu_memory = "96 GB HBM3";
+    }
+    return m;
+}
+
+// Read the first time the Hardware tab is shown: one line per node, cheap for slurmctld
+inline Fetched<std::vector<NodeHardware>> fetchHardware() {
+    Fetched<std::vector<NodeHardware>> r;
+    const RunResult res = run({"scontrol", "-o", "show", "node"}, 20);
+    if (!res.ok()) {
+        r.error = res.error("scontrol");
+        return r;
+    }
+    r.data = parseHardware(res.out);
+    return r;
 }
 
 // ---------------------------------------------------------------- why nodes are down (sinfo -R)
@@ -451,6 +595,101 @@ inline Queue parseQueue(const std::string& out) {
     q.by_user = ranked(users);
     q.by_account = ranked(accounts);
     return q;
+}
+
+// ---------------------------------------------------------------- one node, zoomed on (scontrol, squeue -w)
+
+struct NodeJob {
+    std::string id, user, account, state, name;
+    long cpus = 0;               // the job's, on all its nodes
+    int nodes = 1, gpus = 0;
+    std::time_t start = 0;
+    long left = -1;              // seconds, -1 when unknown
+};
+
+// The name is last: it may contain the separator
+inline const std::vector<std::string>& nodeJobFields() {
+    static const std::vector<std::string> fields = {"JobArrayID", "UserName", "Account", "State", "NumCPUs",
+                                                    "NumNodes", "tres-alloc", "StartTime", "TimeLeft", "Name"};
+    return fields;
+}
+
+inline std::string nodeJobFormat() {
+    std::string format;
+    for (const auto& f : nodeJobFields()) format += (format.empty() ? "" : ",") + f + ":" + SEP;
+    return format;
+}
+
+// The biggest jobs first, then the oldest
+inline std::vector<NodeJob> parseNodeJobs(const std::string& out) {
+    std::vector<NodeJob> jobs;
+    const size_t n = nodeJobFields().size();
+    for (std::string line : util::lines(out)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::vector<std::string> f;
+        size_t start = 0;
+        while (f.size() + 1 < n) {
+            const size_t sep = line.find(SEP, start);
+            if (sep == std::string::npos) break;
+            f.push_back(util::trim(line.substr(start, sep - start)));
+            start = sep + 1;
+        }
+        if (f.size() + 1 < n) continue;
+        std::string name = line.substr(start);
+        if (!name.empty() && name.back() == SEP) name.pop_back();
+        NodeJob j;
+        j.id = f[0];
+        j.user = util::sanitize(f[1]);
+        j.account = util::sanitize(f[2]);
+        j.state = f[3].substr(0, f[3].find(' '));
+        j.cpus = util::toLong(f[4]);
+        j.nodes = std::max(1, static_cast<int>(util::toLong(f[5], 1)));
+        const auto tres = parseTres(f[6]);
+        if (tres.count("gres/gpu")) j.gpus = static_cast<int>(tres.at("gres/gpu"));
+        j.start = util::parseTime(f[7]);
+        j.left = util::parseDuration(f[8]);
+        j.name = util::sanitize(util::trim(name));
+        if (!j.id.empty()) jobs.push_back(j);
+    }
+    std::stable_sort(jobs.begin(), jobs.end(), [](const NodeJob& a, const NodeJob& b) {
+        if (a.cpus / a.nodes != b.cpus / b.nodes) return a.cpus / a.nodes > b.cpus / b.nodes;
+        return a.start < b.start;
+    });
+    return jobs;
+}
+
+struct NodeZoom {
+    std::map<std::string, std::string> node;   // what scontrol says about it (with -d: GresUsed and its indices)
+    std::vector<NodeJob> jobs;
+    std::string jobs_error;
+};
+
+// "HS? [root@2026-07-17T17:57:44]" -> "HS?", "root", the date
+inline void splitReason(const std::string& reason, std::string& text, std::string& user, std::time_t& since) {
+    text = util::trim(reason);
+    user.clear();
+    since = 0;
+    const size_t open = text.rfind(" [");
+    if (open == std::string::npos || text.back() != ']') return;
+    const std::string tail = text.substr(open + 2, text.size() - open - 3);
+    const size_t at = tail.find('@');
+    if (at == std::string::npos) return;
+    user = tail.substr(0, at);
+    since = util::parseTime(tail.substr(at + 1));
+    text = util::trim(text.substr(0, open));
+}
+
+// Read when the zoom opens, then at each refresh while it is open: two cheap commands
+inline Fetched<NodeZoom> fetchNodeZoom(const std::string& name) {
+    Fetched<NodeZoom> r;
+    const RunResult n = run({"scontrol", "-d", "-o", "show", "node", name}, 15);
+    if (!n.ok()) r.error = n.error("scontrol");
+    for (const auto& line : util::lines(n.out))
+        if (util::startsWith(util::trim(line), "NodeName=")) parseFields(util::trim(line), r.data.node);
+    const RunResult q = run({"squeue", "-h", "-w", name, "-O", nodeJobFormat()}, 15);
+    if (q.ok()) r.data.jobs = parseNodeJobs(q.out);
+    else r.data.jobs_error = q.error("squeue");
+    return r;
 }
 
 // ---------------------------------------------------------------- all of it

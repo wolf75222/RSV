@@ -77,7 +77,7 @@ inline Element renderNodeCell(const NodeUse& node) {
     std::vector<Element> core_lines;
     for (int start = 0; start < total_cores; start += CORES_PER_LINE) {
         // A run of the same kind is one text: a 288 cores node is 15 lines, not 288 elements
-        std::vector<Element> line = {text(start == 0 ? "Coeurs : " : "         ")};
+        std::vector<Element> line = {text(start == 0 ? "Cores  : " : "         ")};
         std::string run;
         bool run_mine = false;
         for (int i = start; i < std::min(total_cores, start + CORES_PER_LINE); i++) {
@@ -92,7 +92,7 @@ inline Element renderNodeCell(const NodeUse& node) {
         if (!run.empty()) line.push_back(run_mine ? text(run) | color(theme::green()) : text(run));
         core_lines.push_back(hbox(std::move(line)));
     }
-    if (core_lines.empty()) core_lines.push_back(text("Coeurs : ?") | dim);
+    if (core_lines.empty()) core_lines.push_back(text("Cores  : ?") | dim);
 
     const api::Gpus& gpus = node.alloc->gpus;
     int total_gpus = node.info ? node.info->gpus.count : 0;
@@ -122,9 +122,9 @@ inline Element renderNodeCell(const NodeUse& node) {
 
 // Render APU group header with statistics (as wide as the panel, 60 columns at most)
 inline Element renderApuHeader(const ApuGroup& group, int width) {
-    std::string stats = "Noeuds: " + std::to_string(group.nodes.size()) +
-                        " | Coeurs alloués: " + std::to_string(group.total_allocated_cores) +
-                        " | GPUs alloués: " + std::to_string(group.total_allocated_gpus);
+    std::string stats = "Nodes: " + std::to_string(group.nodes.size()) +
+                        " | Cores allocated: " + std::to_string(group.total_allocated_cores) +
+                        " | GPUs allocated: " + std::to_string(group.total_allocated_gpus);
 
     const int w = std::clamp(width, 10, 60);
     std::string line;

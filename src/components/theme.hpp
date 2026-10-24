@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,40 @@ inline Color stateColor(const std::string& state) {
     if (state == "CANCELLED") return theme::magenta();
     if (api::isFailure(state)) return theme::red();
     return theme::gray();
+}
+
+/* A file as a link the terminal opens (OSC 8, Cmd or Ctrl-click): in VS Code, through Remote-SSH, on ROMEO
+- vscode://vscode-remote/ssh-remote+romeo/<path>: "romeo" is the SSH host's name on the user's computer, as in
+  ROMEO's documentation. RSV_VSCODE_HOST changes it, RSV_LINKS=none takes the links away.
+- A terminal that doesn't know OSC 8 shows the text alone. With RSV's mouse on, some terminals want Shift too.
+*/
+inline std::string fileUrl(const std::string& path) {
+    static const std::string host = [] {
+        const char* links = std::getenv("RSV_LINKS");
+        const std::string mode = links ? util::lower(links) : "";
+        if (mode == "none" || mode == "0" || mode == "off" || mode == "no") return std::string();
+        const char* h = std::getenv("RSV_VSCODE_HOST");
+        return std::string(h && *h ? h : "romeo");
+    }();
+    if (host.empty() || path.empty() || path[0] != '/') return "";
+    static const char* hex = "0123456789ABCDEF";
+    std::string url = "vscode://vscode-remote/ssh-remote+" + host;
+    for (unsigned char c : path) {
+        if (std::isalnum(c) || c == '/' || c == '.' || c == '_' || c == '-' || c == '~') {
+            url += static_cast<char>(c);
+        } else {
+            url += '%';
+            url += hex[c >> 4];
+            url += hex[c & 15];
+        }
+    }
+    return url;
+}
+
+inline Decorator fileLink(const std::string& path) {
+    const std::string url = fileUrl(path);
+    if (url.empty()) return nothing;
+    return hyperlink(url);
 }
 
 // A key and what it does, for the footer and the views: "l log"

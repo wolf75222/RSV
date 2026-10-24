@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "api/arrays.hpp"
 #include "api/cluster.hpp"
 #include "api/slurmjobs.hpp"
 #include "api/usage.hpp"
@@ -44,7 +45,7 @@ using namespace ftxui;
 
 namespace {
 
-constexpr const char* VERSION = "2.0.0";
+constexpr const char* VERSION = "2.1.0";
 
 // The signal that asked RSV to end (kill, hangup), handled once FTXUI's loop has returned: see main()
 volatile std::sig_atomic_t quit_signal = 0;
@@ -230,9 +231,20 @@ public:
         who_ = user_ + "@" + std::string(host).substr(0, std::string(host).find('.'));
         history_.reload = [this] { loadHistory(); };
         cluster_.reload = [this] { loadCluster(false); };
+        cluster_.async = [this](std::function<std::function<void()>()> work) {
+            slurm_.post([this, work = std::move(work)] {
+                std::function<void()> done;
+                try {
+                    done = work();
+                } catch (const std::exception&) {
+                }
+                if (done) post(std::move(done));
+            });
+        };
         cluster_.refresh_seconds = opts_.refresh;
         quota_.reload = [this] { loadQuota(); };
         quota_.user = user_;
+        interval_ = opts_.refresh;
     }
 
     void start() { refresh(); }
@@ -247,9 +259,9 @@ public:
     // Called every 250 ms by the timer thread, on the UI thread
     void tick() {
         const auto now = Clock::now();
-        if (!refreshing_ && now - last_refresh_ >= std::chrono::seconds(opts_.refresh)) refresh();
+        if (!refreshing_ && now - last_refresh_ >= std::chrono::seconds(interval_)) refresh();
         if (view_ == View::Logs && logs_.follow && !log_loading_ && now - last_log_read_ >= std::chrono::seconds(2)) loadLog();
-        if (view_ == View::Partitions && !cluster_.loading && now - cluster_time_ >= std::chrono::seconds(opts_.refresh))
+        if (view_ == View::Partitions && !cluster_.loading && now - cluster_time_ >= std::chrono::seconds(interval_))
             loadCluster(false);
         if (view_ == View::None) requestPreview();
         if (!message_.empty() && now > message_until_) {
@@ -263,7 +275,29 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
-    enum class View { None, Help, Logs, Debug, History, Partitions, Quota, Cancel, Gpu, Plan };
+    enum class View { None, Help, Logs, Debug, History, Partitions, Quota, Confirm, Gpu, Plan, Script };
+
+    // A row of the list: a job, an array (its tasks folded under it), or one of its tasks while it is open
+    struct Row {
+        const api::Job* job = nullptr;         // the job or the task; nullptr: the array's own row
+        const ui::JobArray* array = nullptr;   // the array of the row
+        bool last = false;                     // the last task under its array (└)
+        std::string key() const { return job ? ui::rowKey(*job) : array->shownId(); }
+    };
+
+    // What c (cancel) or H (hold, release) is about to do: shown first, done on y
+    struct Action {
+        enum Kind { Cancel, Hold, Release } kind = Cancel;
+        struct Target {
+            std::string id;      // for the command: 812345, 812402 (a whole array)
+            std::string shown;   // as in the list: 812402_*
+            std::string what;    // job, array
+            std::string name, state, about;
+            std::string waiting_of;   // an array whose waiting tasks are meant: they are read again at the last moment
+        };
+        std::vector<Target> targets;
+        int left_out = 0;        // marked rows it doesn't apply to (ended, or not waiting for H)
+    };
 
     // ---------------------------------------------------------------- threads
 
@@ -273,28 +307,67 @@ private:
         screen_.PostEvent(Event::Custom);
     }
 
+    /* The queue: your jobs, or your accounts' in the project view (o)
+    - The arrays' tasks ended long ago come from sacct: once a minute, or at once when a new array shows up
+    - squeue's time is measured: a slow one is asked less often (see onJobs)
+    */
     void refresh() {
         if (refreshing_) return;
         refreshing_ = true;
         last_refresh_ = Clock::now();
-        slurm_.post([this, user = user_] {
+        const bool past_due = Clock::now() - array_past_time_ >= std::chrono::minutes(1);
+        const std::set<std::string> known = array_asked_;
+        slurm_.post([this, user = user_, accounts = accounts_, project = project_, scope = scope_, past_due, known]() mutable {
             api::Fetched<std::vector<api::Job>> r;
+            api::Fetched<std::map<std::string, std::vector<api::TaskState>>> past;
+            std::set<std::string> asked;
+            double took = 0;
             try {
-                r = api::fetchJobs(user);
+                // The project view's accounts, the first time: those of yours that can run jobs
+                if (project && accounts.empty()) accounts = api::runAccounts(user);
+                const auto start = Clock::now();
+                r = project ? api::fetchAccountJobs(accounts) : api::fetchJobs(user);
+                took = std::chrono::duration<double>(Clock::now() - start).count();
                 if (!r.error.empty()) {
                     const std::string controller = api::controllerProblem();
                     if (!controller.empty()) r.error += " · " + controller;
+                } else {
+                    std::set<std::string> arrays;
+                    for (const auto& j : r.data)
+                        if (const std::string a = api::arrayOf(j.id); !a.empty()) arrays.insert(a);
+                    const bool new_array = std::any_of(arrays.begin(), arrays.end(), [&](const std::string& a) { return !known.count(a); });
+                    if (!arrays.empty() && (past_due || new_array)) {
+                        past = api::fetchArrayTasks(arrays, project);
+                        asked = arrays;
+                    }
                 }
             } catch (const std::exception& e) {
                 r.error = std::string("squeue: ") + e.what();
             }
-            post([this, r = std::move(r)]() mutable { onJobs(std::move(r)); });
+            post([this, scope, took, accounts, asked = std::move(asked), r = std::move(r), past = std::move(past)]() mutable {
+                if (scope != scope_) return;   // read before o switched between your jobs and the project's
+                if (project_ && accounts_.empty()) accounts_ = accounts;
+                // A failed sacct is asked again in a minute, not at every refresh
+                if (!asked.empty()) {
+                    array_past_time_ = Clock::now();
+                    array_asked_.insert(asked.begin(), asked.end());
+                    array_past_error_ = past.error;
+                    if (past.error.empty()) array_past_ = std::move(past.data);
+                }
+                onJobs(std::move(r), took);
+            });
         });
     }
 
-    void onJobs(api::Fetched<std::vector<api::Job>> r) {
+    void onJobs(api::Fetched<std::vector<api::Job>> r, double took) {
         refreshing_ = false;
         last_refresh_ = Clock::now();
+        /* Adaptive: a squeue that takes 2 s is asked every 20 s at most, never more often than --refresh; a failure
+           (often a timeout from a loaded slurmctld) doubles the wait, up to 2 min. Back to normal when Slurm is. */
+        const int longest = std::max(120, opts_.refresh);
+        if (!r.error.empty()) interval_ = std::min(longest, std::max(interval_, opts_.refresh) * 2);
+        else interval_ = std::clamp(static_cast<int>(took * 10 + 0.5), opts_.refresh, longest);
+        cluster_.refresh_seconds = interval_;
         if (!r.error.empty()) {
             jobs_error_ = r.error;   // the last list stays on screen
             return;
@@ -303,8 +376,9 @@ private:
         jobs_ = std::move(r.data);
         jobs_time_ = std::time(nullptr);
         jobs_clock_ = Clock::now();
+        buildArrays();
 
-        // Forget the details of jobs that left the queue
+        // Forget the details of jobs that left the queue, their marks, their arrays
         auto listed = [&](const std::string& id) {
             return std::any_of(jobs_.begin(), jobs_.end(), [&](const api::Job& j) { return j.job_id == id; });
         };
@@ -318,7 +392,56 @@ private:
         prune(preview_time_);
         prune(live_);
         prune(ranks_);
+        for (auto it = marked_.begin(); it != marked_.end();) it = jobByKey(*it) || arrayByKey(*it) ? std::next(it) : marked_.erase(it);
+        for (auto it = open_arrays_.begin(); it != open_arrays_.end();)
+            it = arrayByKey(*it + "_*") ? std::next(it) : open_arrays_.erase(it);
+        for (auto it = array_past_.begin(); it != array_past_.end();)
+            it = arrayByKey(it->first + "_*") ? std::next(it) : array_past_.erase(it);
+        for (auto it = array_asked_.begin(); it != array_asked_.end();)
+            it = arrayByKey(*it + "_*") ? std::next(it) : array_asked_.erase(it);
         requestDetails(false);
+    }
+
+    // The arrays in the queue: their tasks under one row, with what sacct remembers of the others
+    void buildArrays() {
+        arrays_.clear();
+        std::map<std::string, size_t> at;
+        for (const auto& j : jobs_) {
+            const std::string a = api::arrayOf(j.id);
+            if (a.empty()) continue;
+            auto it = at.find(a);
+            if (it == at.end()) {
+                it = at.emplace(a, arrays_.size()).first;
+                arrays_.emplace_back();
+                arrays_.back().id = a;
+            }
+            arrays_[it->second].tasks.push_back(&j);
+        }
+        for (auto& a : arrays_) {
+            const auto past = array_past_.find(a.id);
+            a.past_known = past != array_past_.end();
+            a.progress = api::progressOf(a.tasks, a.past_known ? &past->second : nullptr);
+        }
+    }
+
+    const api::Job* jobByKey(const std::string& key) const {
+        for (const auto& j : jobs_)
+            if (ui::rowKey(j) == key) return &j;
+        return nullptr;
+    }
+
+    // In the project view the queue is everyone's: the limits (u) and the marks on the map (p) are about yours
+    std::vector<api::Job> ownJobs() const {
+        std::vector<api::Job> out;
+        for (const auto& j : jobs_)
+            if (j.user.empty() || j.user == user_) out.push_back(j);
+        return out;
+    }
+
+    const ui::JobArray* arrayByKey(const std::string& key) const {
+        for (const auto& a : arrays_)
+            if (a.shownId() == key) return &a;
+        return nullptr;
     }
 
     /* Details of the selected job (scontrol), read again once per refresh
@@ -331,15 +454,16 @@ private:
         if (!j) return;
         const std::string id = j->job_id;
         const auto when = details_time_.find(id);
-        if (!force && when != details_time_.end() && Clock::now() - when->second < std::chrono::seconds(opts_.refresh - 1)) return;
+        if (!force && when != details_time_.end() && Clock::now() - when->second < std::chrono::seconds(interval_ - 1)) return;
         if (!force && details_pending_ == id) return;
         details_pending_ = id;
 
         const uint64_t generation = ++details_generation_;
         const bool active = j->active();
         const bool pending = j->pending();
+        const int cpus = j->cpus;
         const std::string shown_id = j->id;
-        slurm_.post([this, id, shown_id, generation, active, pending] {
+        slurm_.post([this, id, shown_id, generation, active, pending, cpus] {
             // Moving fast through the list: only the job where it stops is read
             if (generation != details_generation_) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -362,9 +486,14 @@ private:
             } catch (const std::exception& e) {
                 d.error = std::string("scontrol: ") + e.what();
             }
-            post([this, id, d = std::move(d), n = std::move(n), live = std::move(live), rank]() mutable {
-                if (live.error.empty() && live.data.steps > 0) live_[id] = live.data;
-                else live_.erase(id);
+            post([this, id, cpus, d = std::move(d), n = std::move(n), live = std::move(live), rank]() mutable {
+                if (live.error.empty() && live.data.steps > 0) {
+                    const auto before = live_.find(id);
+                    if (before != live_.end()) api::follow(live.data, before->second, cpus);
+                    live_[id] = live.data;
+                } else {
+                    live_.erase(id);
+                }
                 if (rank.of > 0) ranks_[id] = rank;
                 else ranks_.erase(id);
                 details_time_[id] = Clock::now();   // an error too: asked again at the next refresh, not in a loop
@@ -467,10 +596,7 @@ private:
                 cluster_.loading = false;
                 cluster_.error = r.error;
                 cluster_.data.ping = r.data.ping;
-                if (r.error.empty()) {
-                    cluster_.data = std::move(r.data);
-                    cluster_.updated = std::time(nullptr);
-                }
+                if (r.error.empty()) cluster_.setData(std::move(r.data));
                 if (opening) cluster_.extra = std::move(extra.data);
             });
         });
@@ -480,7 +606,7 @@ private:
     std::set<std::string> myNodes() const {
         std::set<std::string> out;
         for (const auto& j : jobs_)
-            if (j.active())
+            if (j.active() && (j.user.empty() || j.user == user_))
                 for (const auto& h : api::expandHostlist(j.nodelist)) out.insert(h);
         return out;
     }
@@ -557,10 +683,7 @@ private:
         slurm_.post([this, user = user_] {
             std::vector<std::string> accounts, partitions, features;
             try {
-                for (const auto& a : api::fetchAssocs(user).data)
-                    if (a.max_submit != 0 && a.max_jobs != 0 &&
-                        std::find(accounts.begin(), accounts.end(), a.account) == accounts.end())
-                        accounts.push_back(a.account);
+                accounts = api::runAccounts(user);
                 const api::RunResult info = api::run({"sinfo", "-h", "-o", "%P|%f"}, 15);
                 for (const auto& line : util::lines(info.out)) {
                     const auto f = util::split(line, '|');
@@ -580,24 +703,116 @@ private:
         if (plan_.fields.empty()) plan_.setChoices({}, {}, {});
     }
 
-    void cancelSelected() {
-        // As squeue shows it: 812402_[3-40] cancels only these pending tasks. A throttle (812402_[3-40%4]) isn't an id.
-        std::string id = cancel_.id;
-        const size_t percent = id.find('%');
-        const size_t bracket = id.find(']', percent == std::string::npos ? 0 : percent);
-        if (percent != std::string::npos && bracket != std::string::npos) id.erase(percent, bracket - percent);
+    static bool held(const api::Job& j) { return util::startsWith(j.reason, "JobHeld"); }
+
+
+    std::string about(const api::Job& j) const {
+        if (j.active()) return "on " + std::to_string(j.nodes) + (j.nodes == 1 ? " node" : " nodes") + ", for " + util::duration(liveUsed(j));
+        if (j.id.find("_[") != std::string::npos) return "only these " + std::to_string(api::taskCount(j.id)) + " waiting tasks";
+        if (j.pending()) return "waiting: " + j.reason;
+        return "";
+    }
+
+    static std::string about(const ui::JobArray& a) {
+        std::string s;
+        if (a.progress.running) s = std::to_string(a.progress.running) + " running";
+        if (a.progress.pending) s += (s.empty() ? "" : ", ") + std::to_string(a.progress.pending) + " waiting";
+        return s.empty() ? "" : "its tasks: " + s;
+    }
+
+    /* c and H act on the marked rows, else on the selected one, after a confirmation that lists them
+    - c: jobs not ended yet, whole arrays (scancel 812402), the waiting tasks of an array (812402_[3-40])
+    - H: holds the waiting ones (they keep their place but don't start), or releases them when all are held already.
+      A running job can't be paused by its user (scontrol suspend is for admins).
+    */
+    void openAction(Action::Kind kind, const Row* selected) {
+        std::vector<std::string> keys(marked_.begin(), marked_.end());
+        if (keys.empty() && selected) keys.push_back(selected->key());
+        if (kind != Action::Cancel) {
+            bool any = false, all_held = true;
+            for (const auto& k : keys) {
+                const api::Job* w = jobByKey(k);
+                if (!w)
+                    if (const ui::JobArray* a = arrayByKey(k)) w = a->waiting();
+                if (w && w->pending()) {
+                    any = true;
+                    all_held = all_held && held(*w);
+                }
+            }
+            kind = any && all_held ? Action::Release : Action::Hold;
+        }
+        Action a;
+        a.kind = kind;
+        for (const auto& k : keys) {
+            if (const api::Job* j = jobByKey(k)) {
+                const bool fits = kind == Action::Cancel ? !j->finished() : j->pending() && held(*j) == (kind == Action::Release);
+                if (!fits) {
+                    a.left_out++;
+                    continue;
+                }
+                // The waiting tasks of an array (812402_[159-200]): which ones they are now is read at the last moment
+                const std::string waiting = j->id.find("_[") != std::string::npos ? api::arrayOf(j->id) : "";
+                a.targets.push_back({api::plainId(j->id), j->id, "job", j->name, j->state, about(*j), waiting});
+            } else if (const ui::JobArray* arr = arrayByKey(k)) {
+                const api::Job* w = arr->waiting();
+                const bool fits = kind == Action::Cancel ? arr->progress.running + arr->progress.pending > 0
+                                                         : w && held(*w) == (kind == Action::Release);
+                if (!fits) {
+                    a.left_out++;
+                    continue;
+                }
+                // Cancel: the whole array. Hold: only its waiting tasks, the running ones can't be held.
+                const std::string how = kind == Action::Cancel ? about(*arr)
+                                                               : std::to_string(arr->progress.pending) + " waiting tasks, the running ones go on";
+                a.targets.push_back({arr->id, arr->shownId(), "array", arr->first().name, arr->state(), how,
+                                     kind == Action::Cancel ? "" : arr->id});
+            }
+        }
+        if (a.targets.empty()) {
+            showMessage(kind == Action::Cancel ? "Nothing to cancel: already ended" : "Nothing to hold: H acts on waiting jobs", true);
+            return;
+        }
+        action_ = std::move(a);
+        view_ = View::Confirm;
+    }
+
+    void runAction() {
+        const Action a = action_;
         view_ = View::None;
-        showMessage("Cancelling job " + id + "...");
-        slurm_.post([this, id] {
+        const std::string what = a.targets.size() == 1
+                                     ? (a.targets[0].what == "array" ? "Array " + a.targets[0].id : "Job " + a.targets[0].shown)
+                                     : std::to_string(a.targets.size()) + " jobs";
+        const char* doing = a.kind == Action::Cancel ? "Cancelling " : a.kind == Action::Hold ? "Holding " : "Releasing ";
+        showMessage(doing + util::lower(what) + "...");
+        slurm_.post([this, kind = a.kind, targets = a.targets, what] {
+            /* The waiting tasks of an array as they are now, not as the last refresh saw them: tasks started since
+               then would be cancelled or held with them. scancel --state=PENDING picks them itself. */
             std::string error;
             try {
-                error = api::cancelJob(id);
+                std::vector<std::string> ids, arrays;
+                for (const auto& t : targets) {
+                    if (t.waiting_of.empty()) ids.push_back(t.id);
+                    else arrays.push_back(t.waiting_of);
+                }
+                if (kind == Action::Cancel) {
+                    if (!ids.empty()) error = api::cancelJobs(ids);
+                    for (const auto& array : arrays)
+                        if (error.empty()) error = api::cancelJobs({"--state=PENDING", array});
+                } else {
+                    for (const auto& array : arrays)
+                        for (const auto& w : api::waitingRecords(array)) ids.push_back(w);
+                    error = ids.empty() ? "Nothing waits any more" : api::holdJobs(ids, kind == Action::Hold);
+                }
             } catch (const std::exception& e) {
-                error = std::string("scancel: ") + e.what();
+                error = std::string(kind == Action::Cancel ? "scancel: " : "scontrol: ") + e.what();
             }
-            post([this, id, error] {
-                if (error.empty()) showMessage("Job " + id + " cancelled");
-                else showMessage(error, true);
+            post([this, kind, what, error] {
+                if (error.empty()) {
+                    showMessage(what + (kind == Action::Cancel ? " cancelled" : kind == Action::Hold ? " held" : " released"));
+                    marked_.clear();
+                } else {
+                    showMessage(error, true);
+                }
                 refreshing_ = false;
                 refresh();
             });
@@ -606,36 +821,63 @@ private:
 
     // ---------------------------------------------------------------- list
 
-    // The jobs shown: filtered, then sorted
-    std::vector<const api::Job*> rows() const {
-        std::vector<const api::Job*> out;
-        const std::string f = util::lower(filter_);
-        for (const auto& j : jobs_) {
-            if (!f.empty()) {
-                const std::string hay = util::lower(j.id + " " + j.name + " " + j.state + " " + api::shortState(j.state) +
-                                                    " " + j.partition + " " + j.account + " " + j.reason);
-                if (hay.find(f) == std::string::npos) continue;
-            }
-            out.push_back(&j);
-        }
+    // For the sort by time left: running jobs by their time left, then pending ones by their expected start
+    long leftOf(const api::Job& j) const {
+        if (j.active() && j.limit > 0) return j.limit - liveUsed(j);
+        if (j.pending() && j.start > 0) return static_cast<long>(j.start - std::time(nullptr)) + (1L << 40);
+        return 1L << 50;
+    }
 
-        auto group = [](const api::Job* j) { return j->active() ? 0 : j->pending() ? 1 : 2; };
-        auto number = [](const api::Job* j) { return util::toLong(j->id, 0); };
-        auto left = [this](const api::Job* j) {
-            if (j->active() && j->limit > 0) return j->limit - liveUsed(*j);
-            if (j->pending() && j->start > 0) return static_cast<long>(j->start - std::time(nullptr)) + (1L << 40);
-            return 1L << 50;
+    // The rows shown: filtered, then sorted; the tasks of the open arrays under them
+    std::vector<Row> rows() const {
+        const std::string f = util::lower(filter_);
+        auto matches = [&](const api::Job& j) {
+            if (f.empty()) return true;
+            const std::string hay = util::lower(j.id + " " + j.name + " " + j.state + " " + api::shortState(j.state) + " " +
+                                                j.partition + " " + j.account + " " + j.reason + " " + j.user);
+            return hay.find(f) != std::string::npos;
         };
-        std::stable_sort(out.begin(), out.end(), [&](const api::Job* a, const api::Job* b) {
+        std::vector<Row> top;
+        for (const auto& j : jobs_)
+            if (api::arrayOf(j.id).empty() && matches(j)) top.push_back({&j, nullptr, false});
+        for (const auto& a : arrays_)
+            if (std::any_of(a.tasks.begin(), a.tasks.end(), [&](const api::Job* t) { return matches(*t); })) top.push_back({nullptr, &a, false});
+
+        auto state = [](const Row& r) { return r.job ? r.job->state : r.array->state(); };
+        auto group = [&](const Row& r) { return api::isActive(state(r)) ? 0 : api::isPending(state(r)) ? 1 : 2; };
+        auto number = [](const Row& r) { return util::toLong(r.job ? r.job->id : r.array->id, 0); };
+        auto id = [](const Row& r) { return r.job ? r.job->id : r.array->id; };
+        auto name = [](const Row& r) { return util::lower(r.job ? r.job->name : r.array->first().name); };
+        auto left = [this](const Row& r) {
+            if (r.job) return leftOf(*r.job);
+            long best = 1L << 50;
+            for (const api::Job* t : r.array->tasks) best = std::min(best, leftOf(*t));
+            return best;
+        };
+        std::stable_sort(top.begin(), top.end(), [&](const Row& a, const Row& b) {
             switch (sort_) {
-                case 1: return number(a) != number(b) ? number(a) > number(b) : a->id > b->id;
-                case 2: return util::lower(a->name) < util::lower(b->name);
+                case 1: return number(a) != number(b) ? number(a) > number(b) : id(a) > id(b);
+                case 2: return name(a) < name(b);
                 case 3: return left(a) < left(b);
                 default:
                     if (group(a) != group(b)) return group(a) < group(b);
-                    return number(a) != number(b) ? number(a) < number(b) : a->id < b->id;
+                    return number(a) != number(b) ? number(a) < number(b) : id(a) < id(b);
             }
         });
+
+        std::vector<Row> out;
+        for (const Row& r : top) {
+            out.push_back(r);
+            if (r.job || !open_arrays_.count(r.array->id)) continue;
+            // Its tasks: running, then waiting, then ended, each by its index
+            std::vector<const api::Job*> tasks = r.array->tasks;
+            std::stable_sort(tasks.begin(), tasks.end(), [](const api::Job* a, const api::Job* b) {
+                const int ga = a->active() ? 0 : a->pending() ? 1 : 2, gb = b->active() ? 0 : b->pending() ? 1 : 2;
+                if (ga != gb) return ga < gb;
+                return api::taskIndex(a->id) < api::taskIndex(b->id);
+            });
+            for (size_t i = 0; i < tasks.size(); i++) out.push_back({tasks[i], r.array, i + 1 == tasks.size()});
+        }
         return out;
     }
 
@@ -644,32 +886,42 @@ private:
         return names[s % 4];
     }
 
-    const api::Job* selectedJob() const {
-        for (const auto& j : jobs_)
-            if (j.id == selected_id_) return &j;
-        return nullptr;
-    }
+    // The job (or task) of the selected row; nullptr on an array's own row
+    const api::Job* selectedJob() const { return jobByKey(selected_id_); }
 
-    // The selection follows the job (its id) through refreshes and sorts; when it leaves, the row below takes it
-    int selectedIndex(const std::vector<const api::Job*>& list) {
+    // The selection follows its row (its key) through refreshes and sorts; when it leaves, the row below takes it
+    int selectedIndex(const std::vector<Row>& list) {
         for (size_t i = 0; i < list.size(); i++)
-            if (list[i]->id == selected_id_) return selected_pos_ = static_cast<int>(i);
+            if (list[i].key() == selected_id_) return selected_pos_ = static_cast<int>(i);
         if (list.empty()) return -1;
         selected_pos_ = std::clamp(selected_pos_, 0, static_cast<int>(list.size()) - 1);
-        selected_id_ = list[static_cast<size_t>(selected_pos_)]->id;
+        selected_id_ = list[static_cast<size_t>(selected_pos_)].key();
         details_offset_ = 0;
         requestDetails(false);
         return selected_pos_;
     }
 
-    void select(const std::vector<const api::Job*>& list, int index) {
+    void select(const std::vector<Row>& list, int index) {
         if (list.empty()) return;
         index = std::clamp(index, 0, static_cast<int>(list.size()) - 1);
-        if (list[static_cast<size_t>(index)]->id == selected_id_) return;
+        if (list[static_cast<size_t>(index)].key() == selected_id_) return;
         selected_pos_ = index;
-        selected_id_ = list[static_cast<size_t>(index)]->id;
+        selected_id_ = list[static_cast<size_t>(index)].key();
         details_offset_ = 0;
         requestDetails(false);
+    }
+
+    // The last column of an array: the soonest end of its running tasks, else when the others should start
+    std::string arrayTime(const ui::JobArray& a, std::time_t now) const {
+        long best = -1;
+        for (const api::Job* t : a.tasks)
+            if (t->active() && t->limit > 0) {
+                const long l = std::max(0L, t->limit - liveUsed(*t));
+                if (best < 0 || l < best) best = l;
+            }
+        if (best >= 0) return util::duration(best);
+        if (const api::Job* w = a.waiting()) return ui::timeColumn(*w, 0, now);
+        return "";
     }
 
     // squeue's run time, plus the time since it was read: the clocks keep going between refreshes
@@ -692,9 +944,9 @@ private:
     /* Copy through the terminal (OSC 52): it reaches the clipboard of the computer in front of the user, over SSH
     - xclip/xsel would copy on the login node, where there is no display
     */
-    void copy(const std::string& s, const std::string& what) {
+    void copy(const std::string& s, const std::string& what, const std::string& shown = "") {
         std::cout << "\033]52;c;" << base64(s) << "\a" << std::flush;
-        showMessage("Copied " + what + ": " + s);
+        showMessage("Copied " + what + ": " + (shown.empty() ? s : shown));
     }
 
     void fillDebug() {
@@ -730,6 +982,62 @@ private:
         requestDetails(true);
     }
 
+    // The script it was submitted with (b), as Slurm keeps it
+    void openScript(const api::Job& j) {
+        script_ = ui::DebugView{};
+        script_.script = true;
+        const uint64_t generation = ++script_generation_;
+        script_.title = "Script · job " + j.id;
+        view_ = View::Script;
+        script_.copy = [this] {
+            std::string all;
+            for (const auto& l : script_.lines) all += l + "\n";
+            copy(all, "the script", std::to_string(script_.lines.size()) + " lines");
+        };
+        slurm_.post([this, generation, id = j.job_id, array = api::arrayOf(j.id), ended = j.finished()] {
+            api::Fetched<std::string> r;
+            try {
+                r = api::fetchScript(id, array, ended);
+            } catch (const std::exception& e) {
+                r.error = std::string("scontrol: ") + e.what();
+            }
+            post([this, generation, r = std::move(r)] {
+                if (view_ != View::Script || generation != script_generation_) return;   // another job's, asked before
+                if (r.error.empty()) script_.setText(r.data);
+                script_.loading = false;
+                script_.error = r.error;
+            });
+        });
+    }
+
+    /* The project view (o): everyone's jobs in your accounts, read-only
+    - It starts at once: the accounts are read by its first refresh, so nothing can happen in between
+    */
+    void toggleProject() { setScope(!project_); }
+
+    void setScope(bool project) {
+        project_ = project;
+        scope_++;
+        jobs_.clear();
+        arrays_.clear();
+        jobs_time_ = 0;
+        jobs_error_.clear();
+        marked_.clear();
+        selected_id_.clear();
+        selected_pos_ = 0;
+        list_offset_ = 0;
+        refreshing_ = false;
+        refresh();
+        showMessage(project ? "Project view, read-only: your accounts' jobs (o: yours)" : "Your jobs");
+    }
+
+    std::string accountList() const {
+        std::string s;
+        for (const auto& a : accounts_) s += (s.empty() ? "" : " ") + a;
+        return s;
+    }
+
+    Element confirmView() const;
     bool mainEvent(Event& e);
     bool filterEvent(Event& e);
     bool viewEvent(Event& e);
@@ -757,6 +1065,17 @@ private:
     std::map<std::string, api::LiveUse> live_;                  // what a running job uses now (sstat)
     std::map<std::string, api::Rank> ranks_;                    // a pending job's place in the queue (sprio)
     std::map<std::string, Clock::time_point> preview_time_;
+    std::vector<ui::JobArray> arrays_;                          // the arrays in jobs_, their tasks under one row
+    std::map<std::string, std::vector<api::TaskState>> array_past_;   // what sacct remembers of their tasks
+    std::string array_past_error_;
+    std::set<std::string> array_asked_;                         // the arrays sacct was asked about, answered or not
+    Clock::time_point array_past_time_{};                       // sacct is read once a minute at most
+    std::set<std::string> open_arrays_;                         // arrays shown with their tasks (Enter)
+    std::set<std::string> marked_;                              // rows marked with Space: job ids, 812402_*
+    bool project_ = false;                                      // o: everyone's jobs in your accounts
+    std::vector<std::string> accounts_;
+    uint64_t scope_ = 0;                                        // one more at each switch between the two
+    int interval_ = 15;                                         // seconds between two readings of the queue
 
     std::string selected_id_;
     int selected_pos_ = 0;
@@ -780,7 +1099,9 @@ private:
     ui::QuotaView quota_;
     ui::GpuView gpu_;
     ui::PlanView plan_;
-    api::Job cancel_;
+    ui::DebugView script_;
+    uint64_t script_generation_ = 0;
+    Action action_;
     uint64_t log_generation_ = 0;
     bool log_loading_ = false;
     Clock::time_point last_log_read_ = Clock::now();
@@ -803,7 +1124,9 @@ Element Viewer::render() {
 
     const auto list = rows();
     const int sel = selectedIndex(list);
-    const api::Job* job = sel >= 0 ? list[static_cast<size_t>(sel)] : nullptr;
+    const Row* row = sel >= 0 ? &list[static_cast<size_t>(sel)] : nullptr;
+    const api::Job* job = row ? row->job : nullptr;
+    const ui::JobArray* array = row && !row->job ? row->array : nullptr;
     const std::time_t now = std::time(nullptr);
 
     /* Layout
@@ -812,14 +1135,23 @@ Element Viewer::render() {
     */
     const bool side = W >= 90;
     const int body_h = H - 2;
-    const int id_w = ui::idWidth(list);
-    size_t name_w = 10;
-    for (const auto* j : list) name_w = std::max(name_w, util::width(j->name));
-    const int ideal = ui::STATE_WIDTH + id_w + 1 + static_cast<int>(std::min<size_t>(name_w, 36)) + 1 + ui::TIME_WIDTH + 2;
+    ui::ListColumns cols;
+    size_t id_w = 5, name_w = 10, user_w = 4;
+    for (const Row& r : list) {
+        id_w = std::max(id_w, util::width(r.key()));
+        // An array's name shares its column with the bar and the count of its tasks
+        name_w = std::max(name_w, r.job ? util::width(r.job->name) + (r.array ? 2 : 0) : util::width(r.array->first().name) + 20);
+        if (project_) user_w = std::max(user_w, util::width(r.job ? r.job->user : r.array->first().user));
+    }
+    cols.id = static_cast<int>(std::min<size_t>(id_w, 16));
+    cols.user = project_ ? static_cast<int>(std::min<size_t>(user_w, 10)) : 0;
+    const int ideal = ui::MARK_WIDTH + ui::STATE_WIDTH + cols.id + 1 + (cols.user ? cols.user + 1 : 0) +
+                      static_cast<int>(std::min<size_t>(name_w, 40)) + 1 + ui::TIME_WIDTH + 2;
     const int list_w = side ? std::clamp(ideal, 34, std::max(34, W * 45 / 100)) : W;
     const int list_h = side ? body_h : std::clamp(static_cast<int>(list.size()) + 3, 5, std::max(5, body_h / 2));
     const int details_w = side ? W - list_w : W;
     const int details_h = side ? body_h : body_h - list_h;
+    cols.width = list_w - 2;
 
     // Job list, scrolled to keep the selection in view
     list_page_ = std::max(1, list_h - 3);
@@ -828,8 +1160,7 @@ Element Viewer::render() {
         if (sel >= list_offset_ + list_page_) list_offset_ = sel - list_page_ + 1;
     }
     list_offset_ = std::clamp(list_offset_, 0, std::max(0, static_cast<int>(list.size()) - list_page_));
-    const int row_w = list_w - 2;
-    Elements list_rows = {ui::jobListHeader(row_w, id_w)};
+    Elements list_rows = {ui::jobListHeader(cols)};
     if (list.empty()) {
         if (jobs_time_ == 0 && jobs_error_.empty())
             list_rows.push_back(text(" Reading squeue...") | dim);
@@ -837,11 +1168,15 @@ Element Viewer::render() {
             list_rows.push_back(ui::emptyList(!filter_.empty(), jobs_time_ == 0 ? jobs_error_ : ""));
     } else {
         for (int i = list_offset_; i < std::min(static_cast<int>(list.size()), list_offset_ + list_page_); i++) {
-            const auto* j = list[static_cast<size_t>(i)];
-            list_rows.push_back(ui::jobRow(*j, row_w, id_w, liveUsed(*j), i == sel, now));
+            const Row& r = list[static_cast<size_t>(i)];
+            const bool marked = marked_.count(r.key()) > 0;
+            if (r.job)
+                list_rows.push_back(ui::jobRow(*r.job, cols, liveUsed(*r.job), i == sel, now, marked, r.array ? (r.last ? "└ " : "├ ") : ""));
+            else
+                list_rows.push_back(ui::arrayRow(*r.array, cols, arrayTime(*r.array, now), open_arrays_.count(r.array->id) > 0, i == sel, marked));
         }
     }
-    std::string list_title = "Jobs";
+    std::string list_title = project_ ? "Project" : "Jobs";
     if (!filter_.empty() || editing_filter_) list_title += " /" + filter_ + (editing_filter_ ? "_" : "");
     std::string list_right = list.size() > static_cast<size_t>(list_page_)
                                  ? std::to_string(sel + 1) + "/" + std::to_string(list.size())
@@ -852,7 +1187,7 @@ Element Viewer::render() {
                                    text(list_right)) |
                          size(WIDTH, EQUAL, list_w) | size(HEIGHT, EQUAL, list_h) | reflect(list_box_);
 
-    // Details of the selected job
+    // Details of the selected job, or array
     Elements info;
     std::string details_title = "Details";
     if (job) {
@@ -863,6 +1198,9 @@ Element Viewer::render() {
         info = ui::jobDetails(*job, detailsFor(*job), nodes_, liveUsed(*job), live == live_.end() ? nullptr : &live->second,
                               rank == ranks_.end() ? nullptr : &rank->second, details_w - 4,
                               err == details_error_.end() ? "" : err->second);
+    } else if (array) {
+        details_title = "Array " + array->id;
+        info = ui::arrayDetails(*array, details_w - 4, array_past_error_);
     } else if (!jobs_error_.empty() && jobs_time_ == 0) {
         info = {paragraph(jobs_error_) | color(ui::theme::red())};
     } else if (jobs_time_ == 0) {
@@ -890,7 +1228,8 @@ Element Viewer::render() {
                 info.push_back(hbox({text("Output") | bold, text("  last lines · l for the whole log") | dim}));
                 const size_t n = std::min(last.size(), static_cast<size_t>(room));
                 for (size_t i = last.size() - n; i < last.size(); i++)
-                    info.push_back(text(util::cut(last[i], static_cast<size_t>(std::max(1, details_w - 4)))) | color(ui::theme::gray()));
+                    info.push_back(text(util::cut(last[i], static_cast<size_t>(std::max(1, details_w - 4)))) |
+                                   color(ui::isErrorLine(last[i]) ? ui::theme::red() : ui::theme::gray()));
             }
         }
     }
@@ -909,10 +1248,12 @@ Element Viewer::render() {
                             size(WIDTH, EQUAL, details_w) | size(HEIGHT, EQUAL, details_h) | reflect(details_box_);
 
     Element body = side ? hbox({list_panel, details_panel}) : vbox({list_panel, details_panel});
+    const std::string slow = interval_ > opts_.refresh ? "Slurm slow: every " + std::to_string(interval_) + " s" : "";
     Element base = vbox({
-        ui::title(who_, jobs_, jobs_time_, refreshing_, jobs_error_, W),
+        ui::title(project_ ? who_ + " · project " + accountList() : who_, jobs_, jobs_time_, refreshing_, jobs_error_, W, slow),
         body,
-        ui::footer(W, editing_filter_ ? "Filter: type, Enter to keep it, Esc to clear it" : message_, message_error_),
+        ui::footer(W, editing_filter_ ? "Filter: type, Enter to keep it, Esc to clear it" : message_, message_error_,
+                   project_ ? 0 : static_cast<int>(marked_.size())),
     });
 
     // Overlays
@@ -922,31 +1263,55 @@ Element Viewer::render() {
         case View::Help: over = ui::helpView(W - 2, opts_.refresh); break;
         case View::Logs: over = logs_.render(ow, oh); break;
         case View::Debug: over = debug_.render(std::min(W - 2, 120), oh); break;
+        case View::Script: over = script_.render(std::min(W - 2, 120), oh); break;
         case View::History: over = history_.render(std::min(W - 2, 130), oh); break;
         case View::Partitions: over = cluster_.render(std::min(W - 2, 140), oh, myNodes()); break;
-        case View::Quota: over = quota_.render(W - 2, jobs_); break;
+        case View::Quota: over = quota_.render(W - 2, project_ ? ownJobs() : jobs_); break;
         case View::Gpu: over = gpu_.render(W - 2); break;
         case View::Plan: over = plan_.render(W - 2); break;
-        case View::Cancel: {
-            Elements lines = {
-                hbox({text("Cancel job "), text(cancel_.id) | bold, text(" ?")}),
-                text(util::cut(cancel_.name, 60)) | dim,
-                hbox({text(cancel_.state) | color(ui::stateColor(cancel_.state)),
-                      text(cancel_.active() ? " on " + std::to_string(cancel_.nodes) + (cancel_.nodes == 1 ? " node" : " nodes") + ", for " + util::duration(liveUsed(cancel_))
-                                            : "")}),
-                text(""),
-                hbox({text("y") | bold | color(ui::theme::red()), text(" cancel it    "), text("n") | bold, text(" / Esc keep it") | dim}),
-            };
-            if (cancel_.id.find("_[") != std::string::npos)
-                lines.insert(lines.begin() + 2, text("(only these pending tasks of the array)") | dim);
-            over = ui::panel("scancel", vbox(std::move(lines)) | size(WIDTH, GREATER_THAN, 40), ui::theme::red());
-            break;
-        }
+        case View::Confirm: over = confirmView(); break;
         case View::None: break;
     }
     if (!over) return base;
     // A blank margin around the view: its frame would otherwise merge with the frames behind it (┴, ╭╭)
     return dbox({base, over | borderEmpty | clear_under | center});
+}
+
+// What c or H is about to do, before y: one job as before, several as a list
+Element Viewer::confirmView() const {
+    const auto& t = action_.targets;
+    const bool cancel = action_.kind == Action::Cancel;
+    const std::string verb = cancel ? "Cancel" : action_.kind == Action::Hold ? "Hold" : "Release";
+    Elements lines;
+    if (t.size() == 1) {
+        lines.push_back(hbox({text(verb + " " + t[0].what + " "), text(t[0].what == "array" ? api::arrayOf(t[0].shown) : t[0].shown) | bold, text(" ?")}));
+        lines.push_back(text(util::cut(t[0].name, 60)) | dim);
+        lines.push_back(hbox({text(t[0].state) | color(ui::stateColor(t[0].state)), text(t[0].about.empty() ? "" : "  " + t[0].about) | dim}));
+    } else {
+        const auto arrays = std::count_if(t.begin(), t.end(), [](const Action::Target& x) { return x.what == "array"; });
+        const auto jobs = static_cast<long>(t.size()) - arrays;
+        auto some = [](long n, const std::string& what) { return std::to_string(n) + " " + what + (n == 1 ? "" : "s"); };
+        const std::string what = arrays && jobs ? some(arrays, "array") + " and " + some(jobs, "job") : arrays ? some(arrays, "array") : some(jobs, "job");
+        lines.push_back(text(verb + " " + what + " ?") | bold);
+        lines.push_back(text(""));
+        size_t id_w = 5;
+        for (const auto& x : t) id_w = std::max(id_w, util::width(x.shown));
+        for (size_t i = 0; i < t.size() && i < 12; i++)
+            lines.push_back(hbox({text(util::padRight(api::shortState(t[i].state), 3)) | color(ui::stateColor(t[i].state)) | bold,
+                                  text(util::padRight(t[i].shown, id_w) + "  "), text(util::padRight(t[i].name, 24) + "  "),
+                                  text(t[i].about) | dim}));
+        if (t.size() > 12) lines.push_back(text("and " + std::to_string(t.size() - 12) + " more") | dim);
+    }
+    if (action_.left_out > 0)
+        lines.push_back(text(std::to_string(action_.left_out) + " marked left out: " +
+                             (cancel ? "already ended" : action_.kind == Action::Hold ? "not waiting, or held already" : "not held")) |
+                        dim);
+    lines.push_back(text(""));
+    const std::string them = t.size() == 1 ? "it" : "them";
+    lines.push_back(hbox({text("y") | bold | color(ui::theme::red()), text(" " + util::lower(verb) + " " + them + "    "), text("n") | bold,
+                          text(" / Esc " + std::string(cancel ? "keep " : "leave ") + them) | dim}));
+    const std::string command = cancel ? "scancel" : action_.kind == Action::Hold ? "scontrol hold" : "scontrol release";
+    return ui::panel(command, vbox(std::move(lines)) | size(WIDTH, GREATER_THAN, 40), cancel ? ui::theme::red() : ui::theme::yellow());
 }
 
 bool Viewer::onEvent(Event e) {
@@ -997,9 +1362,10 @@ bool Viewer::viewEvent(Event& e) {
         case View::Quota: handled = quota_.onEvent(e, close); break;
         case View::Gpu: handled = gpu_.onEvent(e, close); break;
         case View::Plan: handled = plan_.onEvent(e, close); break;
-        case View::Cancel:
+        case View::Script: handled = script_.onEvent(e, close); break;
+        case View::Confirm:
             if (e == Event::Character('y') || e == Event::Character('Y')) {
-                cancelSelected();
+                runAction();
                 return true;
             }
             close = !e.is_mouse();
@@ -1007,7 +1373,7 @@ bool Viewer::viewEvent(Event& e) {
         case View::None: return false;
     }
     if (close) {
-        if (view_ == View::Cancel) showMessage("Not cancelled");
+        if (view_ == View::Confirm) showMessage(action_.kind == Action::Cancel ? "Not cancelled" : "Nothing changed");
         view_ = View::None;
     }
     (void)handled;
@@ -1017,7 +1383,9 @@ bool Viewer::viewEvent(Event& e) {
 bool Viewer::mainEvent(Event& e) {
     const auto list = rows();
     const int sel = selectedIndex(list);
-    const api::Job* job = sel >= 0 ? list[static_cast<size_t>(sel)] : nullptr;
+    const Row* row = sel >= 0 ? &list[static_cast<size_t>(sel)] : nullptr;
+    const api::Job* job = row ? row->job : nullptr;
+    const ui::JobArray* array = row && !row->job ? row->array : nullptr;
 
     if (e.is_mouse()) {
         Mouse& m = e.mouse();
@@ -1027,14 +1395,18 @@ bool Viewer::mainEvent(Event& e) {
         } else if (list_box_.Contain(m.x, m.y)) {
             if (wheel_down || wheel_up) select(list, sel + (wheel_down ? 1 : -1));
             else if (m.button == Mouse::Left && m.motion == Mouse::Pressed) {
-                const int row = m.y - list_box_.y_min - 2;   // border and header
-                if (row >= 0 && row < list_page_) select(list, list_offset_ + row);
+                const int r = m.y - list_box_.y_min - 2;   // border and header
+                if (r >= 0 && r < list_page_) select(list, list_offset_ + r);
             }
         }
         return true;
     }
 
     if (e == Event::Character('q') || e == Event::Escape) {
+        if (e == Event::Escape && !marked_.empty()) {
+            marked_.clear();
+            return true;
+        }
         if (e == Event::Escape && !filter_.empty()) {
             filter_.clear();
             return true;
@@ -1042,6 +1414,7 @@ bool Viewer::mainEvent(Event& e) {
         screen_.Exit();
         return true;
     }
+    const bool writes = e == Event::Character(' ') || e == Event::Character('c') || e == Event::Delete || e == Event::Character('H');
     if (e == Event::ArrowDown || e == Event::Character('j')) select(list, sel + 1);
     else if (e == Event::ArrowUp || e == Event::Character('k')) select(list, sel - 1);
     else if (e == Event::PageDown || e == Event::CtrlD) select(list, sel + std::max(1, list_page_ - 1));
@@ -1066,14 +1439,46 @@ bool Viewer::mainEvent(Event& e) {
     } else if (e == Event::Character('p')) {
         view_ = View::Partitions;
         cluster_.offset = 0;
+        cluster_.opened();
         loadCluster(true);
     } else if (e == Event::Character('u')) {
         view_ = View::Quota;
         loadQuota();
     } else if (e == Event::Character('t')) {
         openPlan();
-    } else if (!job) {
+    } else if (e == Event::Character('o')) {
+        toggleProject();
+    } else if (!row) {
         return e.is_character();
+    } else if (project_ && (writes || e == Event::Character('n'))) {
+        showMessage("The project view is read-only: o for your own jobs", true);
+    } else if (e == Event::Character(' ')) {
+        // Marks the row (or unmarks it) and goes to the next one: several in a row are marked quickly
+        if (!marked_.erase(row->key())) marked_.insert(row->key());
+        select(list, sel + 1);
+    } else if (e == Event::Character('c') || e == Event::Delete) {
+        openAction(Action::Cancel, row);
+    } else if (e == Event::Character('H')) {
+        openAction(Action::Hold, row);
+    } else if (e == Event::Character('b')) {
+        openScript(job ? *job : array->first());
+    } else if (array) {
+        if (e == Event::Return || e == Event::ArrowRight) {
+            if (!open_arrays_.erase(array->id)) open_arrays_.insert(array->id);
+        } else if (e == Event::ArrowLeft) {
+            open_arrays_.erase(array->id);
+        } else if (e == Event::Character('y')) {
+            copy(array->id, "array id");
+        } else if (e == Event::Character('l') || e == Event::Character('d') || e == Event::Character('n') || e == Event::Character('Y')) {
+            showMessage("Enter shows the tasks of the array: each has its log and details");
+        } else {
+            return false;
+        }
+    } else if (e == Event::ArrowLeft && row->array) {
+        // From a task back to its array, folded
+        open_arrays_.erase(row->array->id);
+        selected_id_ = row->array->shownId();
+        details_offset_ = 0;
     } else if (e == Event::Character('l') || e == Event::Return) openLogs(*job);
     else if (e == Event::Character('d')) openDebug(*job);
     else if (e == Event::Character('y')) copy(job->id, "job id");
@@ -1084,13 +1489,6 @@ bool Viewer::mainEvent(Event& e) {
     } else if (e == Event::Character('n')) {
         if (!job->active() || job->gpus == 0) showMessage("n shows the GPUs of a running job that has some", true);
         else openGpus(*job);
-    } else if (e == Event::Character('c') || e == Event::Delete) {
-        if (job->finished()) {
-            showMessage("Job " + job->id + " has already ended", true);
-        } else {
-            cancel_ = *job;
-            view_ = View::Cancel;
-        }
     } else {
         return false;
     }

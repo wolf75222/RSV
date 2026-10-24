@@ -3,12 +3,15 @@
 #include <cstdlib>
 #include <ctime>
 #include <map>
+#include <set>
 #include <string>
+#include <vector>
 
 #include <ftxui/dom/elements.hpp>
 
 #include "../api/slurmjobs.hpp"
 #include "../api/usage.hpp"
+#include "joblist.hpp"
 #include "nodedetails.hpp"
 #include "reason_decoder.hpp"
 #include "theme.hpp"
@@ -98,9 +101,16 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
                                       text("  " + util::duration(used) + " / " + util::duration(j.limit)) | dim})));
     }
 
-    // Live: the CPU time of the running steps over the time reserved so far, and their memory now
-    if (j.active() && live && used > 0 && j.cpus > 0) {
-        const double cpu = live->cpu_seconds / (double(used) * j.cpus);
+    /* Live: how busy its CPUs are and the memory of the running steps
+    - Busy since the reading before; for the first one, since the job started (until that reading, not until now:
+      the CPU time doesn't move between readings, the clock does)
+    */
+    if (j.state == "RUNNING" && live && used > 0 && j.cpus > 0) {
+        double cpu = live->busy;
+        if (cpu < 0) {
+            const double until_reading = std::max(1.0, double(used) - (double(now) - live->at));
+            cpu = std::min(1.0, live->cpu_seconds / (until_reading * j.cpus));
+        }
         Elements line = {text("CPU ") | dim, text(percent(cpu)) | bold | color(efficiencyColor(cpu)),
                          text(" busy · memory ") | dim, text(util::mib(live->mem_mib)) | bold};
         if (j.mem_mib > 0) line.push_back(text(" of " + util::mib(j.mem_mib)) | dim);
@@ -144,7 +154,7 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
                                            (features.empty() || features == "(null)" ? "" : " · " + features))));
 
     std::string res = std::to_string(j.nodes) + (j.nodes == 1 ? " node" : " nodes") + " · " + std::to_string(j.cpus) + " CPUs";
-    if (j.gpus > 0) res += " · " + std::to_string(j.gpus) + " GPUs";
+    if (j.gpus > 0) res += " · " + std::to_string(j.gpus) + (j.gpus == 1 ? " GPU" : " GPUs");
     if (j.mem_mib > 0) res += " · " + util::mib(j.mem_mib);
     out.push_back(field(j.pending() ? "Asks" : "Uses", value(res)));
 
@@ -165,8 +175,8 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
     const std::string dir = d && !d->get("WorkDir").empty() ? d->get("WorkDir") : j.workdir;
     if (!dir.empty()) out.push_back(field("Directory", text(util::cutMiddle(shortPath(dir), value_width))));
     const auto [log_out, log_err] = logPaths(j, d);
-    if (!log_out.empty()) out.push_back(field("Output", text(util::cutMiddle(shortPath(log_out), value_width))));
-    if (!log_err.empty()) out.push_back(field("Errors", text(util::cutMiddle(shortPath(log_err), value_width))));
+    if (!log_out.empty()) out.push_back(field("Output", text(util::cutMiddle(shortPath(log_out), value_width)) | fileLink(log_out)));
+    if (!log_err.empty()) out.push_back(field("Errors", text(util::cutMiddle(shortPath(log_err), value_width)) | fileLink(log_err)));
 
     // Nodes
     if (d && !d->alloc.empty()) {
@@ -175,6 +185,104 @@ inline Elements jobDetails(const api::Job& j, const api::JobDetails* d, const st
         out.push_back(text(""));
         out.push_back(text(details_error.empty() ? "Reading the allocation..." : details_error) | dim);
     }
+    return out;
+}
+
+// 151, 152, 153, 160 -> "151-153,160"
+inline std::string indexRanges(std::vector<long> ids) {
+    std::sort(ids.begin(), ids.end());
+    std::string out;
+    for (size_t i = 0; i < ids.size();) {
+        size_t k = i;
+        while (k + 1 < ids.size() && ids[k + 1] == ids[k] + 1) k++;
+        out += (out.empty() ? "" : ",") + std::to_string(ids[i]) + (k > i ? "-" + std::to_string(ids[k]) : "");
+        i = k + 1;
+    }
+    return out;
+}
+
+/* The details of an array: its progress, the tasks that failed, those running, why the others wait
+- Each task has its own details and log: Enter shows them in the list
+*/
+inline Elements arrayDetails(const JobArray& a, int width, const std::string& past_error) {
+    const std::time_t now = std::time(nullptr);
+    const int value_width = std::max(10, width - 11);
+    auto value = [&](const std::string& s) { return text(util::cut(s, static_cast<size_t>(value_width))); };
+    const api::ArrayProgress& p = a.progress;
+    const api::Job& f = a.first();
+    Elements out = {text(util::cut(f.name, static_cast<size_t>(width))) | bold, text("")};
+
+    std::string what = std::to_string(p.total()) + (p.total() == 1 ? " task" : " tasks");
+    if (p.throttle) what += ", " + std::to_string(p.throttle) + " at a time";
+    out.push_back(field("Array", hbox({text(a.state()) | bold | color(stateColor(a.state())), text("  " + what) | dim})));
+    out.push_back(field("", progressBar(p, std::clamp(value_width, 10, 40))));
+    Elements counts;
+    auto count = [&](int n, const std::string& label, Color c) {
+        if (n == 0) return;
+        if (!counts.empty()) counts.push_back(text(" · ") | dim);
+        counts.push_back(text(std::to_string(n)) | bold | color(c));
+        counts.push_back(text(" " + label));
+    };
+    count(p.done, "done", theme::blue());
+    count(p.running, "running", theme::green());
+    count(p.pending, "waiting", theme::gray());
+    count(p.failed, "failed", theme::red());
+    count(p.cancelled, "cancelled", theme::magenta());
+    out.push_back(field("", hbox(std::move(counts))));
+    if (!a.past_known && !past_error.empty())
+        out.push_back(field("", text(util::cut("Tasks ended over 5 min ago not counted: " + past_error, static_cast<size_t>(value_width))) | dim));
+
+    if (!p.failures.empty()) {
+        std::string list;
+        size_t shown = 0;
+        for (const auto& [id, how] : p.failures) {
+            const std::string item = id.substr(id.find('_') + 1) + " " + how;
+            if (shown > 0 && util::width(list + " · " + item) + 12 > static_cast<size_t>(value_width)) break;
+            list += (list.empty() ? "" : " · ") + item;
+            shown++;
+        }
+        if (shown < p.failures.size()) list += " +" + std::to_string(p.failures.size() - shown);
+        out.push_back(field("Failed", value(list) | color(theme::red())));
+    }
+
+    std::vector<long> running;
+    std::set<std::string> nodes;
+    for (const api::Job* t : a.tasks)
+        if (t->active()) {
+            running.push_back(api::taskIndex(t->id));
+            for (const auto& h : api::expandHostlist(t->nodelist)) nodes.insert(h);
+        }
+    if (!running.empty()) {
+        std::string on;
+        size_t shown = 0;
+        for (const auto& n : nodes) {
+            if (shown == 3) break;
+            on += (on.empty() ? "" : ",") + n;
+            shown++;
+        }
+        if (nodes.size() > shown) on += " +" + std::to_string(nodes.size() - shown);
+        out.push_back(field("Running", value("tasks " + indexRanges(running) + (on.empty() ? "" : " on " + on))));
+    }
+
+    if (const api::Job* w = a.waiting()) {
+        const ui::ReasonInfo info = decodeReason(w->reason);
+        out.push_back(field("Waiting", value(std::to_string(api::taskCount(w->id)) + (api::taskCount(w->id) == 1 ? " task · " : " tasks · ") + w->reason) | color(theme::yellow())));
+        out.push_back(field("", value(info.description)));
+        if (w->start > now)
+            out.push_back(field("Starts", hbox({text("~" + util::clock(w->start, now)), text("  " + util::relative(w->start, now)) | dim})));
+    }
+
+    out.push_back(field("Partition", value(f.partition + (f.qos.empty() ? "" : " · QOS " + f.qos) +
+                                           (f.account.empty() ? "" : " · " + f.account))));
+    std::string res = std::to_string(f.nodes) + (f.nodes == 1 ? " node" : " nodes") + " · " + std::to_string(f.cpus) + " CPUs";
+    if (f.gpus > 0) res += " · " + std::to_string(f.gpus) + (f.gpus == 1 ? " GPU" : " GPUs");
+    if (f.mem_mib > 0) res += " · " + util::mib(f.mem_mib);
+    if (f.limit > 0) res += " · " + util::duration(f.limit);
+    out.push_back(field("Each task", value(res)));
+    if (!f.workdir.empty()) out.push_back(field("Directory", text(util::cutMiddle(shortPath(f.workdir), static_cast<size_t>(value_width)))));
+    out.push_back(text(""));
+    out.push_back(hbox({text("Enter") | bold | color(theme::accent()), text(" its tasks, each with its log  ") | dim,
+                        text("c") | bold | color(theme::accent()), text(" cancel all") | dim}));
     return out;
 }
 

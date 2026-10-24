@@ -24,7 +24,7 @@ inline ReasonInfo decodeReason(const std::string& full) {
         {"Dependency", {"Waiting for the job it depends on", "Starts when the dependency is satisfied"}},
         {"DependencyNeverSatisfied", {"Its dependency failed: it will never start", "Cancel it (c) and resubmit"}},
         {"BeginTime", {"Its start time (--begin) isn't reached", ""}},
-        {"JobHeldUser", {"Held by you", "scontrol release <jobid>"}},
+        {"JobHeldUser", {"Held by you", "H releases it (scontrol release <jobid>)"}},
         {"JobHeldAdmin", {"Held by an administrator", "Ask the support team"}},
         {"ReqNodeNotAvail", {"A requested node is down, drained or reserved", "Check --nodelist / --exclude, or wait"}},
         {"NodeDown", {"A node it needs is down", "Wait, or remove --nodelist"}},

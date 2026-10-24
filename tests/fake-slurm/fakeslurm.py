@@ -139,14 +139,23 @@ def make_nodes():
                                          others_cpus=0, others_gpus=0, others_mem=0)
     for i in list(range(1, 41)) + list(range(101, 105)):
         nodes["romeo-c%03d" % i] = dict(arch="x86_64", cpus=192, sockets=2, cores=96, gpus=0, gpu_type="",
-                                         mem=1160629, features="x64cpu", state="IDLE", load=0.0,
+                                         mem=1547701 if i > 100 else 1160629, features="x64cpu", state="IDLE", load=0.0,
                                          others_cpus=0, others_gpus=0, others_mem=0)
+    # Not every node is in every partition, as on ROMEO (the others' jobs below stay in theirs)
+    for i in range(41, 59):
+        nodes["romeo-a%03d" % i]["partitions"] = "short,instant" if i < 57 else "instant"
+    for i in range(26, 41):
+        nodes["romeo-c%03d" % i]["partitions"] = "short,instant" if i < 40 else "instant"
     # Other users' jobs, so that the cluster looks used
     busy = {"romeo-a%03d" % i: (288, 4) for i in range(30, 44)}
     busy.update({"romeo-a%03d" % i: (128, 2) for i in range(44, 50)})
     busy.update({"romeo-c%03d" % i: (192, 0) for i in range(11, 26)})
     busy.update({"romeo-c%03d" % i: (120, 0) for i in range(26, 34)})
     busy["romeo-c010"] = (96, 0)
+    # A cluster that moves: romeo-a[050-055] fill up and empty again every minute (the overview's curves)
+    wave = (NOW // 5) % 12
+    for k in range(wave if wave <= 6 else 12 - wave):
+        busy["romeo-a%03d" % (50 + k)] = (288, 4)
     for name, (cpus, gpus) in busy.items():
         nodes[name].update(others_cpus=cpus, others_gpus=gpus, others_mem=cpus * 2048)
     for name in ("romeo-a057", "romeo-c040"):
@@ -193,16 +202,8 @@ def demo_jobs():
         job(id="812377", name="motorBike-simpleFoam", state="RUNNING", reason="None", partition="long",
             alloc=[alloc("romeo-c[004-007]", "0-191", "", 1024000)], num_nodes=4, num_cpus=768,
             mem_per_node=1024000, limit=3 * DAY, elapsed=DAY + 5 * HOUR + 22 * MIN, workdir=os.path.join(runs, "motorbike")),
-        job(id="812402_1", job_id="812403", array_job="812402", array_task="1", name="param-sweep", state="RUNNING",
-            reason="None", partition="instant", alloc=[alloc("romeo-c010", "0-7", "", 16384)], num_cpus=8,
-            mem_per_node=16384, limit=HOUR, elapsed=12 * MIN, workdir=os.path.join(runs, "sweep"),
-            stdout=os.path.join(runs, "sweep", "sweep-%A_%a.out")),
-        job(id="812402_2", job_id="812404", array_job="812402", array_task="2", name="param-sweep", state="RUNNING",
-            reason="None", partition="instant", alloc=[alloc("romeo-c010", "8-15", "", 16384)], num_cpus=8,
-            mem_per_node=16384, limit=HOUR, elapsed=11 * MIN, workdir=os.path.join(runs, "sweep"),
-            stdout=os.path.join(runs, "sweep", "sweep-%A_%a.out")),
-        job(id="812402_[3-40]", job_id="812402", array_job="812402", array_task="3-40", name="param-sweep",
-            state="PENDING", reason="QOSMaxJobsPerUserLimit", partition="instant", num_cpus=8, mem_per_node=16384,
+        job(id="812402_[159-200%8]", job_id="812402", array_job="812402", array_task="159-200%8", name="param-sweep",
+            state="PENDING", reason="JobArrayTaskLimit", partition="instant", num_cpus=8, mem_per_node=16384,
             limit=HOUR, start=NOW + 25 * MIN, workdir=os.path.join(runs, "sweep"),
             stdout=os.path.join(runs, "sweep", "sweep-%A_%a.out")),
         job(id="812455", name="post-process", state="PENDING", reason="Dependency", partition="short",
@@ -215,6 +216,44 @@ def demo_jobs():
             alloc=[alloc("romeo-c003", "0-63", "", 131072)], num_cpus=64, mem_per_node=131072, limit=HOUR,
             start=NOW - 40 * MIN, end=NOW - 3 * MIN, elapsed=37 * MIN, workdir=os.path.join(runs, "mesh")),
     ]
+    return jobs + array_tasks()
+
+
+# The tasks of array 812402 squeue still has: 8 running, the last 2 ended (the others ended long ago: sacct only)
+ARRAY_FAILED = {17: ("FAILED", "1:0"), 43: ("FAILED", "1:0"), 77: ("OUT_OF_MEMORY", "0:125"), 98: ("FAILED", "2:0"),
+                121: ("TIMEOUT", "0:0")}
+
+
+def array_tasks():
+    runs = os.path.join(HOME, "runs")
+    tasks = []
+    for t in range(149, 159):
+        running = t >= 151
+        tasks.append(job(id="812402_%d" % t, job_id=str(812402 + t), array_job="812402", array_task=str(t),
+                         name="param-sweep", state="RUNNING" if running else "COMPLETED", reason="None", partition="instant",
+                         alloc=[alloc("romeo-c%03d" % (10 + (t - 149) // 4), "%d-%d" % (8 * (t % 4), 8 * (t % 4) + 7), "", 16384)],
+                         num_cpus=8, mem_per_node=16384, limit=HOUR, elapsed=(t - 148) * 3 * MIN if running else 41 * MIN,
+                         start=0 if running else NOW - 44 * MIN, end=0 if running else NOW - (153 - t) * MIN,
+                         workdir=os.path.join(runs, "sweep"), stdout=os.path.join(runs, "sweep", "sweep-%A_%a.out")))
+    return tasks
+
+
+def colleague_jobs():
+    """Jobs of other people in the user's accounts (proj-cfd, proj-ml), for the project view (squeue -A)"""
+    jobs = []
+    for i, (user, name, state, account, nodes, cpus, gpus) in enumerate([
+            ("lea", "les-channel-re590", "RUNNING", "proj-cfd", "romeo-a[044-045]", 576, 8),
+            ("tom", "pinn-burgers", "RUNNING", "proj-ml", "romeo-a046", 72, 1),
+            ("tom", "pinn-burgers-sweep", "PENDING", "proj-ml", "", 72, 1),
+            ("lea", "post-les", "PENDING", "proj-cfd", "", 32, 0)]):
+        j = job(id=str(811900 + i), name=name, state=state, reason="None" if state == "RUNNING" else "Priority",
+                partition="short", account=account, num_nodes=2 if "[" in nodes else 1, num_cpus=cpus, gpus=gpus,
+                alloc=[alloc(nodes, "0-%d" % (cpus // max(1, 2 if "[" in nodes else 1) - 1), "0-%d" % (gpus - 1) if gpus else "",
+                             262144)] if nodes else [],
+                limit=DAY, elapsed=(i + 2) * HOUR if state == "RUNNING" else 0, start=0 if state == "RUNNING" else NOW + 3 * HOUR,
+                workdir="/home/" + user)
+        j["user"] = user
+        jobs.append(j)
     return jobs
 
 
@@ -286,21 +325,27 @@ def other_jobs():
 def history():
     rows = []
 
+    # ago_end None: still running (no end, no CPU time recorded yet); elapsed None: still pending
     def add(jid, name, state, ago_end, elapsed, limit, ncpus, nnodes, req_mem, maxrss, totalcpu, exitcode="0:0",
-            partition="short", nodes="romeo-c001"):
-        end = NOW - ago_end
-        start = end - elapsed
+            partition="short", nodes="romeo-c001", gpus=0):
+        end = None if ago_end is None else NOW - ago_end
+        start = None if elapsed is None else (end or NOW) - elapsed
         rows.append(dict(JobID=jid, JobName=name, State=state, Partition=partition, Account="proj-cfd",
-                         Submit=start - 120, Start=start, End=end, Elapsed=elapsed, Timelimit=limit, NNodes=nnodes,
-                         NCPUs=ncpus, ReqMem=req_mem, TotalCPU=totalcpu, MaxRSS=maxrss, ExitCode=exitcode,
-                         NodeList=nodes))
+                         Submit=(start or NOW) - 120, Start=start, End=end, Elapsed=elapsed or 0, Timelimit=limit,
+                         NNodes=nnodes, NCPUs=ncpus, ReqMem=req_mem, TotalCPU=totalcpu, MaxRSS=maxrss,
+                         ExitCode=exitcode, NodeList=nodes, GPUs=gpus))
+
+    add("812345", "lbm-d3q19", "RUNNING", None, 3 * HOUR + 12 * MIN + 45, 12 * HOUR, 128, 2, "256G", "", 0,
+        nodes="romeo-a[012-013]", gpus=8)
+    add("812460", "weak-scaling-1024-ranks-final-v2", "PENDING", None, None, DAY, 4608, 16, "750G", "", 0,
+        partition="long", nodes="None assigned", gpus=64)
 
     add("812301", "mesh-refine", "COMPLETED", 3 * MIN, 37 * MIN, HOUR, 64, 1, "128G", "41G", 37 * MIN * 64 * 0.93,
         partition="instant", nodes="romeo-c003")
     add("812290", "lbm-d3q19", "TIMEOUT", 2 * HOUR, 12 * HOUR, 12 * HOUR, 128, 2, "256G", "198G", 12 * HOUR * 128 * 0.97,
-        "0:15", nodes="romeo-a[020-021]")
+        "0:15", nodes="romeo-a[020-021]", gpus=8)
     add("812276", "train resnet50 (fp16)", "COMPLETED", 5 * HOUR, 3 * HOUR + 40 * MIN, 4 * HOUR, 32, 1, "120G", "87G",
-        (3 * HOUR + 40 * MIN) * 32 * 0.41, nodes="romeo-a027")
+        (3 * HOUR + 40 * MIN) * 32 * 0.41, nodes="romeo-a027", gpus=2)
     add("812260", "post-process", "OUT_OF_MEMORY", 9 * HOUR, 14 * MIN, 2 * HOUR, 16, 1, "64G", "64G", 14 * MIN * 16 * 0.88,
         "0:125", nodes="romeo-c008")
     add("812244", "motorBike-simpleFoam", "FAILED", DAY + 2 * HOUR, 25 * MIN, 3 * DAY, 768, 4, "1000G", "302G",
@@ -314,7 +359,7 @@ def history():
     add("812050", "compile-deps", "COMPLETED", 4 * DAY, 9 * MIN, 30 * MIN, 32, 1, "8G", "2.1G", 9 * MIN * 32 * 0.32,
         partition="instant", nodes="romeo-c002")
     add("812001", "lbm-d3q19", "COMPLETED", 6 * DAY, 11 * HOUR + 5 * MIN, 12 * HOUR, 128, 2, "256G", "201G",
-        (11 * HOUR + 5 * MIN) * 128 * 0.98, nodes="romeo-a[012-013]")
+        (11 * HOUR + 5 * MIN) * 128 * 0.98, nodes="romeo-a[012-013]", gpus=8)
     return rows
 
 
@@ -341,6 +386,21 @@ def expand_path(path, j):
     return out.replace("%u", USER)
 
 
+def train_log(f):
+    """A training run that ran out of GPU memory once, then went on with smaller batches"""
+    for step in range(100, 2100, 100):
+        f.write("epoch 1/90  step %5d/5004  loss=%.4f  lr=0.1000  img/s=%d\n"
+                % (step, 6.9 - step * 2.1e-4, 2790 + (step * 13) % 40))
+    f.write("Traceback (most recent call last):\n"
+            "  File \"train.py\", line 212, in <module>\n"
+            "    loss.backward()\n"
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. GPU 1 has 94.50 GiB in total\n"
+            "retrying epoch 1 with batch size 128\n")
+    for step in range(100, 4100, 100):
+        f.write("epoch 1/90  step %5d/10008  loss=%.4f  lr=0.0500  img/s=%d\n"
+                % (step, 6.9 - step * 1.1e-4, 2610 + (step * 7) % 30))
+
+
 def make_logs(jobs):
     for j in jobs:
         if j["state"] not in ("RUNNING", "COMPLETED", "COMPLETING"):
@@ -350,9 +410,18 @@ def make_logs(jobs):
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "w") as f:
                 f.write("Starting %s on %s\n" % (j["name"], j["alloc"][0]["hosts"] if j["alloc"] else "?"))
+                if "resnet" in j["name"]:
+                    train_log(f)
+                    continue
                 for step in range(0, 60):
                     f.write("step %6d  t=%.4e  residual=%.3e  MLUPS=%7.1f\n"
                             % (step * 200, step * 2.5e-5, 1.0 / (step + 1) ** 1.5, 2400 + (step * 37) % 90))
+                    # Made-up errors for the log view: a task of the sweep diverges once
+                    if j["array_task"] == "153" and step == 40:
+                        f.write("case 153: residual is NaN at step 8000\n"
+                                "error: solver diverged, restarting from checkpoint 7800 with dt/2\n")
+                if j["state"] == "COMPLETED" and "mesh" in j["name"]:
+                    f.write("refinement done: 2.4M cells, 0 errors, 3 warnings\nTotal errors: 0\n")
         err = expand_path(j["stderr"], j)
         if err != out and not os.path.exists(err):
             with open(err, "w") as f:
@@ -363,8 +432,11 @@ def all_jobs():
     jobs = SCENARIOS.get(SCENARIO, demo_jobs)()
     state = load_state()
     for j in jobs:
-        if j["id"] in state["cancelled"] or j["job_id"] in state["cancelled"]:
-            when = state["cancelled"].get(j["id"]) or state["cancelled"].get(j["job_id"])
+        if j["state"] == "PENDING" and ({j["id"], re.sub(r"%\d+", "", j["id"]), j["array_job"]} & set(state.get("held", {}))):
+            j["reason"] = "JobHeldUser"
+        if j["id"] in state["cancelled"] or j["job_id"] in state["cancelled"] or (
+                j["array_job"] in state["cancelled"] and j["state"] in ("RUNNING", "PENDING")):
+            when = state["cancelled"].get(j["id"]) or state["cancelled"].get(j["job_id"]) or state["cancelled"].get(j["array_job"])
             j["state"] = "CANCELLED"
             j["reason"] = "None"
             j["end"] = when
@@ -514,10 +586,15 @@ def options(args, with_value):
 # ---------------------------------------------------------------- commands
 
 def squeue():
-    opts, _ = options(ARGS, {"u", "user", "t", "states", "o", "format", "O", "Format", "j", "jobs", "p", "partition", "M", "S", "sort"})
+    opts, _ = options(ARGS, {"u", "user", "t", "states", "o", "format", "O", "Format", "j", "jobs", "p", "partition", "M", "S", "sort",
+                             "A", "account", "w", "nodelist"})
     jobs = all_jobs()
     who = opts.get("u") or opts.get("user")
-    if not who and SCENARIO == "demo":
+    accounts = opts.get("A") or opts.get("account")
+    if accounts:
+        wanted = set(accounts.split(","))
+        jobs = [j for j in jobs + (colleague_jobs() if SCENARIO == "demo" else []) if j["account"] in wanted]
+    elif not who and SCENARIO == "demo":
         jobs = jobs + other_jobs()
     elif who and who != USER:
         jobs = [j for j in other_jobs() if j["user"] == who]
@@ -530,6 +607,10 @@ def squeue():
         jobs = [j for j in jobs if j["state"] in wanted]
     elif not states:
         jobs = [j for j in jobs if j["state"] in ("RUNNING", "PENDING", "COMPLETING")]
+    on = opts.get("w") or opts.get("nodelist")
+    if on:
+        on = set(expand(on))
+        jobs = [j for j in jobs if on & set(node_names(j))]
     ids = opts.get("j") or opts.get("jobs")
     if ids:
         ids = set(str(ids).split(","))
@@ -556,7 +637,7 @@ def job_record(j, detail):
     hosts = node_names(j)
     lines = [
         "JobId=%s %sJobName=%s" % (j["job_id"], ("ArrayJobId=%s ArrayTaskId=%s " % (j["array_job"], j["array_task"])) if j["array_job"] else "", j["name"]),
-        "   UserId=%s(4242) GroupId=%s(4242) MCS_label=N/A" % (USER, USER),
+        "   UserId=%s(4242) GroupId=%s(4242) MCS_label=N/A" % (j.get("user", USER), j.get("user", USER)),
         "   Priority=60779 Nice=0 Account=%s QOS=%s" % (j["account"], j["qos"]),
         "   JobState=%s Reason=%s Dependency=%s" % (j["state"], j["reason"], j["dependency"]),
         "   Requeue=1 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=%s" % j["exit"],
@@ -602,10 +683,11 @@ def job_record(j, detail):
     return "\n".join(lines) + "\n   \n"
 
 
-def node_line(name, n, jobs):
+def node_line(name, n, jobs, detail=False):
     mine_cpus = 0
     mine_gpus = 0
     mine_mem = 0
+    gpu_ids = set()
     for j in jobs:
         if j["state"] not in ("RUNNING", "COMPLETING"):
             continue
@@ -613,6 +695,7 @@ def node_line(name, n, jobs):
             if name in expand(a["hosts"]):
                 mine_cpus += len(expand_ids(a["cpus"]))
                 mine_gpus += len(expand_ids(a["gpus"])) if a["gpus"] else 0
+                gpu_ids |= set(expand_ids(a["gpus"])) if a["gpus"] else set()
                 mine_mem += a["mem"]
     cpu_alloc = min(n["cpus"], mine_cpus + n["others_cpus"])
     gpu_alloc = min(n["gpus"], mine_gpus + n["others_gpus"])
@@ -624,16 +707,32 @@ def node_line(name, n, jobs):
     if gpu_alloc:
         alloc_tres += ",gres/gpu=%d" % gpu_alloc
     gres = "gpu:%s:%d" % (n["gpu_type"], n["gpus"]) if n["gpus"] else "(null)"
-    return ("NodeName=%s Arch=%s CoresPerSocket=%d  CPUAlloc=%d CPUEfctv=%d CPUTot=%d CPULoad=%.2f "
-            "AvailableFeatures=%s ActiveFeatures=%s Gres=%s NodeAddr=%s NodeHostName=%s Version=23.11.10 "
+    # With -d: the GPUs in use and their indices (the user's jobs' ones, then the first free ones for the others)
+    gres_used = ""
+    if detail and n["gpus"]:
+        free = [i for i in range(n["gpus"]) if i not in gpu_ids]
+        used = sorted(gpu_ids | set(free[:max(0, gpu_alloc - len(gpu_ids))]))
+        gres_used = " GresDrain=N/A GresUsed=gpu:%s:%d(IDX:%s)" % (n["gpu_type"], len(used), cpu_ranges(used) if used else "N/A")
+    # scontrol's states, and why a node is down or drained
+    shown_state = {"DOWN*": "DOWN+NOT_RESPONDING", "DRAINED": "IDLE+DRAIN"}.get(state, state)
+    reason = ""
+    for why, user, since, nodes, _ in DOWN_REASONS:
+        if name in expand(nodes):
+            reason = " Reason=%s [%s@%s]" % (why, user, stamp(since))
+    line = ("NodeName=%s Arch=%s CoresPerSocket=%d  CPUAlloc=%d CPUEfctv=%d CPUTot=%d CPULoad=%.2f "
+            "AvailableFeatures=%s ActiveFeatures=%s Gres=%s%s NodeAddr=%s NodeHostName=%s Version=23.11.10 "
             "OS=Linux 5.14.0-570.el9_6.%s #1 SMP PREEMPT_DYNAMIC Thu Sep 10 02:14:15 UTC 2026  RealMemory=%d AllocMem=%d "
             "FreeMem=%d Sockets=%d Boards=1 MemSpecLimit=15360 State=%s ThreadsPerCore=1 TmpDisk=0 Weight=100 "
-            "Owner=N/A MCS_label=N/A Partitions=long,short,instant  BootTime=2026-10-02T13:32:47 "
+            "Owner=N/A MCS_label=N/A Partitions=%s  BootTime=2026-10-02T13:32:47 "
             "SlurmdStartTime=2026-10-21T03:29:09 CfgTRES=cpu=%d,mem=%dM,billing=%d%s AllocTRES=%s CapWatts=n/a "
-            "CurrentWatts=0 AveWatts=0 ExtSensorsJoules=n/a ExtSensorsWatts=0 ExtSensorsTemp=n/a") % (
-        name, n["arch"], n["cores"], cpu_alloc, n["cpus"], n["cpus"], load, n["features"], n["features"], gres, name,
-        name, n["arch"], n["mem"], mine_mem + n["others_mem"], n["mem"] // 3, n["sockets"], state, n["cpus"], n["mem"],
-        n["cpus"], (",gres/gpu=%d" % n["gpus"]) if n["gpus"] else "", alloc_tres), state, cpu_alloc, gpu_alloc
+            "CurrentWatts=0 AveWatts=0 ExtSensorsJoules=n/a ExtSensorsWatts=0 ExtSensorsTemp=n/a%s") % (
+        name, n["arch"], n["cores"], cpu_alloc, n["cpus"], n["cpus"], load, n["features"], n["features"], gres, gres_used,
+        name, name, n["arch"], n["mem"], mine_mem + n["others_mem"], n["mem"] // 3, n["sockets"], shown_state,
+        n.get("partitions", "long,short,instant"), n["cpus"], n["mem"], n["cpus"],
+        (",gres/gpu=%d" % n["gpus"]) if n["gpus"] else "", alloc_tres, reason)
+    if state == "DOWN*":   # a node that doesn't answer: no Arch, no OS
+        line = re.sub(r"OS=.*? 2026  ", "", re.sub(r"Arch=\S+ ", "", line))
+    return line, state, cpu_alloc, gpu_alloc
 
 
 def expand_ids(s):
@@ -654,7 +753,7 @@ def scontrol():
     detail = any(a in ("-d", "-dd", "--details") for a in ARGS)
     oneliner = any(a in ("-o", "--oneliner") for a in ARGS)
     if len(args) >= 2 and args[0] == "show" and args[1] in ("job", "jobid", "jobs"):
-        jobs = all_jobs()
+        jobs = all_jobs() + (colleague_jobs() if SCENARIO == "demo" else [])
         if len(args) > 2:
             wanted = args[2]
             jobs = [j for j in jobs if wanted in (j["id"], j["job_id"]) or (j["array_job"] == wanted)]
@@ -669,7 +768,7 @@ def scontrol():
         for name in names:
             if name not in nodes:
                 fail("Node %s not found" % name)
-            line = node_line(name, nodes[name], jobs)[0]
+            line = node_line(name, nodes[name], jobs, detail)[0]
             if not oneliner:
                 line = line.replace("  ", " ").replace(" ", "\n   ", 0)
             out.append(line)
@@ -678,6 +777,34 @@ def scontrol():
         print("\n".join(expand(args[2])))
     elif args[:1] == ["ping"]:
         print("Slurmctld(primary) at admin1 is UP")
+    elif args[:1] in (["hold"], ["release"]) and len(args) > 1:
+        state = load_state()
+        held = state.setdefault("held", {})
+        pending = {k for j in all_jobs() if j["state"] == "PENDING"
+                   for k in (j["id"], re.sub(r"%\d+", "", j["id"]), j["job_id"], j["array_job"]) if k}
+        for i in args[1].split(","):
+            if i not in pending:
+                fail("Job is no longer pending execution for job %s" % i)
+            if args[0] == "hold":
+                held[i] = NOW
+            else:
+                held.pop(i, None)
+        save_state(state)
+        with open(os.path.join(STATE, "scancel.log"), "a") as f:
+            f.write("%d scontrol %s\n" % (NOW, " ".join(args)))
+    elif args[:2] == ["write", "batch_script"] and len(args) > 2:
+        match = [j for j in all_jobs() if args[2] in (j["id"], j["job_id"], j["array_job"]) and j["state"] in ("RUNNING", "PENDING")]
+        if not match:
+            fail("job script retrieval failed: Invalid job id specified")
+        j = match[0]
+        print("#!/bin/bash\n#SBATCH --job-name=%s\n#SBATCH --account=%s\n#SBATCH --partition=%s\n#SBATCH --constraint=%s\n"
+              "#SBATCH --nodes=%d\n#SBATCH --ntasks-per-node=1\n#SBATCH --cpus-per-task=%d\n#SBATCH --mem=%s\n%s#SBATCH --time=%s\n"
+              "#SBATCH --output=%s\n\n# Made-up script of the fake Slurm\nset -euo pipefail\nromeo_load_%s_env\n\n"
+              "echo \"start $(date) on $SLURM_JOB_NODELIST\"\nsrun ./solver --config case.yaml --steps 12000\n"
+              % (j["name"], j["account"], j["partition"], "armgpu" if j["gpus"] else "x64cpu", j["num_nodes"],
+                 j["num_cpus"] // j["num_nodes"], mem(j["mem_per_node"]),
+                 "#SBATCH --gpus-per-node=%d\n" % (j["gpus"] // j["num_nodes"]) if j["gpus"] else "", limit_str(j["limit"]),
+                 j["stdout"], "armgpu" if j["gpus"] else "x64cpu"))
     elif args[:2] == ["show", "reservation"]:
         print("ReservationName=maintenance-gpfs StartTime=%s EndTime=%s Duration=08:00:00\n"
               "   Nodes=romeo-a[001-058],romeo-c[001-040,101-104] NodeCnt=102 CoreCnt=25152 Features=(null) PartitionName=(null) Flags=MAINT,IGNORE_JOBS\n"
@@ -719,6 +846,8 @@ def sinfo():
     rows = []
     for partition, limit in (("instant*", "1:00:00"), ("short", "1-00:00:00"), ("long", "30-00:00:00")):
         for name, n in nodes.items():
+            if partition.rstrip("*") not in n.get("partitions", "long,short,instant").split(","):
+                continue
             _, state, cpu_alloc, gpu_alloc = node_line(name, n, jobs)
             compact = {"IDLE": "idle", "MIXED": "mix", "ALLOCATED": "alloc", "DOWN*": "down*", "DRAINED": "drain"}[state]
             long_state = {"IDLE": "idle", "MIXED": "mixed", "ALLOCATED": "allocated", "DOWN*": "down*", "DRAINED": "drained"}[state]
@@ -764,8 +893,26 @@ def sinfo():
 SACCT_UNITS = {"K": 1, "M": 1024, "G": 1024 * 1024, "T": 1024 ** 3}
 
 
+def array_history(fields, sep):
+    """sacct -j 812402: every task of the demo array, ended ones too"""
+    lines = []
+    for t in range(1, 159):
+        state, code = ARRAY_FAILED.get(t, ("COMPLETED", "0:0"))
+        if t >= 151:
+            state, code = "RUNNING", "0:0"
+        values = {"JobID": "812402_%d" % t, "State": state, "ExitCode": code}
+        lines.append(sep.join(values.get(f, "") for f in fields))
+    lines.append(sep.join({"JobID": "812402_[159-200%8]", "State": "PENDING", "ExitCode": "0:0"}.get(f, "") for f in fields))
+    return lines
+
+
 def sacct():
     opts, _ = options(ARGS, {"u", "user", "S", "starttime", "E", "endtime", "o", "format", "s", "state", "j", "jobs", "delimiter"})
+    if opts.get("j") or opts.get("jobs"):
+        fields = [f.split("%")[0] for f in (opts.get("o") or opts.get("format") or "JobID,State,ExitCode").split(",")]
+        ids = (opts.get("j") or opts.get("jobs")).split(",")
+        print("\n".join(array_history(fields, opts.get("delimiter") or "|") if "812402" in ids else []))
+        return
     fields = [f.split("%")[0] for f in (opts.get("o") or opts.get("format") or "JobID,JobName,State,Elapsed").split(",")]
     sep = opts.get("delimiter") or "|"
     allocations_only = opts.get("X") or opts.get("allocations")
@@ -776,19 +923,24 @@ def sacct():
             short = {"COMPLETED": "CD", "FAILED": "F", "TIMEOUT": "TO", "OUT_OF_MEMORY": "OOM", "CANCELLED": "CA"}.get(r["State"].split()[0], "")
             if short.lower() not in states.lower().split(",") and r["State"].split()[0].lower() not in states.lower().split(","):
                 continue
-        steps = [("", None)] if allocations_only else [("", None), (".batch", "batch"), (".extern", "extern")]
+        steps = [("", None)] if allocations_only or r["Start"] is None else [("", None), (".batch", "batch"), (".extern", "extern")]
+        # As on ROMEO: CPU time and gres/gpu in AllocTRES; with -X the job's line has no CPU time (only its steps do)
+        gres = ",gres/gpu=%d" % r["GPUs"] if r["GPUs"] else ""
+        tres = "billing=%d,cpu=%d%s,mem=%dG,node=%d" % (r["NCPUs"], r["NCPUs"], gres, int(r["ReqMem"][:-1]) * r["NNodes"], r["NNodes"])
         for suffix, step in steps:
             cpu_time = r["Elapsed"] * r["NCPUs"]
+            total_cpu = 0 if step == "extern" or (allocations_only and not step) else r["TotalCPU"]
             values = {
                 "JobID": r["JobID"] + suffix, "JobName": step or r["JobName"],
                 "State": r["State"] if not step else ("CANCELLED" if r["State"].startswith("CANCELLED") else r["State"]),
                 "Partition": "" if step else r["Partition"], "Account": r["Account"], "User": "" if step else USER,
-                "Submit": stamp(r["Submit"]), "Start": stamp(r["Start"]), "End": stamp(r["End"]),
+                "Submit": stamp(r["Submit"]), "Start": stamp(r["Start"]) if r["Start"] else "Unknown",
+                "End": stamp(r["End"]) if r["End"] else "Unknown",
                 "Elapsed": duration(r["Elapsed"]), "ElapsedRaw": str(r["Elapsed"]),
                 "Timelimit": "" if step else limit_str(r["Timelimit"]), "TimelimitRaw": "" if step else str(r["Timelimit"] // 60),
                 "NNodes": str(r["NNodes"]), "NCPUs": str(r["NCPUs"]), "ReqMem": "" if step else r["ReqMem"],
-                "AllocTRES": "cpu=%d,mem=%dG,node=%d" % (r["NCPUs"], int(r["ReqMem"][:-1]) * r["NNodes"], r["NNodes"]),
-                "TotalCPU": duration(r["TotalCPU"] if step != "extern" else 0) + ".123",
+                "AllocTRES": tres if not step or r["Start"] else "",
+                "TotalCPU": duration(total_cpu) + ".123" if total_cpu else "00:00:00",
                 "CPUTime": duration(cpu_time), "CPUTimeRAW": str(cpu_time),
                 "MaxRSS": "" if not step else (r["MaxRSS"] if step == "batch" else "0"),
                 "ExitCode": r["ExitCode"], "NodeList": r["NodeList"], "WorkDir": HOME,
@@ -817,16 +969,22 @@ def sacctmgr():
 
 def scancel():
     ids = [a for a in ARGS if not a.startswith("-")]
+    pending_only = any(a in ("--state=PENDING", "--state=PD", "-tPENDING", "-tPD") for a in ARGS)
     state = load_state()
     jobs = all_jobs()
     os.makedirs(STATE, exist_ok=True)
     with open(os.path.join(STATE, "scancel.log"), "a") as f:
         f.write("%d scancel %s\n" % (NOW, " ".join(ARGS)))
     for i in ids:
-        match = [j for j in jobs if i in (j["id"], j["job_id"])]
-        if not match or match[0]["state"] not in ("RUNNING", "PENDING", "COMPLETING"):
+        match = [j for j in jobs if i in (j["id"], j["job_id"], j["array_job"]) and j["state"] in ("RUNNING", "PENDING", "COMPLETING")]
+        if pending_only:
+            match = [j for j in match if j["state"] == "PENDING"]
+            for j in match:
+                state["cancelled"][j["id"]] = NOW
+            continue
+        if not match:
             fail("scancel: error: Kill job error on job id %s: Invalid job id specified" % i)
-        state["cancelled"][match[0]["id"]] = NOW
+        state["cancelled"][i if any(j["array_job"] == i for j in match) else match[0]["id"]] = NOW
     save_state(state)
 
 

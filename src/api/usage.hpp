@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <map>
@@ -26,7 +27,25 @@ struct LiveUse {
     double mem_mib = 0;       // memory they use now, all tasks
     double max_task_mib = 0;  // the largest task's peak
     int steps = 0;
+    double at = 0;            // when sstat answered, in seconds since the epoch
+    double busy = -1;         // share of the job's CPUs busy since the reading before (-1: no reading before)
 };
+
+/* What the CPUs did between two readings of the same job: what it does now, not since it started
+- sstat gives the CPU time in whole seconds: readings less than 5 s apart (r pressed twice) keep the one before
+  as the base, and what it said
+- Less CPU time than before (a step ended): no figure until the next reading
+*/
+inline void follow(LiveUse& now, const LiveUse& before, int cpus) {
+    if (now.at - before.at < 5) {
+        now.at = before.at;
+        now.cpu_seconds = before.cpu_seconds;
+        now.busy = before.busy;
+        return;
+    }
+    const double cpu = now.cpu_seconds - before.cpu_seconds;
+    now.busy = cpu >= 0 && cpus > 0 ? std::min(1.0, cpu / ((now.at - before.at) * cpus)) : -1;
+}
 
 // "cpu=01:02:03,energy=0,fs/disk=1234,mem=1.5G,pages=0,vmem=3G": the CPU time and the memory
 inline void parseUsageTres(const std::string& tres, double& cpu_seconds, double& mem_mib) {
@@ -61,6 +80,7 @@ inline Fetched<LiveUse> fetchLiveUse(const std::string& job_id) {
         return r;
     }
     r.data = parseSstat(res.out);
+    r.data.at = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     if (r.data.steps == 0) r.error = "no step running";
     return r;
 }

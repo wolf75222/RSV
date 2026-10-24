@@ -218,7 +218,7 @@ struct Job {
     std::string id;           // as squeue shows it: 812345, 812402_1, 812402_[3-40]
     std::string job_id;       // Slurm's own number (each array task has one), for scontrol
     std::string state;        // RUNNING, PENDING, COMPLETED...
-    std::string name, partition, account, qos, reason, nodelist, dependency, stdout_path, workdir;
+    std::string name, partition, account, qos, reason, nodelist, dependency, stdout_path, workdir, user;
     int nodes = 0, cpus = 0, gpus = 0;
     double mem_mib = 0;       // all nodes
     long used = UNKNOWN, limit = UNKNOWN, left = UNKNOWN;   // seconds
@@ -240,7 +240,7 @@ inline const std::vector<std::string>& squeueFields() {
     static const std::vector<std::string> fields = {
         "JobArrayID", "JobID", "State", "Partition", "Account", "QOS", "NumNodes", "NumCPUs", "tres-alloc",
         "TimeUsed", "TimeLimit", "TimeLeft", "StartTime", "EndTime", "SubmitTime", "Reason", "NodeList",
-        "Dependency", "STDOUT", "WorkDir", "Name"};
+        "Dependency", "STDOUT", "WorkDir", "UserName", "Name"};
     return fields;
 }
 
@@ -293,7 +293,8 @@ inline std::vector<Job> parseSqueue(const std::string& out) {
         j.dependency = f[17] == "(null)" ? "" : f[17];
         j.stdout_path = f[18];
         j.workdir = f[19];
-        j.name = util::sanitize(f[20]);   // shown only: no escape sequence or invisible character reaches the screen
+        j.user = util::sanitize(f[20]);
+        j.name = util::sanitize(f[21]);   // shown only: no escape sequence or invisible character reaches the screen
         if (!j.id.empty()) jobs.push_back(j);
     }
     return jobs;
@@ -308,6 +309,60 @@ inline Fetched<std::vector<Job>> fetchJobs(const std::string& user) {
         return r;
     }
     r.data = parseSqueue(res.out);
+    return r;
+}
+
+// The jobs of everyone in these accounts (ROMEO shows them: PrivateData = none), for the project view
+inline Fetched<std::vector<Job>> fetchAccountJobs(const std::vector<std::string>& accounts) {
+    Fetched<std::vector<Job>> r;
+    std::string list;
+    for (const auto& a : accounts) list += (list.empty() ? "" : ",") + a;
+    if (list.empty()) {
+        r.error = "no account of yours can run jobs";
+        return r;
+    }
+    const RunResult res = run({"squeue", "-A", list, "-t", "all", "-h", "-O", squeueFormat()}, 15);
+    if (!res.ok()) {
+        r.error = res.error("squeue");
+        return r;
+    }
+    r.data = parseSqueue(res.out);
+    return r;
+}
+
+/* The script a job was submitted with, as Slurm keeps it
+- Waiting or running: scontrol write batch_script (an array's tasks share their array's script)
+- Ended: sacct --batch-script, only where Slurm stores the scripts (AccountingStoreFlags=job_script), ROMEO doesn't
+*/
+inline Fetched<std::string> fetchScript(const std::string& job_id, const std::string& array, bool ended) {
+    Fetched<std::string> r;
+    std::string error;
+    for (const std::string& id : {job_id, array}) {
+        if (id.empty()) continue;
+        const RunResult res = run({"scontrol", "write", "batch_script", id, "-"}, 15);
+        if (res.ok() && !util::trim(res.out).empty()) {
+            r.data = res.out;
+            return r;
+        }
+        if (error.empty()) error = util::trim(res.err.empty() ? res.out : res.err);
+    }
+    if (ended) {
+        const RunResult config = run({"scontrol", "show", "config"}, 15);
+        bool stored = false;
+        for (const auto& line : util::lines(config.out))
+            if (util::startsWith(util::trim(line), "AccountingStoreFlags") && line.find("job_script") != std::string::npos) stored = true;
+        if (!stored) {
+            r.error = "Slurm keeps no script once a job has ended here (AccountingStoreFlags has no job_script)";
+            return r;
+        }
+        const RunResult res = run({"sacct", "-j", job_id, "--batch-script"}, 30);
+        if (res.ok() && !util::trim(res.out).empty()) {
+            r.data = res.out;
+            return r;
+        }
+        error = util::trim(res.err.empty() ? res.out : res.err);
+    }
+    r.error = error.empty() ? "no script" : error;
     return r;
 }
 
@@ -442,17 +497,71 @@ struct HistoryJob {
     std::string id, name, state, state_detail, partition, account, exit_code, nodelist;
     std::time_t submit = 0, start = 0, end = 0;
     long elapsed = UNKNOWN, limit = UNKNOWN;
-    int nodes = 0, cpus = 0;
+    int nodes = 0, cpus = 0, gpus = 0;   // allocated (gpus: gres/gpu of AllocTRES)
     double mem_mib = 0;        // allocated, on each node
     double max_rss_mib = 0;    // largest task (sacct can't tell more), over all steps
-    long total_cpu = UNKNOWN;  // CPU time used, in seconds
+    long total_cpu = UNKNOWN;  // CPU time used, in seconds (the sum of the steps that ended)
     long cpu_time = UNKNOWN;   // CPU time allocated: elapsed × CPUs
 
+    // The CPU time of a step is recorded when it ends: a running job's isn't known yet
+    bool ended() const { return !isActive(state) && !isPending(state); }
+
     // 0..1 (or more), -1 when unknown
-    double cpuEfficiency() const { return total_cpu >= 0 && cpu_time > 0 ? double(total_cpu) / cpu_time : -1; }
+    double cpuEfficiency() const { return ended() && total_cpu >= 0 && cpu_time > 0 ? double(total_cpu) / cpu_time : -1; }
     double memEfficiency() const { return max_rss_mib > 0 && mem_mib > 0 ? max_rss_mib / mem_mib : -1; }
-    double timeUsed() const { return elapsed >= 0 && limit > 0 ? double(elapsed) / limit : -1; }
+    double timeUsed() const { return ended() && start > 0 && elapsed >= 0 && limit > 0 ? double(elapsed) / limit : -1; }
+
+    /* Hours: reserved (a running job's so far), used, reserved but idle (cores that did nothing), -1 when unknown
+    - GPU hours are only reserved ones: ROMEO doesn't record what the GPUs did (gres/gpuutil stays empty)
+    */
+    double cpuHours() const { return cpu_time > 0 ? cpu_time / 3600.0 : 0; }
+    double usedCpuHours() const { return ended() && total_cpu >= 0 ? total_cpu / 3600.0 : -1; }
+    double idleCpuHours() const { return usedCpuHours() < 0 ? -1 : std::max(0.0, cpuHours() - usedCpuHours()); }
+    double gpuHours() const { return elapsed > 0 ? double(elapsed) * gpus / 3600.0 : 0; }
+    // --time asked but not used, by a completed job (one cancelled, failed or out of time didn't ask for too much)
+    long unusedTime() const {
+        return state == "COMPLETED" && limit > 0 && elapsed >= 0 ? std::max(0L, limit - elapsed) : UNKNOWN;
+    }
 };
+
+/* What a list of jobs used, for the history's summary
+- CPU and GPU hours of the jobs that ended: a running job counts once it has ended (its CPU time is known then)
+- The idle CPU hours of GPU jobs apart: their cores mostly feed the GPUs, idle cores are expected there
+- Time: the --time asked by the completed jobs, and what they ran
+*/
+struct Consumption {
+    int ended = 0, running = 0, gpu_jobs = 0;
+    double cpu_h = 0, used_cpu_h = 0, idle_cpu_h = 0, gpu_h = 0;
+    double idle_cpu_h_gpu_jobs = 0;   // part of idle_cpu_h
+    double asked_h = 0, ran_h = 0;   // completed jobs
+
+    double idleShare() const { return cpu_h > 0 ? idle_cpu_h / cpu_h : -1; }
+    double unusedShare() const { return asked_h > 0 ? 1 - ran_h / asked_h : -1; }
+};
+
+inline Consumption consumption(const std::vector<const HistoryJob*>& jobs) {
+    Consumption c;
+    for (const HistoryJob* j : jobs) {
+        if (!j->ended()) {
+            c.running += isActive(j->state);
+            continue;
+        }
+        c.ended++;
+        c.cpu_h += j->cpuHours();
+        if (j->usedCpuHours() >= 0) {
+            c.used_cpu_h += j->usedCpuHours();
+            c.idle_cpu_h += j->idleCpuHours();
+            if (j->gpus > 0) c.idle_cpu_h_gpu_jobs += j->idleCpuHours();
+        }
+        c.gpu_h += j->gpuHours();
+        c.gpu_jobs += j->gpus > 0 && j->elapsed > 0;
+        if (j->unusedTime() >= 0) {
+            c.asked_h += j->limit / 3600.0;
+            c.ran_h += j->elapsed / 3600.0;
+        }
+    }
+    return c;
+}
 
 inline const std::vector<std::string>& sacctFields() {
     static const std::vector<std::string> fields = {
@@ -505,6 +614,7 @@ inline std::vector<HistoryJob> parseSacct(const std::string& out) {
         h.nodes = static_cast<int>(util::toLong(f[9]));
         h.cpus = static_cast<int>(util::toLong(f[10]));
         const auto tres = parseTres(f[12]);
+        if (tres.count("gres/gpu")) h.gpus = static_cast<int>(tres.at("gres/gpu"));
         if (tres.count("mem") && h.nodes > 0)
             h.mem_mib = tres.at("mem") / h.nodes;
         else if (!f[11].empty()) {
@@ -588,15 +698,38 @@ inline Fetched<std::vector<Assoc>> fetchAssocs(const std::string& user) {
     return r;
 }
 
+// Your accounts that can run jobs: on ROMEO "default" can't (MaxSubmit=0), --account is needed
+inline std::vector<std::string> runAccounts(const std::string& user) {
+    std::vector<std::string> out;
+    for (const auto& a : fetchAssocs(user).data)
+        if (a.max_submit != 0 && a.max_jobs != 0 && std::find(out.begin(), out.end(), a.account) == out.end()) out.push_back(a.account);
+    return out;
+}
+
 // ---------------------------------------------------------------- cancel (scancel)
 
 // "" when it worked, else what scancel said
-inline std::string cancelJob(const std::string& id) {
-    const RunResult res = run({"scancel", id}, 15);
+// scancel 812345 812402 ...: "" when it went well, else what scancel said
+inline std::string cancelJobs(const std::vector<std::string>& ids) {
+    std::vector<std::string> args = {"scancel"};
+    args.insert(args.end(), ids.begin(), ids.end());
+    const RunResult res = run(args, 30);
     if (res.ok() && res.err.find("error") == std::string::npos) return "";
     std::string e = res.error("scancel");
     if (e.empty()) e = util::trim(res.err);
     return e.empty() ? "scancel failed" : e;
+}
+
+// scontrol hold (or release) 812345,812402: pending jobs kept from starting, or let go again
+inline std::string holdJobs(const std::vector<std::string>& ids, bool hold) {
+    std::string list;
+    for (const auto& id : ids) list += (list.empty() ? "" : ",") + id;
+    const char* verb = hold ? "hold" : "release";
+    const RunResult res = run({"scontrol", verb, list}, 30);
+    if (res.ok() && util::trim(res.err).empty()) return "";
+    std::string e = res.error(std::string("scontrol ") + verb);
+    if (e.empty()) e = util::trim(res.err);
+    return e.empty() ? std::string("scontrol ") + verb + " failed" : e;
 }
 
 // ---------------------------------------------------------------- log files
