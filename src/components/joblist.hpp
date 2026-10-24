@@ -126,16 +126,19 @@ inline Element jobRow(const api::Job& j, const ListColumns& c, long used, bool s
     return selected ? row | inverted : row;
 }
 
-// An array: its state, 812402_*, its name, the bar of its tasks and how many have ended
+/* An array: its state, 812402_*, its name, the bar of its tasks and how many have ended
+- Selected, the row is inverted but its bar: inverted, its colors would be lost
+*/
 inline Element arrayRow(const JobArray& a, const ListColumns& c, const std::string& time, bool open, bool selected, bool marked) {
     const api::ArrayProgress& p = a.progress;
     const std::string state = a.state();
+    auto inv = [selected](Element e) { return selected ? e | inverted : e; };
     Elements cells = {
         markCell(marked),
-        text(util::padRight(api::shortState(state), STATE_WIDTH)) | color(stateColor(state)) | bold,
-        text(util::padRight(a.shownId(), static_cast<size_t>(c.id)) + " "),
+        inv(text(util::padRight(api::shortState(state), STATE_WIDTH)) | color(stateColor(state)) | bold),
+        inv(text(util::padRight(a.shownId(), static_cast<size_t>(c.id)) + " ")),
     };
-    if (c.user) cells.push_back(text(util::padRight(a.first().user, static_cast<size_t>(c.user)) + " ") | color(theme::cyan()));
+    if (c.user) cells.push_back(inv(text(util::padRight(a.first().user, static_cast<size_t>(c.user)) + " ") | color(theme::cyan())));
 
     const int name_w = c.name();
     const std::string count = std::to_string(p.done + p.failed + p.cancelled) + "/" + std::to_string(p.total());
@@ -143,13 +146,14 @@ inline Element arrayRow(const JobArray& a, const ListColumns& c, const std::stri
     const int bar_w = std::min(10, name_w - 2 - 8 - 1 - 1 - count_w);   // 8 columns of name at least
     const bool with_count = name_w >= 2 + 4 + 1 + count_w;
     const int text_w = std::max(1, name_w - 2 - (with_count ? count_w + 1 : 0) - (bar_w >= 5 ? bar_w + 1 : 0));
-    Elements name = {text(open ? "▾ " : "▸ ") | dim, text(util::padRight(a.first().name, static_cast<size_t>(text_w)) + " ")};
-    if (bar_w >= 5) name.push_back(hbox({progressBar(p, bar_w), text(" ")}));
-    if (with_count) name.push_back(text(count) | (p.failed ? color(theme::red()) : nothing));
-    cells.push_back(hbox(std::move(name)) | size(WIDTH, EQUAL, name_w + 1));
-    cells.push_back(text(util::padLeft(time, TIME_WIDTH)) | (api::isActive(state) ? nothing : dim));
-    Element row = hbox(std::move(cells));
-    return selected ? row | inverted : row;
+    cells.push_back(inv(text((open ? "▾ " : "▸ ") + util::padRight(a.first().name, static_cast<size_t>(text_w)) + " ")));
+    if (bar_w >= 5) {
+        cells.push_back(progressBar(p, bar_w));
+        cells.push_back(inv(text(" ")));
+    }
+    if (with_count) cells.push_back(inv(text(count + " ") | (p.failed && !selected ? color(theme::red()) : nothing)));
+    cells.push_back(inv(text(util::padLeft(time, TIME_WIDTH)) | (api::isActive(state) ? nothing : dim)));
+    return hbox(std::move(cells));
 }
 
 inline Element jobListHeader(const ListColumns& c) {
