@@ -74,6 +74,10 @@ Under it, when there is room, the last lines of the job's output.
 
 ![Every node: why some are down, what the others run](../img/nodes.png)
 
+![A zoom on a node: its jobs, load and memory](../img/node.png)
+
+![The hardware of each kind of node](../img/hardware.png)
+
 ## In the details
 
 - A running job: `Now` is how busy its CPUs were between the last two readings (`sstat`, CPU time over time × CPUs: the first reading counts since the job started), and the memory of its running steps.
