@@ -46,7 +46,7 @@ using namespace ftxui;
 
 namespace {
 
-constexpr const char* VERSION = "2.3.0";
+constexpr const char* VERSION = "2.4.0";
 
 // The signal that asked RSV to end (kill, hangup), handled once FTXUI's loop has returned: see main()
 volatile std::sig_atomic_t quit_signal = 0;
@@ -719,21 +719,29 @@ private:
         monitor_worker_.post([this, generation = monitor_generation_, id = monitor_.job_id, known] {
             api::Fetched<std::vector<api::StepUse>> r;
             std::set<std::string> own;
+            std::map<std::string, std::string> names;
             bool asked = false;
             try {
                 r = api::fetchSteps(id);
-                // A step not seen before may be one of the view's: they are found by their name (rsv-live...)
+                // A step not seen before: its name, what it runs (the view's own are named rsv-live...)
                 for (const auto& s : r.data)
                     if (!known.count(s.id)) asked = true;
-                if (asked) own = api::stepsNamed(id, api::liveStepName());
+                if (asked) {
+                    names = api::stepNames(id);
+                    for (const auto& [step, name] : names)
+                        if (util::startsWith(name, api::liveStepName())) own.insert(step);
+                }
             } catch (const std::exception& e) {
                 r.error = std::string("sstat: ") + e.what();
             }
             const double at = ui::MonitorView::nowSeconds();
-            post([this, generation, at, own, asked, r = std::move(r)]() mutable {
+            post([this, generation, at, own, names, asked, r = std::move(r)]() mutable {
                 if (generation != monitor_generation_) return;
                 monitor_loading_ = false;
-                if (asked) monitor_.own_steps = own;
+                if (asked) {
+                    monitor_.own_steps = own;
+                    for (const auto& [step, name] : names) monitor_.step_names[step] = name;
+                }
                 monitor_.setSteps(r.data, at, r.error);
             });
         });

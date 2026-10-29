@@ -763,18 +763,24 @@ static void monitor() {
     }
     CHECK_EQ(ui::resample(s, 104, 1, 6, 2)[2], 0.2);   // divided by the scale
 
-    // btop's graph: each character shows the value before (left) and its own (right); blocks or braille
+    // btop's graph: two readings per character (the older on the left), a dot at least where there is one (no_zero)
     {
         auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(3), ftxui::Dimension::Fixed(1));
-        ftxui::Render(screen, ui::chart::graph({0, 1, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Braille));
-        CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));   // 0 then nothing before: empty
-        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("⢸"));   // from 0 to full
+        ftxui::Render(screen, ui::chart::graph({-1, -1, 0, 1, 1, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Braille));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));   // nothing read: empty
+        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("⣸"));   // 0 (its baseline dot), then full
         CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
-        ftxui::Render(screen, ui::chart::graph({0.5, 0.5, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Block));
+        ftxui::Render(screen, ui::chart::graph({0.5, 0.5, 0.5, 0.5, 0.5, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Block));
         CHECK_EQ(screen.PixelAt(1, 0).character, std::string("▄"));
         CHECK_EQ(screen.PixelAt(2, 0).character, std::string("▟"));
-        ftxui::Render(screen, ui::chart::graph({1, 1, 1}, 3, 1, ui::chart::cpuGradient(), true, ui::chart::Symbols::Braille));   // hanging
+        ftxui::Render(screen, ui::chart::graph({1, 1, 1, 1, 1, 1}, 3, 1, ui::chart::cpuGradient(), true, ui::chart::Symbols::Braille));   // hanging
         CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
+        // Two rows: the top one only where the reading passes half
+        auto two = ftxui::Screen::Create(ftxui::Dimension::Fixed(2), ftxui::Dimension::Fixed(2));
+        ftxui::Render(two, ui::chart::graph({0.25, 0.25, 1, 1}, 2, 2, ui::chart::cpuGradient(), false, ui::chart::Symbols::Braille));
+        CHECK_EQ(two.PixelAt(0, 0).character, std::string(" "));
+        CHECK_EQ(two.PixelAt(1, 0).character, std::string("⣿"));
+        CHECK_EQ(two.PixelAt(0, 1).character, std::string("⣤"));   // a quarter: half of the bottom row
         // Bars: each column's height to an eighth; hanging, the rest of the character inverted
         ftxui::Render(screen, ui::chart::graph({0, 0.5, 1}, 3, 1, ui::chart::cpuGradient()));
         CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));
@@ -1005,6 +1011,40 @@ static void gpu_view() {
     CHECK(m.wantFacts(200));   // never read
 }
 
+// The overview as btop's: steps picked with ↑ ↓, the one picked in depth on Enter, with what it runs
+static void overview_steps() {
+    ui::MonitorView m;
+    m.cpus = 64;
+    api::StepUse a, b;
+    a.id = "9.0";
+    b.id = "9.batch";
+    a.tasks = 2;
+    b.tasks = 1;
+    for (int k = 0; k < 4; k++) {
+        a.cpu_seconds = 400.0 * k;   // 40 cores busy
+        b.cpu_seconds = 10.0 * k;    // 1
+        m.setSteps({a, b}, 100 + 10 * k, "");
+    }
+    m.step_names = {{"9.0", "lbm3d"}, {"9.batch", "batch"}};
+    CHECK_EQ(m.stepOrder().front(), std::string("9.0"));   // the busiest first
+    bool close = false;
+    m.onEvent(ftxui::Event::ArrowDown, close);
+    m.onEvent(ftxui::Event::ArrowDown, close);
+    CHECK_EQ(m.step_selected, std::string("9.batch"));
+    m.onEvent(ftxui::Event::Return, close);
+    CHECK(m.step_detail);
+    CHECK(!close);
+    auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(150), ftxui::Dimension::Fixed(46));
+    ftxui::Render(screen, m.render(150, 46));
+    const std::string out = screen.ToString();
+    CHECK(out.find("Runs") != std::string::npos);
+    CHECK(out.find("lbm3d") != std::string::npos);
+    CHECK(out.find("¹") != std::string::npos);   // the boxes' numbers, as btop's
+    m.onEvent(ftxui::Event::Escape, close);
+    CHECK(!m.step_detail);
+    CHECK(!close);   // Esc closes the details first
+}
+
 // A server of models: its metrics (recorded from vLLM 0.31 on ROMEO, and SGLang's names), found from its log
 static void inference() {
     const std::string vllm = R"(# HELP vllm:num_requests_running Number of requests in model execution batches.
@@ -1173,6 +1213,7 @@ int main() {
     monitor();
     gpu_view();
     inference();
+    overview_steps();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

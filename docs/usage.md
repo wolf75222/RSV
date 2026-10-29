@@ -77,13 +77,14 @@ Everywhere in it: `+` `-` zoom in time (1 to 30 s per column, up to the last hou
 
 ### 1 overview
 
-The CPUs' curve and under it the GPUs' (or the memory's, without GPUs), each with its scale. Beside them a gauge for the CPUs, memory, GPUs and their memory, and each GPU with its little curve, use and temperature (each step when there is no GPU). Under them:
+Laid out as btop's boxes: muted frames, each title on its border with its number (`¹cpu`, `²mem`, `³io`, `⁴steps`), the keys that act on a box on its border too (`- 2s per column +`, `v`, `↑↓ select`, `Enter details`).
 
-- `memory`: asked, in use with its curve, free, the largest task and its node, GPU memory.
-- `disk`: the bytes its steps read and write per second (reads above, writes hanging under them, on one scale), with their totals.
-- `steps`: each step with the cores it keeps busy and their curve, its memory and largest task.
+- `cpu`: the CPUs' graph and under it the GPUs' (each GPU its own graph, side by side with its name and use, when each gets 10 columns; the memory's without GPUs), with their scale. Beside them, in a box of its own named after the nodes, a meter for the CPUs, memory, GPUs and their memory, and each GPU with its little graph (braille, coloured by its value), use and temperature (each step when there is no GPU).
+- `mem`: asked; used with its graph; free, the largest task and its node, GPU memory with their meters.
+- `io`: the bytes its steps read per second rising, those they write hanging under them, each on its own scale written in its corner; beside them, for each, its rate, its top and its total (as btop's network box).
+- `steps`: as btop's processes, the busiest first: each step with what it runs (its name in `squeue -s`: `python`, `lbm3d`...), its tasks, the cores it keeps busy and their little graph, its memory and largest task. `↑` `↓` pick one, `Enter` shows it in depth above the list (its graph of cores, what it runs, tasks, memory, largest task and its node, reads and writes per second and in all), `Esc` back.
 
-The graphs are solid areas, each column in the colour of its value, its top to an eighth of a character; `v` draws them in braille or in blocks instead.
+The graphs are solid areas, each column in the colour of its value, its top to an eighth of a character. `v` draws them as btop does instead: braille (or blocks), two readings per character, a dot at least where there is one, each row coloured along the gradient by its height (btop's `Draw::Graph`, the same tables of characters).
 
 ![A running job live (m): the overview](../img/live.png)
 

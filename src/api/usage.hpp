@@ -443,13 +443,21 @@ inline std::vector<GpuUse> parseNvidiaSmi(const std::string& out, const std::vec
 inline std::string liveStepName() { return "rsv-live"; }
 
 // The ids of the job's running steps whose name starts with `prefix` (squeue -s): the live view's own
-inline std::set<std::string> stepsNamed(const std::string& job_id, const std::string& prefix) {
-    std::set<std::string> r;
+// What each running step of a job runs, by its id (squeue -s: its name, the program srun started unless named)
+inline std::map<std::string, std::string> stepNames(const std::string& job_id) {
+    std::map<std::string, std::string> r;
     const RunResult res = run({"squeue", "-h", "-s", "-j", job_id, "-o", "%i|%j"}, 10);
     for (const auto& line : util::lines(res.out)) {
-        const auto f = util::split(line, '|');
-        if (f.size() >= 2 && util::startsWith(util::trim(f[1]), prefix)) r.insert(util::trim(f[0]));
+        const size_t bar = line.find('|');
+        if (bar != std::string::npos) r[util::trim(line.substr(0, bar))] = util::sanitize(util::trim(line.substr(bar + 1)));
     }
+    return r;
+}
+
+inline std::set<std::string> stepsNamed(const std::string& job_id, const std::string& prefix) {
+    std::set<std::string> r;
+    for (const auto& [id, name] : stepNames(job_id))
+        if (util::startsWith(name, prefix)) r.insert(id);
     return r;
 }
 

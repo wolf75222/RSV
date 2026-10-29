@@ -58,10 +58,14 @@ struct MonitorView : LivePieces {
     struct StepTrack {
         api::StepUse last;
         Series cores;           // how many cores it keeps busy
-        Rate rate;
+        Series reads, writes;   // bytes per second
+        Rate rate, read_rate{4, {}}, write_rate{4, {}};
         double seen = 0;
     };
     std::map<std::string, StepTrack> steps;
+    std::map<std::string, std::string> step_names;   // squeue -s: what each step runs (python, lbm3d...)
+    std::string step_selected;           // the one picked in the overview's steps (↑ ↓), its details on Enter
+    bool step_detail = false;
     std::set<std::string> own_steps;     // the view's own steps (nvidia-smi...): not the job's
     std::set<std::string> known_steps;   // every step sstat showed: a new one is looked up by name
 
@@ -122,6 +126,9 @@ struct MonitorView : LivePieces {
             t.seen = at;
             const double cores = t.rate.add(at, s.cpu_seconds);
             if (cores >= 0) t.cores.add(at, cores);
+            const double sr = t.read_rate.add(at, s.read_bytes), sw = t.write_rate.add(at, s.write_bytes);
+            if (sr >= 0) t.reads.add(at, sr);
+            if (sw >= 0) t.writes.add(at, sw);
         }
         for (auto it = steps.begin(); it != steps.end();) it = at - it->second.seen > 30 ? steps.erase(it) : std::next(it);
         cpu_rate.window = std::clamp(20.0 / std::max(1, cpus), 6.0, 20.0);
@@ -262,6 +269,17 @@ struct MonitorView : LivePieces {
             gpu_zoom = !gpu_zoom;
         } else if (view == 2 && gpu_zoom && e == Event::Escape) {
             gpu_zoom = false;
+        } else if (view == 0 && (e == Event::ArrowDown || e == Event::Character('j') || e == Event::ArrowUp || e == Event::Character('k'))) {
+            const auto order = stepOrder();
+            int here = 0;
+            for (size_t i = 0; i < order.size(); i++)
+                if (order[i] == step_selected) here = static_cast<int>(i);
+            const bool down = e == Event::ArrowDown || e == Event::Character('j');
+            if (!order.empty()) step_selected = order[static_cast<size_t>(std::clamp(here + (down ? 1 : -1), 0, static_cast<int>(order.size()) - 1))];
+        } else if (view == 0 && e == Event::Return) {
+            step_detail = !step_detail;
+        } else if (view == 0 && step_detail && e == Event::Escape) {
+            step_detail = false;
         } else if (view == 3 && (e == Event::ArrowDown || e == Event::Character('j'))) {
             inference.selected = std::min(servers - 1, inference.selected + 1);
         } else if (view == 3 && (e == Event::ArrowUp || e == Event::Character('k'))) {
@@ -294,19 +312,33 @@ struct MonitorView : LivePieces {
     }
     double memScale() const { return mem_limit_mib > 0 ? mem_limit_mib : std::max(1.0, mem.peak() * 1.25); }
 
-    // ---------------------------------------------------------------- 1: overview
+    // ---------------------------------------------------------------- 1: overview, as btop's boxes
 
-    Element overview(int width, int height, double now) {
+    // A series as the graph drawn with `symbols` wants it: one reading per column, or two (btop's braille)
+    std::vector<double> curve(const Series& s, double now, double step, int width, double scale, chart::Symbols how) const {
+        const int k = chart::perColumn(how);
+        return resample(s, now, step / k, width * k, scale);
+    }
+
+    // The steps, the busiest first (the order ↑ ↓ go through)
+    std::vector<std::string> stepOrder() const {
+        std::vector<std::pair<double, std::string>> v;
+        for (const auto& [id, t] : steps) v.push_back({-t.cores.last(), id});
+        std::sort(v.begin(), v.end());
+        std::vector<std::string> out;
+        for (const auto& [c, id] : v) out.push_back(id);
+        return out;
+    }
+
+    /* cpu: the CPUs' graph, under it the GPUs' (one beside the other, as btop's, when there is room) or the memory's;
+       beside them, in a box of its own, a meter for each and every GPU with its little graph, as btop's cores */
+    Element cpuBox(int width, int height, double now) {
         const double step = ZOOMS[zoom];
         const bool has_gpus = gpus > 0, wide = width >= 100;
-        const int cpu_h = std::clamp(height * 11 / 20, 10, std::max(10, height - 10));
-        const int low_h = height - cpu_h;
-
-        // cpu: the CPUs' curve, under it the GPUs' (else the memory's), each with its scale
         const int side_w = wide ? std::clamp(width * 2 / 5, 46, 66) : 0;
-        const int left_w = width - 2 - (wide ? side_w + 3 : 0);
+        const int left_w = width - 2 - (wide ? side_w + 1 : 0);
         const int graph_w = left_w - 6;
-        const int rows = cpu_h - 2 - 2;   // a line above each graph
+        const int rows = height - 2 - 2;
         const int up_h = std::max(2, rows * 11 / 20), down_h = std::max(2, rows - up_h);
         const double busy = cpu.last();
         const chart::Gradient under_g = has_gpus ? chart::gpuGradient() : chart::usedGradient();
@@ -327,36 +359,57 @@ struct MonitorView : LivePieces {
         if (has_gpus && gpu_power.last() > 0) under_line.push_back(text("  " + watts(gpu_power.last())) | color(chart::graphText()));
         if (!has_gpus && mem_mib >= 0) under_line.push_back(text("  " + util::mib(mem_mib) + " of " + util::mib(memScale())) | color(chart::graphText()));
 
+        // Under it, each GPU its own graph, side by side with its name, when each gets 10 columns (btop's gpu-totals)
+        Element under;
+        const int n_gpu = static_cast<int>(gpu_tracks.size());
+        if (has_gpus && n_gpu > 1 && (graph_w - (n_gpu - 1)) / n_gpu >= 10) {
+            const int each = (graph_w - (n_gpu - 1)) / n_gpu;
+            Elements cols;
+            int i = 0, used = 0;
+            for (const auto& [key, t] : gpu_tracks) {
+                const int w = i + 1 == n_gpu ? graph_w - used : each;
+                const double u = t.last.util < 0 ? -1 : t.last.util / 100;
+                Element label = hbox({text(shortNode(key.first) + ":" + std::to_string(key.second)) | color(chart::graphText()), text(" "),
+                                      text(pct(u)) | bold | color(chart::gpuGradient().at(std::max(0.0, u)))});
+                cols.push_back(dbox({chart::graph(curve(t.util, now, step * graph_w / w, w, 1, symbols), w, down_h, under_g, false, symbols),
+                                     vbox({hbox({text(" "), label, filler()}), filler()})}) |
+                               size(WIDTH, EQUAL, w));
+                used += w;
+                if (++i < n_gpu) {
+                    cols.push_back(separatorLight() | color(chart::divColor()));
+                    used += 1;
+                }
+            }
+            under = hbox(std::move(cols));
+        } else {
+            under = chart::graph(curve(has_gpus ? gpu : mem, now, step, graph_w, has_gpus ? 1 : memScale(), symbols), graph_w, down_h, under_g, false, symbols);
+        }
         Element left = vbox({hbox(std::move(cpu_line)),
-                             hbox({axis(up_h, "100%", "50%"), chart::graph(resample(cpu, now, step, graph_w, 1), graph_w, up_h, chart::cpuGradient(), false, symbols)}),
+                             hbox({axis(up_h, "100%", "50%"), chart::graph(curve(cpu, now, step, graph_w, 1, symbols), graph_w, up_h, chart::cpuGradient(), false, symbols)}),
                              rule(std::move(under_line)),
-                             hbox({axis(down_h, has_gpus ? "100%" : util::mib(memScale()), has_gpus ? "50%" : ""),
-                                   chart::graph(resample(has_gpus ? gpu : mem, now, step, graph_w, has_gpus ? 1 : memScale()), graph_w, down_h, under_g,
-                                                false, symbols)})}) |
+                             hbox({axis(down_h, has_gpus ? "100%" : util::mib(memScale()), has_gpus ? "50%" : ""), under})}) |
                        size(WIDTH, EQUAL, left_w);
-        Element cpu_content = left;
+        Element content = left;
 
         if (wide) {
-            // Beside it: a gauge for each, then each GPU (or each step) with its little curve
-            const int w = side_w;
-            Elements lines = {text(util::cut(nodelist, static_cast<size_t>(w))) | bold,
-                              gauge("CPU", busy, w, chart::cpuGradient()),
-                              gauge("MEM", mem_mib < 0 ? -1 : mem_mib / memScale(), w, chart::usedGradient())};
+            // btop's box in the box: a meter for each, then each GPU (or step) with its little graph
+            const int w = side_w - 2;
+            Elements lines = {gauge("CPU", busy, w, chart::cpuGradient()), gauge("MEM", mem_mib < 0 ? -1 : mem_mib / memScale(), w, chart::usedGradient())};
             if (has_gpus) {
                 lines.push_back(gauge("GPU", gpu.last(), w, chart::gpuGradient()));
                 lines.push_back(gauge("VRAM", gpu_mem.last(), w, chart::cachedGradient()));
             }
-            lines.push_back(separatorLight() | color(chart::faint()));
+            lines.push_back(separatorLight() | color(chart::divColor()));
             const int per_row = w >= 56 ? 2 : 1, cell_w = (w - (per_row - 1) * 2) / per_row;
             const int mini_w = std::max(4, cell_w - 7 - 5 - 5);
-            const double mini_step = step * graph_w / mini_w;   // the same time as the big curve
+            const double mini_step = step * graph_w / mini_w;   // the same time as the big graph
             Elements cells;
             if (has_gpus) {
                 for (const auto& [key, t] : gpu_tracks) {
                     const double u = t.last.util < 0 ? -1 : t.last.util / 100;
                     const double temp = t.last.temp_c;
                     Element cell = hbox({text(util::padRight(shortNode(key.first) + ":" + std::to_string(key.second), 7)),
-                                         chart::sparkline(resample(t.util, now, mini_step, mini_w, 1), mini_w, chart::gpuGradient()),
+                                         chart::graph(resample(t.util, now, mini_step / 2, mini_w * 2, 1), mini_w, 1, chart::gpuGradient(), false, chart::Symbols::Braille),
                                          text(util::padLeft(pct(u), 5)) | bold | color(chart::gpuGradient().at(std::max(0.0, u))),
                                          text(temp < 0 ? "     " : util::padLeft(std::to_string(static_cast<int>(temp)) + "°C", 5)) |
                                              color(chart::tempGradient().at((temp - 30) / 60))});
@@ -367,7 +420,8 @@ struct MonitorView : LivePieces {
                 for (const auto& [id, t] : steps) {
                     const double c = t.cores.last();
                     cells.push_back(hbox({text(util::padRight(util::cut(stepName(id), 6), 7)),
-                                          chart::sparkline(resample(t.cores, now, mini_step, mini_w, std::max(1, cpus)), mini_w, chart::cpuGradient()),
+                                          chart::graph(resample(t.cores, now, mini_step / 2, mini_w * 2, std::max(1, cpus)), mini_w, 1, chart::cpuGradient(), false,
+                                                       chart::Symbols::Braille),
                                           text(util::padLeft(c < 0 ? "-" : std::to_string(static_cast<long>(std::lround(c))), 5)) | bold,
                                           text(" core") | color(chart::graphText())}));
                 }
@@ -383,43 +437,54 @@ struct MonitorView : LivePieces {
             lines.push_back(filler());
             lines.push_back(hbox({text(cpu_seconds < 0 ? "" : util::duration(static_cast<long>(cpu_seconds)) + " of CPU time") | color(chart::graphText()),
                                   filler(), text(std::to_string(steps.size()) + (steps.size() == 1 ? " step" : " steps")) | color(chart::graphText())}));
-            cpu_content = hbox({left, text(" "), separatorLight() | color(chart::faint()), text(" "), vbox(std::move(lines)) | size(WIDTH, EQUAL, side_w)});
+            content = hbox({left, text(" "), box(util::cut(nodelist, static_cast<size_t>(side_w - 8)), nullptr, vbox(std::move(lines)), chart::cpuBox(), side_w, height - 2)});
         }
-        Elements out = {box("cpu", text(thousands(cpus) + (cpus == 1 ? " CPU" : " CPUs") + " · " + std::to_string(nodes) + (nodes == 1 ? " node" : " nodes")) |
-                                       color(chart::graphText()),
-                            cpu_content, chart::cpuGradient().low, width, cpu_h)};
+        const std::string per_col = std::to_string(static_cast<int>(ZOOMS[zoom])) + "s";
+        return box("cpu",
+                   hbox({text(thousands(cpus) + (cpus == 1 ? " CPU" : " CPUs") + " · " + std::to_string(nodes) + (nodes == 1 ? " node" : " nodes")) |
+                         color(chart::titleColor())}),
+                   content, chart::cpuBox(), width, height, 1,
+                   {tag(hbox({text("- ") | bold | color(chart::hiColor()), text(per_col + " per column") | color(chart::titleColor()),
+                              text(" +") | bold | color(chart::hiColor())}),
+                        chart::cpuBox(), true),
+                    text(" "), keyTag("v", symbols == chart::Symbols::Bars ? "areas" : symbols == chart::Symbols::Braille ? "braille" : "blocks", chart::cpuBox(), true)});
+    }
 
-        // Under it: memory, disk and the steps side by side (the steps go when it is narrow)
-        const int mem_w = wide ? width * 27 / 100 : width / 2;
-        const int io_w = wide ? width * 33 / 100 : width - mem_w;
+    Element overview(int width, int height, double now) {
+        const int cpu_h = std::clamp(height * 11 / 20, 10, std::max(10, height - 10));
+        const int low_h = height - cpu_h;
+        const bool wide = width >= 100;
+        const int mem_w = wide ? width * 25 / 100 : width / 2;
+        const int io_w = wide ? width * 35 / 100 : width - mem_w;
         const int steps_w = wide ? width - mem_w - io_w : 0;
         Elements bottom = {memBox(mem_w, low_h, now), ioBox(io_w, low_h, now)};
         if (steps_w > 0) bottom.push_back(stepsBox(steps_w, low_h, now));
-        out.push_back(hbox(std::move(bottom)));
-        return vbox(std::move(out));
+        return vbox({cpuBox(width, cpu_h, now), hbox(std::move(bottom))});
     }
 
-    // Memory: what it asked, what it uses with its curve, what is left, its largest task, the GPUs' memory
+    // mem, as btop's: what it asked; then each figure with its value on the right, its graph or meter under it
     Element memBox(int width, int height, double now) const {
         const int w = width - 2;
         const double step = ZOOMS[zoom], scale = memScale();
         const auto head = [](const std::string& label, const std::string& value, Color c) {
-            return hbox({text(label) | color(chart::graphText()), filler(), text(value) | bold | color(c)});
+            return hbox({text(label + ":") | bold | color(chart::titleColor()), filler(), text(value) | bold | color(c)});
         };
         const auto withPct = [w](Element e, double ratio) { return hbox({e | size(WIDTH, EQUAL, w - 5), text(util::padLeft(pct(ratio), 5)) | bold}); };
-        const int fixed = 2 + (mem_limit_mib > 0 ? 2 : 0) + 2 + (gpus > 0 ? 2 : 0);
+        const auto divider = [] { return separatorLight() | color(chart::divColor()); };
+        const int fixed = 1 + 2 + (mem_limit_mib > 0 ? 3 : 0) + 3 + (gpus > 0 ? 3 : 0);
         const int graph_h = std::clamp(height - 2 - fixed, 1, 10);
         const double used = mem_mib < 0 ? -1 : mem_mib / scale;
-        Elements lines = {head("asked", mem_limit_mib > 0 ? util::mib(mem_limit_mib) : "nothing", Color::RGB(0xee, 0xee, 0xee)),
-                          head("in use", mem_mib < 0 ? "-" : util::mib(mem_mib), chart::usedGradient().high),
-                          hbox({chart::graph(resample(mem, now, step * 2, w - 5, scale), w - 5, graph_h, chart::usedGradient(), false, symbols, true),
-                                vbox({filler(), text(util::padLeft(pct(used), 5)) | bold})})};
+        Elements lines = {head("Asked", mem_limit_mib > 0 ? util::mib(mem_limit_mib) : "nothing", chart::titleColor()),
+                          head("Used", mem_mib < 0 ? "-" : util::mib(mem_mib), chart::usedGradient().high),
+                          withPct(chart::graph(curve(mem, now, step * 2, w - 5, scale, symbols), w - 5, graph_h, chart::usedGradient(), false, symbols, true), used)};
         if (mem_limit_mib > 0) {
             const double free_ratio = used < 0 ? -1 : std::max(0.0, 1 - used);
-            lines.push_back(head("free", mem_mib < 0 ? "-" : util::mib(std::max(0.0, mem_limit_mib - mem_mib)), chart::freeGradient().mid));
+            lines.push_back(divider());
+            lines.push_back(head("Free", mem_mib < 0 ? "-" : util::mib(std::max(0.0, mem_limit_mib - mem_mib)), chart::freeGradient().mid));
             lines.push_back(withPct(chart::meter(free_ratio, w - 6, chart::freeGradient()), free_ratio));
         }
-        lines.push_back(head("largest task", max_task_mib > 0 ? util::mib(max_task_mib) : "-", chart::availableGradient().mid));
+        lines.push_back(divider());
+        lines.push_back(head("Largest task", max_task_mib > 0 ? util::mib(max_task_mib) : "-", chart::availableGradient().mid));
         lines.push_back(hbox({filler(), text(max_task_node.empty() ? "" : "on " + max_task_node) | color(chart::graphText())}));
         if (gpus > 0) {
             double gu = 0, gt = 0;
@@ -427,62 +492,108 @@ struct MonitorView : LivePieces {
                 gu += t.last.mem_used_mib;
                 gt += t.last.mem_total_mib;
             }
-            lines.push_back(head("GPU memory", gt > 0 ? util::mib(gu) + " of " + util::mib(gt) : "-", chart::cachedGradient().mid));
+            lines.push_back(divider());
+            lines.push_back(head("GPU memory", gt > 0 ? util::mib(gu) + " / " + util::mib(gt) : "-", chart::cachedGradient().mid));
             lines.push_back(withPct(chart::meter(gpu_mem.last(), w - 6, chart::cachedGradient()), gpu_mem.last()));
         }
-        return box("memory", nullptr, vbox(std::move(lines)), chart::usedGradient().mid, width, height);
+        return box("mem", nullptr, vbox(std::move(lines)), chart::memBox(), width, height, 2);
     }
 
-    // Disk: the reads rising, the writes hanging under them on the same scale, each with its rate and total
+    /* io, as btop's net: the reads rising, the writes hanging under them, each on its own scale written in its corner;
+       beside them a box with each one's rate, its top and its total */
     Element ioBox(int width, int height, double now) const {
         const double step = ZOOMS[zoom];
-        const int gw = width - 2 - 10;
-        const int gh = height - 2 - 2;
-        const double top = chart::niceMax(std::max({reads.peak(now - step * gw), writes.peak(now - step * gw), 1e6}));
+        const bool side = width >= 46;
+        const int sub_w = side ? 22 : 0;
+        const int gw = width - 2 - (side ? sub_w + 1 : 0);
+        const int gh = height - 2;
+        const double window = step * gw;
+        const double top_r = chart::niceMax(std::max(reads.peak(now - window), 1e6)), top_w = chart::niceMax(std::max(writes.peak(now - window), 1e6));
         const double r = reads.last(), w = writes.last();
-        const std::string label = chart::bytes(top) + "/s";
-        const auto line = [&](const std::string& what, double rate, double total, Color c) {
-            return hbox({text(what) | bold | color(c), text(rate < 0 ? "  -" : "  " + chart::bytes(rate) + "/s") | bold, filler(),
-                         text(chart::bytes(total) + " in all") | color(chart::graphText())});
+        const auto scaled = [&](const Series& s, double top, int h, const chart::Gradient& g, bool hang) {
+            Element label = text(" " + chart::bytes(top) + "/s ") | color(chart::graphText());
+            return dbox({chart::graph(curve(s, now, step, gw, top, symbols), gw, h, g, hang, symbols),
+                         hang ? vbox({filler(), hbox({label, filler()})}) : vbox({hbox({label, filler()}), filler()})});
         };
-        Element content = vbox({line("▲ read ", r, read_total, chart::readGradient().high),
-                                hbox({axis((gh + 1) / 2, label, "", false, 10),
-                                      chart::graph(resample(reads, now, step, gw, top), gw, (gh + 1) / 2, chart::readGradient(), false, symbols)}),
-                                hbox({axis(gh / 2, label, "", true, 10),
-                                      chart::graph(resample(writes, now, step, gw, top), gw, gh / 2, chart::writeGradient(), true, symbols)}),
-                                line("▼ write", w, write_total, chart::writeGradient().high)});
-        return box("disk", text("all its steps, every file system") | color(chart::graphText()), content, chart::readGradient().mid, width, height);
+        Element graphs = vbox({scaled(reads, top_r, (gh + 1) / 2, chart::readGradient(), false), scaled(writes, top_w, gh / 2, chart::writeGradient(), true)}) |
+                         size(WIDTH, EQUAL, gw);
+        Element content = graphs;
+        if (side) {
+            const auto stats = [&](const char* arrow, const std::string& what, double rate, double peak, double total, Color c) {
+                return vbox({hbox({text(std::string(arrow) + " ") | color(c), text(what) | bold | color(chart::titleColor()), filler(),
+                                   text(rate < 0 ? "-" : chart::bytes(rate) + "/s") | bold | color(c)}),
+                             hbox({text(std::string(arrow) + " Top:") | color(chart::graphText()), filler(), text(chart::bytes(peak) + "/s")}),
+                             hbox({text(std::string(arrow) + " Total:") | color(chart::graphText()), filler(), text(chart::bytes(total))})});
+            };
+            Element sub = vbox({stats("▲", "read", r, reads.peak(), read_total, chart::readGradient().high), filler(),
+                                stats("▼", "write", w, writes.peak(), write_total, chart::writeGradient().high)});
+            content = hbox({graphs, text(" "), box("all steps", nullptr, sub, chart::netBox(), sub_w, height - 2)});
+        }
+        return box("io", text("every file system") | color(chart::graphText()), content, chart::netBox(), width, height, 3);
     }
 
-    // The job's steps, the busiest first, each with the curve of the cores it keeps busy
-    Element stepsBox(int width, int height, double now) const {
+    /* steps, as btop's processes: each with what it runs, its tasks, the cores it keeps busy and their graph, its memory;
+       ↑ ↓ pick one, Enter shows it in depth above the list (its graph, its memory, its reads and writes) */
+    Element stepsBox(int width, int height, double now) {
         const double step = ZOOMS[zoom];
         const int w = width - 2;
-        const int graph_w = std::max(4, w - (8 + 6 + 7 + 2 + 7 + 8 + 2 + 6));
-        std::vector<const std::pair<const std::string, StepTrack>*> order;
-        for (const auto& s : steps) order.push_back(&s);
-        std::sort(order.begin(), order.end(), [](auto* a, auto* b) { return a->second.cores.last() > b->second.cores.last(); });
+        const auto order = stepOrder();
+        if (!order.empty() && !steps.count(step_selected)) step_selected = order.front();
         const auto col = [](const std::string& s, int n, bool right = true) {
             return text(right ? util::padLeft(s, static_cast<size_t>(n)) : util::padRight(s, static_cast<size_t>(n)));
         };
-        Elements lines = {hbox({col("step", 8, false), col("tasks", 6), col("cores", 7), text("  "), text("") | size(WIDTH, EQUAL, graph_w),
-                                col("memory", 7), col("max RSS", 8), text("  "), col("on", 6, false)}) |
-                          color(chart::graphText())};
-        for (const auto* s : order) {
-            const auto& t = s->second;
+        const int name_w = std::clamp(w - (7 + 6 + 7 + 2 + 12 + 7 + 8), 6, 18);
+        const int graph_w = std::max(4, w - (7 + name_w + 6 + 7 + 2 + 7 + 8));
+        Elements lines;
+
+        // The one picked, in depth
+        if (step_detail && steps.count(step_selected)) {
+            const auto& t = steps.at(step_selected);
+            const int dh = std::clamp(height / 2 - 1, 4, 8);
+            const int dg_w = std::max(10, w / 2);
             const double c = t.cores.last();
-            lines.push_back(hbox({col(util::cut(stepName(s->first), 7), 8, false) | bold, col(std::to_string(t.last.tasks), 6),
-                                  col(c < 0 ? "-" : std::to_string(static_cast<long>(std::lround(c))), 7) | bold | color(chart::cpuGradient().low),
-                                  text("  "), chart::sparkline(resample(t.cores, now, step * 2, graph_w, std::max(1, cpus)), graph_w, chart::cpuGradient()),
-                                  col(util::mib(t.last.mem_mib), 7), col(util::mib(t.last.max_rss_mib), 8), text("  "),
-                                  col(util::cut(shortNode(t.last.max_rss_node), 6), 6, false) | color(chart::graphText())}));
+            const auto name = step_names.find(step_selected);
+            const std::vector<std::pair<std::string, std::string>> figures = {
+                {"Runs", name == step_names.end() ? "?" : name->second},
+                {"Tasks", std::to_string(t.last.tasks)},
+                {"Cores busy", c < 0 ? "-" : std::to_string(static_cast<long>(std::lround(c)))},
+                {"Memory", util::mib(t.last.mem_mib)},
+                {"Largest task", util::mib(t.last.max_rss_mib) + (t.last.max_rss_node.empty() ? "" : " on " + shortNode(t.last.max_rss_node))},
+                {"Reads", t.reads.empty() ? "-" : chart::bytes(t.reads.last()) + "/s · " + chart::bytes(t.last.read_bytes)},
+                {"Writes", t.writes.empty() ? "-" : chart::bytes(t.writes.last()) + "/s · " + chart::bytes(t.last.write_bytes)}};
+            Elements right;
+            for (const auto& [k, v] : figures)
+                right.push_back(hbox({text(util::padRight(k, 13)) | color(chart::graphText()), text(util::cut(v, static_cast<size_t>(std::max(4, w - dg_w - 15)))) | bold}));
+            const double top = std::max(1.0, chart::niceMax(t.cores.peak(now - step * dg_w)));
+            lines.push_back(hbox({dbox({chart::graph(curve(t.cores, now, step, dg_w, top, symbols), dg_w, dh, chart::cpuGradient(), false, symbols),
+                                        vbox({hbox({text(" " + fmt::count(top) + " cores ") | color(chart::graphText()), filler()}), filler()})}) |
+                                      size(WIDTH, EQUAL, dg_w),
+                                  text(" "), vbox(std::move(right))}) |
+                            size(HEIGHT, EQUAL, dh));
+            lines.push_back(separatorLight() | color(chart::procBox()));
+        }
+        lines.push_back(hbox({col("step", 7, false), col("runs", name_w, false), col("tasks", 6), col("cores", 7), text("  "),
+                              text("") | size(WIDTH, EQUAL, graph_w), col("memory", 7), col("max RSS", 8)}) |
+                        bold | color(chart::titleColor()));
+        for (const auto& id : order) {
+            const auto& t = steps.at(id);
+            const double c = t.cores.last();
+            const auto name = step_names.find(id);
+            const bool on = id == step_selected;
+            Element row = hbox({col(util::cut(stepName(id), 6), 7, false) | bold,
+                                col(util::cut(name == step_names.end() ? "" : name->second, static_cast<size_t>(name_w - 1)), name_w, false) |
+                                    color(on ? chart::titleColor() : chart::graphText()),
+                                col(std::to_string(t.last.tasks), 6),
+                                col(c < 0 ? "-" : std::to_string(static_cast<long>(std::lround(c))), 7) | bold | color(chart::cpuGradient().low), text("  "),
+                                chart::graph(resample(t.cores, now, step, graph_w * 2, std::max(1, cpus)), graph_w, 1, chart::cpuGradient(), false, chart::Symbols::Braille),
+                                col(util::mib(t.last.mem_mib), 7), col(util::mib(t.last.max_rss_mib), 8)});
+            lines.push_back(on ? row | bgcolor(Color::RGB(0x6a, 0x2f, 0x2f)) : row);
         }
         if (steps.empty()) lines.push_back(text("reading sstat...") | dim);
         lines.push_back(filler());
-        lines.push_back(text(util::cut("cores: CPU seconds per second · max RSS: its largest task, and where", static_cast<size_t>(w))) |
-                        color(chart::graphText()));
-        return box("steps", text(std::to_string(steps.size()) + (steps.size() == 1 ? " step" : " steps")) | color(chart::graphText()),
-                   vbox(std::move(lines)), chart::cpuGradient().mid, width, height);
+        return box("steps", text(std::to_string(steps.size()) + (steps.size() == 1 ? " step" : " steps")) | color(chart::titleColor()), vbox(std::move(lines)),
+                   chart::procBox(), width, height, 4,
+                   {keyTag("↑↓", "select", chart::procBox(), true), text(" "), keyTag("Enter", step_detail ? "list" : "details", chart::procBox(), true)});
     }
 
     // ---------------------------------------------------------------- 2: a task manager's
@@ -894,6 +1005,10 @@ struct MonitorView : LivePieces {
         if (view == 2) {
             keys.push_back(keyHint("↑↓", "GPU"));
             keys.push_back(keyHint("Enter", gpu_zoom ? "list" : "zoom"));
+        }
+        if (view == 0) {
+            keys.push_back(keyHint("↑↓", "step"));
+            keys.push_back(keyHint("Enter", step_detail ? "list" : "details"));
         }
         if (view == 0)
             keys.push_back(keyHint("v", symbols == chart::Symbols::Bars ? "braille" : symbols == chart::Symbols::Braille ? "blocks" : "areas"));

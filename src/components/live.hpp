@@ -107,12 +107,30 @@ struct LivePieces {
     }
 
     // A box: its name and what it says now on the top border, between the corners
-    static Element box(const std::string& name, Element right, Element content, Color frame, int width, int height) {
-        Elements top = {text("") | size(WIDTH, EQUAL, 2), text(" " + name + " ") | bold | color(Color::RGB(0xee, 0xee, 0xee)), filler()};
-        if (right) top.push_back(hbox({text(" "), right, text(" ")}));
-        top.push_back(text("") | size(WIDTH, EQUAL, 2));
-        return dbox({content | flex | borderStyled(ROUNDED, frame), vbox({hbox(std::move(top)), filler()})}) | clear_under |
-               size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height);
+    /* A box as btop draws them: rounded, its title on the top border between ┐ and ┌ ("╭─┐¹cpu┌───"), the key that
+       shows it (`number`) as a red superscript; `right` (what it says now) and `bottom` (its keys) on its borders too */
+    static Element tag(Element inner, Color frame, bool down = false) {
+        return hbox({text(down ? "┘" : "┐") | color(frame), inner, text(down ? "└" : "┌") | color(frame)});
+    }
+    static Element keyTag(const std::string& key, const std::string& what, Color frame, bool down = false) {
+        return tag(hbox({text(key) | bold | color(chart::hiColor()), text(what.empty() ? "" : " " + what) | color(chart::titleColor())}), frame, down);
+    }
+    static Element box(const std::string& name, Element right, Element content, Color frame, int width, int height, int number = 0,
+                       Elements bottom = {}) {
+        Elements title;
+        if (number > 0) title.push_back(text(chart::superscript(number)) | bold | color(chart::hiColor()));
+        title.push_back(text(name) | bold | color(chart::titleColor()));
+        Elements top = {text("") | size(WIDTH, EQUAL, 1), tag(hbox(std::move(title)), frame), filler()};
+        if (right) top.push_back(tag(right, frame));
+        top.push_back(text("") | size(WIDTH, EQUAL, 1));
+        Elements layers = {content | flex | borderStyled(ROUNDED, frame), vbox({hbox(std::move(top)), filler()})};
+        if (!bottom.empty()) {
+            Elements under = {text("") | size(WIDTH, EQUAL, 1)};
+            for (auto& b : bottom) under.push_back(std::move(b));
+            under.push_back(filler());
+            layers.push_back(vbox({filler(), hbox(std::move(under))}));
+        }
+        return dbox(std::move(layers)) | clear_under | size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height);
     }
 
     // "CPU  ■■■■■■■■■■■■  91%"

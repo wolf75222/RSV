@@ -307,7 +307,7 @@ struct InferenceView : LivePieces {
                         const chart::Gradient& g, int width) {
         const int w = std::max(6, width - 2);
         Element top = hbox({text(value) | bold | color(g.high), filler(), text(note) | color(chart::graphText())});
-        return box(name, nullptr, vbox({top, chart::graph(curve, w, 2, g, false, chart::Symbols::Bars, true)}), chart::faint(), width, 5);
+        return box(name, nullptr, vbox({top, chart::graph(curve, w, 2, g, false, chart::Symbols::Bars, true)}), chart::cpuBox(), width, 5);
     }
 
     static std::string repeatStr(const std::string& s, int n) {
@@ -549,7 +549,7 @@ struct InferenceView : LivePieces {
             }
         }
         const std::string span = win.seconds > 0 ? "last " + util::duration(static_cast<long>(win.seconds + 0.5)) : "";
-        return box("latency", text(span) | color(chart::graphText()), vbox(std::move(lines)), chart::tempGradient().mid, width, height);
+        return box("latency", text(span) | color(chart::titleColor()), vbox(std::move(lines)), chart::netBox(), width, height);
     }
 
     // The caches and the drafts: how full, how often they serve, how many drafted tokens are kept
@@ -587,7 +587,7 @@ struct InferenceView : LivePieces {
                                           shareBar(win.per_position[i] / win.drafts, w - 15, chart::availableGradient())}));
         }
         if (lines.empty()) lines.push_back(text("its engine says nothing of its caches") | color(chart::graphText()));
-        return box("cache & drafts", nullptr, vbox(std::move(lines)), chart::usedGradient().mid, width, height);
+        return box("cache & drafts", nullptr, vbox(std::move(lines)), chart::memBox(), width, height);
     }
 
     // The requests: how many ended and how, how long they are; the GPUs beside the tokens
@@ -625,7 +625,7 @@ struct InferenceView : LivePieces {
                                   text(util::padLeft(fmt::count(s.generation.last()), 8)) | bold}));
             if (gpus > 0 && s.generation.last() >= 0) lines.push_back(line("per GPU", fmt::count(s.generation.last() / gpus) + " tok/s"));
         }
-        return box("requests", nullptr, vbox(std::move(lines)), chart::availableGradient().mid, width, height);
+        return box("requests", nullptr, vbox(std::move(lines)), chart::procBox(), width, height);
     }
 };
 
