@@ -1,7 +1,10 @@
 // Parsing of Slurm output as printed on ROMEO (Slurm 23.11), names and accounts made up.
 // Build with cmake -DRSV_TESTS=ON, run with ctest (or ./parse_test).
 
+#include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 #include <string>
 
 #include "api/arrays.hpp"
@@ -10,6 +13,7 @@
 #include "api/usage.hpp"
 #include "components/cluster_view.hpp"
 #include "components/log_view.hpp"
+#include "components/monitor_view.hpp"
 #include "components/quota_view.hpp"
 #include "utils/format.hpp"
 
@@ -732,6 +736,164 @@ static void arrays() {
     CHECK_EQ(p.total(), 199);
 }
 
+// Live view (m): nvidia-smi's longer lines, the curves in time, the busy share from sstat, a stream of lines
+static void monitor() {
+    api::GpuUse g;
+    CHECK(api::parseNvidiaSmiLine("1: 2, NVIDIA GH200 120GB, 88, 60000, 97871, 64, 512.40, [N/A]", {"romeo-a012", "romeo-a013"}, g));
+    CHECK_EQ(g.node, std::string("romeo-a013"));
+    CHECK_EQ(g.index, 2);
+    CHECK_EQ(g.temp_c, 64.0);
+    CHECK_EQ(g.power_w, 512.4);
+    CHECK_EQ(g.power_limit_w, -1.0);
+    CHECK(!api::parseNvidiaSmiLine("srun: error: something", {"romeo-a012"}, g));
+
+    // Resampled: nothing before the first reading, the mean of a dot's readings, the one before holds after them
+    ui::Series s;
+    s.add(100, 0.2);
+    s.add(101, 0.6);
+    s.add(101.2, 0.4);   // less than 0.5 s after: replaces it
+    const auto v = ui::resample(s, 104, 1, 6, 1);
+    CHECK_EQ(v.size(), 6u);
+    if (v.size() == 6) {
+        CHECK_EQ(v[0], -1.0);   // (98, 99]
+        CHECK_EQ(v[1], 0.2);    // (99, 100]
+        CHECK_EQ(v[2], 0.4);    // (100, 101]: the reading at 101 became 0.4
+        CHECK_EQ(v[5], 0.4);    // held
+    }
+    CHECK_EQ(ui::resample(s, 104, 1, 6, 2)[2], 0.2);   // divided by the scale
+
+    // btop's graph: each character shows the value before (left) and its own (right); blocks or braille
+    {
+        auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(3), ftxui::Dimension::Fixed(1));
+        ftxui::Render(screen, ui::chart::graph({0, 1, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Braille));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));   // 0 then nothing before: empty
+        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("⢸"));   // from 0 to full
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
+        ftxui::Render(screen, ui::chart::graph({0.5, 0.5, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Block));
+        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("▄"));
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("▟"));
+        ftxui::Render(screen, ui::chart::graph({1, 1, 1}, 3, 1, ui::chart::cpuGradient(), true, ui::chart::Symbols::Braille));   // hanging
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
+        // Bars: each column's height to an eighth; hanging, the rest of the character inverted
+        ftxui::Render(screen, ui::chart::graph({0, 0.5, 1}, 3, 1, ui::chart::cpuGradient()));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));
+        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("▄"));
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("█"));
+        ftxui::Render(screen, ui::chart::graph({0.25, 0.25, 0.25}, 3, 1, ui::chart::cpuGradient(), true));
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("▆"));
+        CHECK(screen.PixelAt(2, 0).inverted);
+        ftxui::Render(screen, ui::chart::sparkline({-1, -1, 0.5}, 3, ui::chart::cpuGradient()));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string("▁"));   // the faint base where there is nothing
+    }
+    CHECK_EQ(ui::chart::niceMax(340e6), 500e6);
+    CHECK_EQ(ui::chart::niceMax(1), 1.0);
+    CHECK_EQ(ui::chart::bytes(1536), std::string("1.5 KB"));
+
+    // A task manager's chart: the line, the area under it tinted, its scale on the left
+    {
+        auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(10), ftxui::Dimension::Fixed(3));
+        ftxui::Render(screen, ui::chart::lineChart({{{0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, ui::theme::cyan(), true}}, 10, 3,
+                                                   [](double f) { return std::to_string(static_cast<int>(f * 100)); },
+                                                   [](int) { return std::string(""); }, 100));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string("1"));      // "100" at the top
+        CHECK_EQ(screen.PixelAt(2, 1).character, std::string("0"));      // "0" at the bottom
+        CHECK(screen.PixelAt(6, 1).background_color == screen.PixelAt(8, 1).background_color);   // under the line: tinted
+        CHECK(!(screen.PixelAt(8, 1).background_color == ftxui::Color()));
+    }
+
+    // sstat, step by step: the CPU time between readings at least 6 s apart, memory and bytes summed
+    ui::MonitorView m;
+    m.cpus = 2;
+    api::StepUse batch, s0;
+    batch.id = "1.batch";
+    s0.id = "1.0";
+    batch.tasks = s0.tasks = 1;
+    batch.cpu_seconds = 40;
+    s0.cpu_seconds = 60;
+    batch.mem_mib = 1024;
+    s0.mem_mib = 1024;
+    s0.read_bytes = 1e9;
+    m.setSteps({batch, s0}, 1000, "");
+    CHECK(m.cpu.empty());   // one reading: nothing to compare with
+    CHECK_EQ(m.mem.last(), 2048.0);
+    batch.cpu_seconds = 46;
+    s0.cpu_seconds = 66;    // 12 s of CPU over 12 s on 2 CPUs
+    s0.read_bytes = 1.6e9;  // 50 MB/s
+    m.setSteps({batch, s0}, 1012, "");
+    CHECK_EQ(m.cpu.last(), 0.5);
+    CHECK_EQ(m.reads.last(), 5e7);
+    CHECK_EQ(m.steps.size(), 2u);
+    CHECK_EQ(m.steps["1.0"].cores.last(), 0.5);
+    // The view's own step (nvidia-smi) isn't one of the job's
+    api::StepUse own;
+    own.id = "1.3";
+    own.cpu_seconds = 1;
+    m.own_step = "1.3";
+    m.setSteps({batch, s0, own}, 1014, "");
+    CHECK_EQ(m.steps.count("1.3"), 0u);
+    m.setSteps({}, 1014, "sstat: error");
+    CHECK_EQ(m.cpu_error, std::string("sstat: error"));
+
+    // A total that went down (a step ended): no rate until the next reading
+    ui::Rate rate;
+    CHECK_EQ(rate.add(0, 10), -1.0);
+    CHECK_EQ(rate.add(10, 30), 2.0);
+    CHECK_EQ(rate.add(20, 5), -1.0);
+
+    // sstat with the node of the largest task and the bytes written
+    const auto st = api::parseSteps("9.0|4|2G|romeo-a013|cpu=00:10:00,energy=0,fs/disk=5000,mem=3G,pages=0|energy=0,fs/disk=7000\n");
+    CHECK_EQ(st.size(), 1u);
+    if (st.size() == 1) {
+        CHECK_EQ(st[0].tasks, 4);
+        CHECK_EQ(st[0].cpu_seconds, 600.0);
+        CHECK_EQ(st[0].max_rss_node, std::string("romeo-a013"));
+        CHECK_EQ(st[0].read_bytes, 5000.0);
+        CHECK_EQ(st[0].write_bytes, 7000.0);
+        CHECK_EQ(st[0].mem_mib, 3072.0);
+    }
+
+    // GPUs together: the mean use and the memory of all, from each one's last line
+    api::GpuUse g0, g1;
+    g0.node = g1.node = "romeo-a012";
+    g1.index = 1;
+    g0.util = 80;
+    g1.util = 20;
+    g0.mem_used_mib = g1.mem_used_mib = 25;
+    g0.mem_total_mib = g1.mem_total_mib = 100;
+    m.addGpu(g0, 2000);
+    m.addGpu(g1, 2000.1);
+    CHECK_EQ(m.gpu_tracks.size(), 2u);
+    CHECK_EQ(m.gpu.last(), 0.5);
+    CHECK_EQ(m.gpu_mem.last(), 0.25);
+    CHECK_EQ(m.gpu.points.size(), 1u);   // the lines of one answer are one point
+
+    // A stream: each line as it comes, then how it ended; stop() ends one that keeps going
+    {
+        std::vector<std::string> lines;
+        std::string end = "?";
+        std::mutex mu;
+        api::LineStream stream;
+        stream.start({"sh", "-c", "echo one; echo two; exit 3"}, [&](const std::string& l) { std::lock_guard<std::mutex> lock(mu); lines.push_back(l); },
+                     [&](const std::string& e) { std::lock_guard<std::mutex> lock(mu); end = e; });
+        for (int i = 0; i < 300 && stream.running(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        stream.stop();
+        CHECK_EQ(lines.size(), 2u);
+        if (lines.size() == 2) CHECK_EQ(lines[1], std::string("two"));
+        CHECK(end.find("exit status 3") != std::string::npos);
+
+        end = "?";
+        const auto t0 = std::chrono::steady_clock::now();
+        stream.start({"sh", "-c", "while :; do echo tick; sleep 0.05; done"}, [](const std::string&) {},
+                     [&](const std::string& e) { std::lock_guard<std::mutex> lock(mu); end = e; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(stream.running());
+        stream.stop();
+        CHECK(!stream.running());
+        CHECK_EQ(end, std::string(""));   // stopped: no error
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+    }
+}
+
 int main() {
     durations();
     widths();
@@ -749,6 +911,7 @@ int main() {
     logs();
     node_hardware();
     arrays();
+    monitor();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

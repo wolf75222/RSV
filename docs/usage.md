@@ -58,12 +58,17 @@ Under it, when there is room, the last lines of the job's output.
 | `p` | Cluster | All of ROMEO, read again every 15 s while open, in four tabs: `←` `→` (or `Tab`, `1` to `4`) change tabs everywhere in it. See below. |
 | `t` | Start time | When would a job start? Account, partition, constraint, nodes, cores, GPUs, memory and time: `Enter` asks Slurm (`sbatch --test-only`, nothing is submitted) and shows when and where, or why it can't. |
 | `n` | GPUs | For a running job with GPUs: each GPU's use and memory, from `nvidia-smi` run in the job itself (`srun --overlap`, only when you press `n`). |
+| `m` | Live | A running job live, in two views. `1` overview: the CPUs' curve and under it the GPUs' (or the memory's), each with its scale; beside them a gauge for the CPUs, memory, GPUs and their memory, and each GPU with its little curve, use and temperature (each step when there is no GPU); under them `memory` (asked, in use with its curve, free, the largest task and its node, GPU memory), `disk` (the bytes its steps read and write per second, reads above and writes under them, with their totals) and `steps` (each step with the cores it keeps busy and their curve, its memory and largest task). `2` performance, as a task manager's: CPU, memory, disk and each GPU on the left with their little curves, the one picked (`↑` `↓`) on the right with its chart, scale, time and figures. `+` `-` zoom in time (1 to 30 s per column, up to the last hour), `g` draws the graphs in braille (the default), bars or blocks, `r` reads again. `sstat` every 2 s; the GPUs from one `srun --overlap` step that runs `nvidia-smi --loop-ms=2000` while the view is open and ends with it (one step, not one every few seconds). |
 | `u` | Limits | For each of your accounts: its CPU, GPU and job limits and what your jobs use now (`sacctmgr`, `squeue`), its fairshare and the CPU-hours used (`sshare`), then your disk quotas and your projects' (`mmlsquota`), with a warning when one is over. |
 | `?` | Help | |
 
 `y` copies the job id, `Y` its output path (see [terminals](terminals.md) for how copying works over SSH).
 
 ![The log of a running job, followed](../img/log.png)
+
+![A running job live (m): the overview](../img/live.png)
+
+![The same, as a task manager's Performance tab](../img/live-performance.png)
 
 ## Cluster tabs
 
@@ -113,6 +118,7 @@ Above the table, what the jobs of the last 7 days used: CPU hours reserved, used
 | Node zoom | `scontrol -d -o show node <node>`, `squeue -w <node>` | on `Enter`, then every refresh |
 | Start time | `sbatch --test-only` | on `Enter` |
 | GPUs | `srun --jobid=<job> --overlap nvidia-smi` | on `n` |
+| Live | `sstat -a -j <job>` (each step: CPU time, memory, bytes read and written, largest task and its node), `srun --jobid=<job> --overlap nvidia-smi --loop-ms=2000` (one step) | every 2 s while open |
 | Limits | `sacctmgr show assoc`, `sshare -U`, `mmlsquota -Y` | when opened |
 | Cancel, hold | `scancel <ids>`, `scontrol hold <ids>`, `scontrol release <ids>` | when confirmed |
 

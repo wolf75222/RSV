@@ -85,6 +85,51 @@ inline Fetched<LiveUse> fetchLiveUse(const std::string& job_id) {
     return r;
 }
 
+/* Each running step of a job, for the live view (m): what sstat says of it now
+- TRESUsageInTot fs/disk: the bytes its tasks read; TRESUsageOutTot fs/disk: the bytes they wrote
+- MaxRSSNode: the node of its largest task
+*/
+struct StepUse {
+    std::string id;           // 812345.0, 812345.batch
+    int tasks = 0;
+    double cpu_seconds = 0, mem_mib = 0, max_rss_mib = 0;
+    double read_bytes = 0, write_bytes = 0;
+    std::string max_rss_node;
+};
+
+inline std::string stepsFormat() { return "JobID,NTasks,MaxRSS,MaxRSSNode,TRESUsageInTot,TRESUsageOutTot"; }
+
+inline std::vector<StepUse> parseSteps(const std::string& out) {
+    std::vector<StepUse> r;
+    for (const auto& line : util::lines(out)) {
+        const auto f = util::split(line, '|');
+        if (f.size() < 6 || f[0].empty()) continue;
+        StepUse s;
+        s.id = util::trim(f[0]);
+        s.tasks = static_cast<int>(util::toLong(f[1]));
+        s.max_rss_mib = util::parseMiB(f[2], 1.0 / 1024 / 1024);
+        s.max_rss_node = util::trim(f[3]);
+        parseUsageTres(f[4], s.cpu_seconds, s.mem_mib);
+        for (const auto& [field, sink] : {std::pair<const std::string*, double*>{&f[4], &s.read_bytes}, {&f[5], &s.write_bytes}})
+            for (const auto& item : util::split(*field, ','))
+                if (util::startsWith(item, "fs/disk=")) *sink = util::toDouble(item.substr(8));
+        r.push_back(s);
+    }
+    return r;
+}
+
+inline Fetched<std::vector<StepUse>> fetchSteps(const std::string& job_id) {
+    Fetched<std::vector<StepUse>> r;
+    const RunResult res = run({"sstat", "-a", "-n", "-P", "--format=" + stepsFormat(), "-j", job_id}, 15);
+    if (!res.ok()) {
+        r.error = res.error("sstat");
+        return r;
+    }
+    r.data = parseSteps(res.out);
+    if (r.data.empty()) r.error = "no step running";
+    return r;
+}
+
 // ---------------------------------------------------------------- pending jobs: priority and rank (sprio)
 
 struct Priority {
@@ -327,26 +372,38 @@ struct GpuUse {
     std::string node, name;
     int index = 0;
     double util = -1, mem_used_mib = 0, mem_total_mib = 0;
+    double temp_c = -1, power_w = -1, power_limit_w = -1;   // only asked by the live monitor (-1: not given)
 };
 
-// "0: 1, NVIDIA GH200 120GB, 97, 70123, 97871" (srun -l: the task number, one task per node, in the node order)
+/* "0: 1, NVIDIA GH200 120GB, 97, 70123, 97871" (srun -l: the task number, one task per node, in the node order)
+- The live monitor asks for 3 more: "..., 97871, 61, 412.33, 900.00" (temperature, power, its limit; "[N/A]" when unknown)
+*/
+inline bool parseNvidiaSmiLine(const std::string& line, const std::vector<std::string>& hosts, GpuUse& g) {
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos) return false;
+    const long task = util::toLong(util::trim(line.substr(0, colon)), -1);
+    const auto f = util::split(line.substr(colon + 1), ',');
+    if (task < 0 || f.size() < 5) return false;
+    g = GpuUse{};
+    g.node = static_cast<size_t>(task) < hosts.size() ? hosts[static_cast<size_t>(task)] : "task " + std::to_string(task);
+    g.index = static_cast<int>(util::toLong(util::trim(f[0])));
+    g.name = util::trim(f[1]);
+    g.util = util::toDouble(util::trim(f[2]), -1);
+    g.mem_used_mib = util::toDouble(util::trim(f[3]));
+    g.mem_total_mib = util::toDouble(util::trim(f[4]));
+    if (f.size() >= 8) {
+        g.temp_c = util::toDouble(util::trim(f[5]), -1);
+        g.power_w = util::toDouble(util::trim(f[6]), -1);
+        g.power_limit_w = util::toDouble(util::trim(f[7]), -1);
+    }
+    return true;
+}
+
 inline std::vector<GpuUse> parseNvidiaSmi(const std::string& out, const std::vector<std::string>& hosts) {
     std::vector<GpuUse> r;
-    for (const auto& line : util::lines(out)) {
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        const long task = util::toLong(util::trim(line.substr(0, colon)), -1);
-        const auto f = util::split(line.substr(colon + 1), ',');
-        if (task < 0 || f.size() < 5) continue;
-        GpuUse g;
-        g.node = static_cast<size_t>(task) < hosts.size() ? hosts[static_cast<size_t>(task)] : "task " + std::to_string(task);
-        g.index = static_cast<int>(util::toLong(util::trim(f[0])));
-        g.name = util::trim(f[1]);
-        g.util = util::toDouble(util::trim(f[2]), -1);
-        g.mem_used_mib = util::toDouble(util::trim(f[3]));
-        g.mem_total_mib = util::toDouble(util::trim(f[4]));
-        r.push_back(g);
-    }
+    GpuUse g;
+    for (const auto& line : util::lines(out))
+        if (parseNvidiaSmiLine(line, hosts, g)) r.push_back(g);
     return r;
 }
 
@@ -370,6 +427,35 @@ inline Fetched<std::vector<GpuUse>> fetchGpus(const std::string& job_id, const s
     r.data = parseNvidiaSmi(res.out, hosts);
     if (r.data.empty()) r.error = res.error("srun").empty() ? "nvidia-smi showed no GPU" : res.error("srun");
     return r;
+}
+
+// The name of the live view's own step: it is left out of the job's steps
+inline std::string liveStepName() { return "rsv-live"; }
+
+// The id of a running step of the job by its name (squeue -s), "" when there is none
+inline std::string stepNamed(const std::string& job_id, const std::string& name) {
+    const RunResult res = run({"squeue", "-h", "-s", "-j", job_id, "-o", "%i|%j"}, 10);
+    if (!res.ok()) return "";
+    for (const auto& line : util::lines(res.out)) {
+        const auto f = util::split(line, '|');
+        if (f.size() >= 2 && util::trim(f[1]) == name) return util::trim(f[0]);
+    }
+    return "";
+}
+
+/* The same step, but it stays: nvidia-smi --loop-ms answers every `interval_ms` until it is stopped (live monitor)
+- One step for as long as the monitor is open, instead of one every few seconds: sacct isn't filled with them
+*/
+inline std::vector<std::string> gpuStreamArgs(const std::string& job_id, size_t nodes, int gpus_per_node, int interval_ms) {
+    std::vector<std::string> args = {"srun", "--jobid=" + job_id, "--overlap", "--nodes=" + std::to_string(nodes),
+                                     "--ntasks-per-node=1", "-l", "--quiet", "--job-name=" + liveStepName()};
+    if (gpus_per_node > 0) args.push_back("--gres=gpu:" + std::to_string(gpus_per_node));
+    for (const char* a : {"nvidia-smi",
+                          "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+                          "--format=csv,noheader,nounits"})
+        args.push_back(a);
+    args.push_back("--loop-ms=" + std::to_string(interval_ms));
+    return args;
 }
 
 }  // namespace api

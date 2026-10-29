@@ -24,6 +24,7 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 | `b` | the script the job was submitted with |
 | `d` | everything `scontrol` says about the job |
 | `n` | the job's GPUs now: use and memory |
+| `m` | the job live: an overview of its CPUs, memory, disk I/O, steps and GPUs, or a task manager's Performance view |
 | `c` | cancel the job, or a whole array (asks first) |
 | `H` | hold or release a waiting job (ROMEO refuses both to users, RSV says why) |
 | `Space` | mark jobs: `c` then cancels all of them |

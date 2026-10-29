@@ -32,6 +32,7 @@
 #include "components/debug_view.hpp"
 #include "components/footer.hpp"
 #include "components/gpu_view.hpp"
+#include "components/monitor_view.hpp"
 #include "components/history_view.hpp"
 #include "components/jobdetails.hpp"
 #include "components/joblist.hpp"
@@ -45,7 +46,7 @@ using namespace ftxui;
 
 namespace {
 
-constexpr const char* VERSION = "2.1.0";
+constexpr const char* VERSION = "2.2.0";
 
 // The signal that asked RSV to end (kill, hangup), handled once FTXUI's loop has returned: see main()
 volatile std::sig_atomic_t quit_signal = 0;
@@ -252,6 +253,8 @@ public:
     // Stops the workers (and the commands they run) before the rest of the Viewer goes away
     void stop() {
         api::stopping() = true;
+        gpu_stream_.stop();
+        monitor_worker_.stop();
         slurm_.stop();
         files_.stop();
     }
@@ -263,6 +266,7 @@ public:
         if (view_ == View::Logs && logs_.follow && !log_loading_ && now - last_log_read_ >= std::chrono::seconds(2)) loadLog();
         if (view_ == View::Partitions && !cluster_.loading && now - cluster_time_ >= std::chrono::seconds(interval_))
             loadCluster(false);
+        if (view_ == View::Monitor) sampleMonitor();
         if (view_ == View::None) requestPreview();
         if (!message_.empty() && now > message_until_) {
             message_.clear();
@@ -275,7 +279,7 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
-    enum class View { None, Help, Logs, Debug, History, Partitions, Quota, Confirm, Gpu, Plan, Script };
+    enum class View { None, Help, Logs, Debug, History, Partitions, Quota, Confirm, Gpu, Plan, Script, Monitor };
 
     // A row of the list: a job, an array (its tasks folded under it), or one of its tasks while it is open
     struct Row {
@@ -659,6 +663,107 @@ private:
         };
         view_ = View::Gpu;
         gpu_.reload();
+    }
+
+    /* A running job, live (m): its CPUs and memory (sstat every 2 s), its GPUs (one srun step with nvidia-smi --loop-ms)
+    - sstat runs on a worker of its own: a slow squeue on `slurm_` doesn't leave holes in the curves
+    - Nothing is read once the view is closed, and the GPU step ends with it
+    */
+    void openMonitor(const api::Job& j) {
+        closeMonitor();
+        monitor_ = ui::MonitorView{};
+        monitor_.title = "Live · job " + j.id + " " + util::cut(j.name, 40);
+        monitor_.job_id = j.job_id;
+        monitor_.state = j.state;
+        monitor_.partition = j.partition;
+        monitor_.cpus = std::max(1, j.cpus);
+        monitor_.gpus = std::max(0, j.gpus);
+        monitor_.nodes = std::max(1, j.nodes);
+        monitor_.mem_limit_mib = j.mem_mib;
+        monitor_.started = j.start;
+        monitor_.limit = j.limit;
+        monitor_.nodelist = j.nodelist;
+        monitor_nodelist_ = j.nodelist;
+        monitor_.reload = [this] {
+            if (monitor_.ended) return;
+            monitor_sstat_time_ = {};
+            if (monitor_.gpus > 0 && !gpu_stream_.running()) startGpuStream();
+            sampleMonitor();
+        };
+        view_ = View::Monitor;
+        if (monitor_.gpus > 0) startGpuStream();
+        sampleMonitor();
+    }
+
+    void closeMonitor() {
+        monitor_generation_++;   // what is still on its way is dropped
+        monitor_loading_ = false;
+        gpu_stream_.stop();
+    }
+
+    // Every 250 ms while the view is open: sstat when 2 s have passed, and whether the job still runs
+    void sampleMonitor() {
+        const api::Job* j = nullptr;
+        for (const auto& k : jobs_)
+            if (k.job_id == monitor_.job_id) j = &k;
+        if (!j || !j->active()) {
+            if (j) monitor_.state = j->state;
+            if (!monitor_.ended) closeMonitor();
+            monitor_.ended = true;
+            return;
+        }
+        if (monitor_loading_ || Clock::now() - monitor_sstat_time_ < std::chrono::seconds(2)) return;
+        monitor_loading_ = true;
+        monitor_sstat_time_ = Clock::now();
+        // The GPU step once it runs: found by its name, then left out of the job's steps
+        const bool find_own = monitor_.gpus > 0 && monitor_.own_step.empty() && gpu_stream_.running();
+        monitor_worker_.post([this, generation = monitor_generation_, id = monitor_.job_id, find_own] {
+            api::Fetched<std::vector<api::StepUse>> r;
+            std::string own;
+            try {
+                if (find_own) own = api::stepNamed(id, api::liveStepName());
+                r = api::fetchSteps(id);
+            } catch (const std::exception& e) {
+                r.error = std::string("sstat: ") + e.what();
+            }
+            const double at = ui::MonitorView::nowSeconds();
+            post([this, generation, at, own, r = std::move(r)]() mutable {
+                if (generation != monitor_generation_) return;
+                monitor_loading_ = false;
+                if (!own.empty()) monitor_.own_step = own;
+                monitor_.setSteps(r.data, at, r.error);
+            });
+        });
+    }
+
+    // Each line of nvidia-smi is one GPU, given to the view on the UI thread
+    void startGpuStream() {
+        const auto hosts = api::expandHostlist(monitor_nodelist_);
+        if (hosts.empty()) {
+            monitor_.gpu_error = "the job has no node";
+            return;
+        }
+        monitor_.gpu_waiting = true;
+        monitor_.own_step.clear();   // a new step, found again by its name
+        const int per_node = std::max(1, monitor_.gpus / monitor_.nodes);
+        const uint64_t generation = monitor_generation_;
+        gpu_stream_.start(
+            api::gpuStreamArgs(monitor_.job_id, hosts.size(), per_node, 2000),
+            [this, generation, hosts](const std::string& line) {
+                api::GpuUse g;
+                if (!api::parseNvidiaSmiLine(line, hosts, g)) return;
+                post([this, generation, g] {
+                    if (generation == monitor_generation_) monitor_.addGpu(g, ui::MonitorView::nowSeconds());
+                });
+            },
+            [this, generation](const std::string& error) {
+                if (error.empty()) return;
+                post([this, generation, error] {
+                    if (generation != monitor_generation_) return;
+                    monitor_.gpu_waiting = false;
+                    monitor_.gpu_error = error + " (r: start it again)";
+                });
+            });
     }
 
     // When would a job start (t): the form starts from the user's accounts, the partitions and the kinds of nodes
@@ -1123,6 +1228,11 @@ private:
     Clock::time_point cluster_time_ = Clock::now();
     ui::QuotaView quota_;
     ui::GpuView gpu_;
+    ui::MonitorView monitor_;
+    std::string monitor_nodelist_;
+    uint64_t monitor_generation_ = 0;
+    bool monitor_loading_ = false;
+    Clock::time_point monitor_sstat_time_{};
     ui::PlanView plan_;
     ui::DebugView script_;
     uint64_t script_generation_ = 0;
@@ -1138,6 +1248,8 @@ private:
     // Last: they stop (and join) first when the Viewer goes away, while the rest is still there
     Worker slurm_;
     Worker files_;
+    Worker monitor_worker_;      // sstat for the live view only
+    api::LineStream gpu_stream_;   // its GPU step: stopped before the rest
 };
 
 Element Viewer::render() {
@@ -1293,6 +1405,7 @@ Element Viewer::render() {
         case View::Partitions: over = cluster_.render(std::min(W - 2, 140), oh, myNodes()); break;
         case View::Quota: over = quota_.render(W - 2, oh, project_ ? ownJobs() : jobs_); break;
         case View::Gpu: over = gpu_.render(W - 2, oh); break;
+        case View::Monitor: over = monitor_.render(W - 2, oh); break;
         case View::Plan: over = plan_.render(W - 2); break;
         case View::Confirm: over = confirmView(); break;
         case View::None: break;
@@ -1387,6 +1500,7 @@ bool Viewer::viewEvent(Event& e) {
         case View::Partitions: handled = cluster_.onEvent(e, close); break;
         case View::Quota: handled = quota_.onEvent(e, close); break;
         case View::Gpu: handled = gpu_.onEvent(e, close); break;
+        case View::Monitor: handled = monitor_.onEvent(e, close); break;
         case View::Plan: handled = plan_.onEvent(e, close); break;
         case View::Script: handled = script_.onEvent(e, close); break;
         case View::Confirm:
@@ -1400,6 +1514,7 @@ bool Viewer::viewEvent(Event& e) {
     }
     if (close) {
         if (view_ == View::Confirm) showMessage(action_.kind == Action::Cancel ? "Not cancelled" : "Nothing changed");
+        if (view_ == View::Monitor) closeMonitor();
         view_ = View::None;
     }
     (void)handled;
@@ -1480,7 +1595,7 @@ bool Viewer::mainEvent(Event& e) {
         toggleProject();
     } else if (!row) {
         return e.is_character();
-    } else if (project_ && (writes || e == Event::Character('n'))) {
+    } else if (project_ && (writes || e == Event::Character('n') || e == Event::Character('m'))) {
         showMessage("The project view is read-only: o for your own jobs", true);
     } else if (e == Event::Character(' ')) {
         // Marks the row (or unmarks it) and goes to the next one: several in a row are marked quickly
@@ -1499,7 +1614,8 @@ bool Viewer::mainEvent(Event& e) {
             open_arrays_.erase(array->id);
         } else if (e == Event::Character('y')) {
             copy(array->id, "array id");
-        } else if (e == Event::Character('l') || e == Event::Character('d') || e == Event::Character('n') || e == Event::Character('Y')) {
+        } else if (e == Event::Character('l') || e == Event::Character('d') || e == Event::Character('n') || e == Event::Character('m') ||
+                   e == Event::Character('Y')) {
             showMessage("Enter shows the tasks of the array: each has its log and details");
         } else {
             return false;
@@ -1519,6 +1635,9 @@ bool Viewer::mainEvent(Event& e) {
     } else if (e == Event::Character('n')) {
         if (!job->active() || job->gpus == 0) showMessage("n shows the GPUs of a running job that has some", true);
         else openGpus(*job);
+    } else if (e == Event::Character('m')) {
+        if (!job->active()) showMessage("m shows a running job live: its CPUs, memory and GPUs", true);
+        else openMonitor(*job);
     } else {
         return false;
     }
