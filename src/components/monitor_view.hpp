@@ -16,82 +16,12 @@
 
 #include "../api/usage.hpp"
 #include "charts.hpp"
+#include "inference_view.hpp"
+#include "live.hpp"
 #include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
-
-// ---------------------------------------------------------------- readings in time
-
-/* Readings of one quantity: (seconds since the epoch, value)
-- Two readings less than half a second apart are one: nvidia-smi gives the GPUs of a node one line each
-- An hour is kept: the longest the widest zoom shows
-*/
-struct Series {
-    std::vector<std::pair<double, double>> points;
-
-    void add(double at, double value) {
-        if (!points.empty() && at - points.back().first < 0.5) points.back() = {points.back().first, value};
-        else points.emplace_back(at, value);
-        if (points.size() > 64 && at - points.front().first > 3600)
-            points.erase(points.begin(), points.begin() + static_cast<long>(points.size() / 8));
-    }
-    bool empty() const { return points.empty(); }
-    double last() const { return points.empty() ? -1 : points.back().second; }
-    double peak(double since = 0) const {
-        double p = 0;
-        for (const auto& [at, v] : points)
-            if (at >= since) p = std::max(p, v);
-        return p;
-    }
-};
-
-/* The series as `n` values, one per `step` seconds, the newest at the right (at `now`), each divided by `scale`
-- Several readings in one: their mean. None: the one before holds (sstat answers every 2 s)
-- -1 before the first reading: nothing is drawn there
-*/
-inline std::vector<double> resample(const Series& s, double now, double step, int n, double scale) {
-    std::vector<double> out(static_cast<size_t>(std::max(0, n)), -1);
-    if (s.empty() || scale <= 0) return out;
-    size_t k = 0;
-    double held = -1;
-    const double first = now - n * step;
-    while (k < s.points.size() && s.points[k].first <= first) held = s.points[k++].second;
-    for (int i = 0; i < n; i++) {
-        const double end = first + (i + 1) * step;
-        double sum = 0;
-        int count = 0;
-        while (k < s.points.size() && s.points[k].first <= end) {
-            sum += s.points[k++].second;
-            count++;
-        }
-        if (count > 0) held = sum / count;
-        if (held >= 0) out[static_cast<size_t>(i)] = std::clamp(held / scale, 0.0, 1.0);
-    }
-    return out;
-}
-
-/* How fast a total grows (CPU seconds, bytes), from readings far enough apart
-- sstat counts CPU time in whole seconds and doesn't say when it took it: over 2 s, a second more or less is 50%
-  on 1 CPU. The base is a reading at least `window` seconds older: the curve is smooth.
-- Less than before (a step ended): it starts again from this reading
-*/
-struct Rate {
-    double window = 6;
-    std::vector<std::pair<double, double>> readings;
-
-    // The rate per second, -1 until there are two readings 1.5 s apart
-    double add(double at, double total) {
-        if (!readings.empty() && total < readings.back().second) readings.clear();
-        readings.emplace_back(at, total);
-        const std::pair<double, double>* base = nullptr;
-        for (const auto& r : readings)
-            if (at - r.first >= window || (!base && at - r.first >= 1.5)) base = &r;
-        const double rate = base ? (total - base->second) / (at - base->first) : -1;
-        while (readings.size() > 2 && at - readings[1].first >= window) readings.erase(readings.begin());
-        return rate;
-    }
-};
 
 // ---------------------------------------------------------------- the view
 
@@ -103,7 +33,7 @@ struct Rate {
 - sstat every 2 s (main.cpp, on a worker of its own); the GPUs from one srun --overlap step that runs
   nvidia-smi --loop-ms while the view is open
 */
-struct MonitorView {
+struct MonitorView : LivePieces {
     static constexpr double ZOOMS[] = {1, 2, 5, 10, 30};   // seconds per column
 
     std::string title, job_id, state, partition, nodelist;
@@ -159,15 +89,14 @@ struct MonitorView {
     int gpu_selected = 0;
     bool gpu_zoom = false;      // Enter: the selected GPU alone, the whole width
 
-    int view = 0;               // 0 overview, 1 performance, 2 GPUs
-    chart::Symbols symbols = chart::Symbols::Braille;   // the graphs of the first view (v: braille, bars, blocks)
+    // The server of models it runs, if it runs one (4, or i): found and read by main.cpp
+    InferenceView inference;
+
+    int view = 0;               // 0 overview, 1 performance, 2 GPUs, 3 inference
+    chart::Symbols symbols = chart::Symbols::Bars;   // the graphs of the first view (v: areas, braille, blocks)
     int zoom = 1;
     int selected = 0, side_offset = 0, item_count = 1;
     std::function<void()> reload;
-
-    static double nowSeconds() {
-        return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-    }
 
     // sstat: each step's CPU time, memory and bytes; the job's are their sums
     void setSteps(const std::vector<api::StepUse>& list, double at, const std::string& error) {
@@ -283,33 +212,48 @@ struct MonitorView {
         return false;
     }
 
+    // The views it has: the GPUs' when it has some, the server's when one was found (or it is shown)
+    std::vector<int> views() const {
+        std::vector<int> v = {0, 1};
+        if (gpus > 0) v.push_back(2);
+        if (inference.any() || inference.hinted() || view == 3) v.push_back(3);
+        return v;
+    }
+
     /* Keys, as in the rest of RSV
-- 1 2 3, Tab or ← → (h l): the views, as the cluster view's tabs
-- ↑ ↓ (j k): the resource (2) or the GPU (3); Enter: that GPU alone, Esc back
-- + -: zoom in time; v: how the graphs are drawn; r: read again (and start the GPU steps again)
-- q or Esc close; the key that opened it closes it too: m from the first two views, n from the GPUs (each goes to
-  the other's view otherwise)
+- 1 2 3 4, Tab or ← → (h l): the views, as the cluster view's tabs
+- ↑ ↓ (j k): the resource (2), the GPU (3) or the server (4); Enter: that GPU alone, Esc back
+- + -: zoom in time; v: how the graphs are drawn; r: read again (and start the GPU steps again, look for a server)
+- q or Esc close; the key that opened it closes it too: m from the first two views, n from the GPUs, i from the
+  server (each goes to its view otherwise)
 */
     bool onEvent(Event e, bool& close) {
         const int n = std::max(1, item_count);
-        const int views = gpus > 0 ? 3 : 2;
+        const auto tabs = views();
+        const auto at = std::find(tabs.begin(), tabs.end(), view);
+        const int pos = at == tabs.end() ? 0 : static_cast<int>(at - tabs.begin());
+        const int count = static_cast<int>(tabs.size());
+        const int servers = static_cast<int>(inference.servers.size());
         if (e == Event::Character('r')) {
             if (reload) reload();
-        } else if (e == Event::Character('1') || e == Event::Character('2') || (e == Event::Character('3') && gpus > 0)) {
+        } else if (e == Event::Character('1') || e == Event::Character('2') || (e == Event::Character('3') && gpus > 0) || e == Event::Character('4')) {
             view = e.character()[0] - '1';
         } else if (e == Event::Character('n') && gpus > 0) {
             if (view == 2) close = true;
             else view = 2;
+        } else if (e == Event::Character('i')) {
+            if (view == 3) close = true;
+            else view = 3;
         } else if (e == Event::Character('m')) {
-            if (view == 2) view = 0;
+            if (view >= 2) view = 0;
             else close = true;
         } else if (e == Event::Character('v')) {
-            symbols = symbols == chart::Symbols::Braille ? chart::Symbols::Bars
-                      : symbols == chart::Symbols::Bars ? chart::Symbols::Block : chart::Symbols::Braille;
+            symbols = symbols == chart::Symbols::Bars ? chart::Symbols::Braille
+                      : symbols == chart::Symbols::Braille ? chart::Symbols::Block : chart::Symbols::Bars;
         } else if (e == Event::Tab || e == Event::ArrowRight || e == Event::Character('l')) {
-            view = (view + 1) % views;
+            view = tabs[static_cast<size_t>((pos + 1) % count)];
         } else if (e == Event::TabReverse || e == Event::ArrowLeft || e == Event::Character('h')) {
-            view = (view + views - 1) % views;
+            view = tabs[static_cast<size_t>((pos + count - 1) % count)];
         } else if (view == 2 && (e == Event::ArrowDown || e == Event::Character('j'))) {
             gpu_selected = std::min(static_cast<int>(gpu_tracks.size()) - 1, gpu_selected + 1);
         } else if (view == 2 && (e == Event::ArrowUp || e == Event::Character('k'))) {
@@ -318,6 +262,10 @@ struct MonitorView {
             gpu_zoom = !gpu_zoom;
         } else if (view == 2 && gpu_zoom && e == Event::Escape) {
             gpu_zoom = false;
+        } else if (view == 3 && (e == Event::ArrowDown || e == Event::Character('j'))) {
+            inference.selected = std::min(servers - 1, inference.selected + 1);
+        } else if (view == 3 && (e == Event::ArrowUp || e == Event::Character('k'))) {
+            inference.selected = std::max(0, inference.selected - 1);
         } else if (e == Event::Character('+') || e == Event::Character('=')) {
             zoom = std::max(0, zoom - 1);
         } else if (e == Event::Character('-') || e == Event::Character('_')) {
@@ -340,60 +288,11 @@ struct MonitorView {
 
     // ---------------------------------------------------------------- pieces
 
-    static std::string watts(double w) {
-        if (w >= 1000) {
-            const long tenths = std::lround(w / 100);
-            return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10) + " kW";
-        }
-        return std::to_string(static_cast<long>(w + 0.5)) + " W";
-    }
-    static std::string pct(double r) { return r < 0 ? "-" : std::to_string(static_cast<int>(std::lround(r * 100))) + "%"; }
-    static std::string shortNode(const std::string& node) {
-        const size_t dash = node.rfind('-');
-        return dash == std::string::npos ? node : node.substr(dash + 1);
-    }
     static std::string stepName(const std::string& id) {
         const size_t dot = id.find('.');
         return dot == std::string::npos ? id : id.substr(dot + 1);
     }
     double memScale() const { return mem_limit_mib > 0 ? mem_limit_mib : std::max(1.0, mem.peak() * 1.25); }
-
-    // A box: its name and what it says now on the top border, between the corners
-    static Element box(const std::string& name, Element right, Element content, Color frame, int width, int height) {
-        Elements top = {text("") | size(WIDTH, EQUAL, 2), text(" " + name + " ") | bold | color(Color::RGB(0xee, 0xee, 0xee)), filler()};
-        if (right) top.push_back(hbox({text(" "), right, text(" ")}));
-        top.push_back(text("") | size(WIDTH, EQUAL, 2));
-        return dbox({content | flex | borderStyled(ROUNDED, frame), vbox({hbox(std::move(top)), filler()})}) | clear_under |
-               size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height);
-    }
-
-    // "CPU  ■■■■■■■■■■■■  91%"
-    static Element gauge(const std::string& label, double ratio, int width, const chart::Gradient& g) {
-        const int w = std::max(3, width - 5 - 5);
-        return hbox({text(util::padRight(label, 5)) | bold, chart::meter(ratio, w, g),
-                     text(util::padLeft(pct(ratio), 5)) | bold | color(g.at(std::max(0.0, ratio)))});
-    }
-
-    // The scale beside a graph: its top, its middle when there is room, and 0 at the bottom (the top at the bottom
-    // for one hanging down, and no 0: it shares the one above it)
-    static Element axis(int height, const std::string& top, const std::string& mid = "", bool hanging = false, int width = 6) {
-        Elements rows;
-        for (int r = 0; r < height; r++) {
-            std::string label;
-            if (r == (hanging ? height - 1 : 0)) label = top;
-            else if (!hanging && r == height - 1 && height > 2) label = "0";
-            else if (!mid.empty() && height >= 7 && r == (height - 1) / 2) label = mid;
-            rows.push_back(text(util::padLeft(label, static_cast<size_t>(width - 1)) + " ") | color(chart::graphText()));
-        }
-        return vbox(std::move(rows));
-    }
-
-    // A line between two graphs: what the one under it shows, then a faint rule
-    static Element rule(Elements what) {
-        what.push_back(text(" "));
-        what.push_back(separatorLight() | color(chart::faint()) | flex);
-        return hbox(std::move(what));
-    }
 
     // ---------------------------------------------------------------- 1: overview
 
@@ -971,8 +870,8 @@ struct MonitorView {
             Element t = text(" " + std::to_string(i + 1) + " " + name + " ");
             return view == i ? t | bold | inverted | color(theme::accent()) : t | color(chart::graphText());
         };
-        Elements head = {tab(0, "overview"), tab(1, "performance")};
-        if (gpus > 0) head.push_back(tab(2, "gpus"));
+        Elements head;
+        for (int v : views()) head.push_back(tab(v, v == 0 ? "overview" : v == 1 ? "performance" : v == 2 ? "gpus" : "inference"));
         for (auto& e : Elements{text("  "), text(state) | bold | color(stateColor(state)), text(" · " + partition) | color(chart::graphText()),
                                 filler()})
             head.push_back(std::move(e));
@@ -983,19 +882,26 @@ struct MonitorView {
 
         const int body_h = inner_h - 2;
         if (view == 2 && gpus <= 0) view = 0;
-        Element body = view == 0 ? overview(inner_w, body_h, now) : view == 1 ? performance(inner_w, body_h, now) : gpuView(inner_w, body_h, now);
+        Element body = view == 0   ? overview(inner_w, body_h, now)
+                       : view == 1 ? performance(inner_w, body_h, now)
+                       : view == 2 ? gpuView(inner_w, body_h, now)
+                                   : inference.render(inner_w, body_h, now, ZOOMS[zoom], gpus > 0 ? &gpu : nullptr, gpus, job_id);
 
-        Elements keys = keyHints({{gpus > 0 ? "1 2 3 ←→" : "1 2 ←→", "view"}, {"+ -", "zoom"}});
+        std::string numbers;
+        for (int v : views()) numbers += std::to_string(v + 1) + " ";
+        Elements keys = keyHints({{numbers + "←→", "view"}, {"+ -", "zoom"}});
+        if (view == 3 && inference.servers.size() > 1) keys.push_back(keyHint("↑↓", "server"));
         if (view == 2) {
             keys.push_back(keyHint("↑↓", "GPU"));
             keys.push_back(keyHint("Enter", gpu_zoom ? "list" : "zoom"));
         }
         if (view == 0)
-            keys.push_back(keyHint("v", symbols == chart::Symbols::Braille ? "bars" : symbols == chart::Symbols::Bars ? "blocks" : "braille"));
+            keys.push_back(keyHint("v", symbols == chart::Symbols::Bars ? "braille" : symbols == chart::Symbols::Braille ? "blocks" : "areas"));
         if (view == 1) keys.push_back(keyHint("↑↓", "resource"));
         for (auto& k : keyHints({{"r", "read again"}, {"q", "close"}})) keys.push_back(k);
         const std::string when =
-            std::to_string(static_cast<int>(ZOOMS[zoom])) + " s per column · sstat 2 s" + (gpus > 0 ? " · nvidia-smi 2 s" : "");
+            std::to_string(static_cast<int>(ZOOMS[zoom])) + " s per column · sstat 2 s" + (gpus > 0 ? " · nvidia-smi 2 s" : "") +
+            (inference.any() ? " · metrics 2 s" : "");
         Elements foot = {hbox(std::move(keys)), filler()};
         if (inner_w >= 110) foot.push_back(text(when) | color(chart::graphText()));
         return panel(title,

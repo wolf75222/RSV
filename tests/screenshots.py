@@ -67,6 +67,7 @@ def main():
     t.sleep(2.5)
     shot(3.0)                       # main view, 2 GPU nodes
     shot(2.0, "j")                  # 1 node, 2 GPUs, an error in red in its last lines
+    shot(2.0, "j")                  # a server of models
     shot(2.0, "j")                  # 4 CPU nodes
     shot(3.0, "j", 1.0)             # an array of 200 tasks on one row, its progress
     shot(2.6, "enter", 0.8)         # its tasks

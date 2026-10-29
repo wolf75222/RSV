@@ -46,7 +46,7 @@ using namespace ftxui;
 
 namespace {
 
-constexpr const char* VERSION = "2.2.0";
+constexpr const char* VERSION = "2.3.0";
 
 // The signal that asked RSV to end (kill, hangup), handled once FTXUI's loop has returned: see main()
 volatile std::sig_atomic_t quit_signal = 0;
@@ -257,6 +257,7 @@ public:
         gpm_stream_.stop();
         apps_stream_.stop();
         monitor_worker_.stop();
+        inference_worker_.stop();
         slurm_.stop();
         files_.stop();
     }
@@ -663,6 +664,9 @@ private:
         monitor_.limit = j.limit;
         monitor_.nodelist = j.nodelist;
         monitor_nodelist_ = j.nodelist;
+        monitor_name_ = j.name;
+        const auto [out, err] = ui::logPaths(j, detailsFor(j));
+        monitor_files_ = {out, err};
         monitor_.reload = [this] {
             if (monitor_.ended) return;
             monitor_sstat_time_ = {};
@@ -672,6 +676,7 @@ private:
                 if (!apps_stream_.running()) startAppsStream();
                 monitor_.facts_at = 0;
             }
+            if (!monitor_.inference.any()) monitor_.inference.searched_at = 0;   // look again now
             sampleMonitor();
         };
         view_ = View::Monitor;
@@ -706,6 +711,7 @@ private:
             startAppsStream();
         }
         if (monitor_extras_ && monitor_.wantFacts(ui::MonitorView::nowSeconds())) loadGpuFacts();
+        sampleInference();
         if (monitor_loading_ || Clock::now() - monitor_sstat_time_ < std::chrono::seconds(2)) return;
         monitor_loading_ = true;
         monitor_sstat_time_ = Clock::now();
@@ -729,6 +735,46 @@ private:
                 monitor_loading_ = false;
                 if (asked) monitor_.own_steps = own;
                 monitor_.setSteps(r.data, at, r.error);
+            });
+        });
+    }
+
+    /* The server of models the job runs, if it runs one: found from its output, errors and script, then its metrics
+       every 2 s (on a worker of its own: a server slow to answer doesn't hold sstat) */
+    void sampleInference() {
+        auto& inf = monitor_.inference;
+        const double now = ui::MonitorView::nowSeconds();
+        if (inf.wantSearch(now, monitor_.view == 3)) {
+            inf.searching = true;
+            inference_worker_.post([this, generation = monitor_generation_, id = monitor_.job_id, nodes = api::expandHostlist(monitor_nodelist_),
+                                    files = monitor_files_, name = monitor_name_] {
+                api::Discovery d;
+                try {
+                    const char* urls = std::getenv("RSV_METRICS_URL");
+                    d = api::discover(id, nodes, files, name, urls ? urls : "");
+                } catch (const std::exception& e) {
+                    d.tried.push_back(e.what());
+                }
+                post([this, generation, d = std::move(d)]() mutable {
+                    if (generation == monitor_generation_) monitor_.inference.setDiscovery(std::move(d), ui::MonitorView::nowSeconds());
+                });
+            });
+            return;
+        }
+        if (!inf.any() || inf.scraping || now - inf.scraped_at < 2) return;
+        inf.scraping = true;
+        inf.scraped_at = now;
+        std::vector<api::Endpoint> where;
+        for (const auto& srv : inf.servers) where.push_back(srv.where);
+        inference_worker_.post([this, generation = monitor_generation_, where] {
+            std::vector<api::Scraped> got;
+            for (const auto& e : where) got.push_back(api::scrape(e));
+            post([this, generation, got = std::move(got)] {
+                if (generation != monitor_generation_) return;
+                auto& i = monitor_.inference;
+                i.scraping = false;
+                const double at = ui::MonitorView::nowSeconds();
+                for (size_t k = 0; k < got.size(); k++) i.addReading(k, got[k], at);
             });
         });
     }
@@ -1293,7 +1339,8 @@ private:
     Clock::time_point cluster_time_ = Clock::now();
     ui::QuotaView quota_;
     ui::MonitorView monitor_;
-    std::string monitor_nodelist_;
+    std::string monitor_nodelist_, monitor_name_;
+    std::vector<std::string> monitor_files_;   // its output and errors: where a server says where it listens
     uint64_t monitor_generation_ = 0;
     bool monitor_loading_ = false;
     bool monitor_extras_ = false;   // the GPU view's steps run
@@ -1314,6 +1361,7 @@ private:
     Worker slurm_;
     Worker files_;
     Worker monitor_worker_;      // sstat for the live view only
+    Worker inference_worker_;    // the live view's server of models: found, then read every 2 s
     api::LineStream gpu_stream_;   // its GPU steps: stopped before the rest
     api::LineStream gpm_stream_;
     api::LineStream apps_stream_;
@@ -1660,7 +1708,7 @@ bool Viewer::mainEvent(Event& e) {
         toggleProject();
     } else if (!row) {
         return e.is_character();
-    } else if (project_ && (writes || e == Event::Character('n') || e == Event::Character('m'))) {
+    } else if (project_ && (writes || e == Event::Character('n') || e == Event::Character('m') || e == Event::Character('i'))) {
         showMessage("The project view is read-only: o for your own jobs", true);
     } else if (e == Event::Character(' ')) {
         // Marks the row (or unmarks it) and goes to the next one: several in a row are marked quickly
@@ -1679,7 +1727,7 @@ bool Viewer::mainEvent(Event& e) {
             open_arrays_.erase(array->id);
         } else if (e == Event::Character('y')) {
             copy(array->id, "array id");
-        } else if (e == Event::Character('l') || e == Event::Character('d') || e == Event::Character('n') || e == Event::Character('m') ||
+        } else if (e == Event::Character('l') || e == Event::Character('d') || e == Event::Character('n') || e == Event::Character('m') || e == Event::Character('i') ||
                    e == Event::Character('Y')) {
             showMessage("Enter shows the tasks of the array: each has its log and details");
         } else {
@@ -1703,6 +1751,9 @@ bool Viewer::mainEvent(Event& e) {
     } else if (e == Event::Character('m')) {
         if (!job->active()) showMessage("m shows a running job live: its CPUs, memory and GPUs", true);
         else openMonitor(*job);
+    } else if (e == Event::Character('i')) {
+        if (!job->active()) showMessage("i shows the server of models a running job runs (vLLM, SGLang...)", true);
+        else openMonitor(*job, 3);
     } else {
         return false;
     }

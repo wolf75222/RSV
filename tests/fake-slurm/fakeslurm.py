@@ -2,6 +2,7 @@
 """Fake Slurm commands for testing RSV anywhere, with made-up jobs (no real user, account or project).
 
 bin/ holds one wrapper per command (squeue, scontrol, sinfo, sacct, sacctmgr, scancel): put it first in PATH.
+Its curl answers only for the made-up model server (vLLM's metrics on the vllm job's node, port 8000).
 
     PATH=tests/fake-slurm/bin:$PATH USER=demo ./build/rsv
 
@@ -218,6 +219,10 @@ def demo_jobs():
         job(id="812350", name="train resnet50 (fp16)", state="RUNNING", reason="None", partition="short",
             account="proj-ml", alloc=[alloc("romeo-a027", "0-31", "0-1", 122880)], num_cpus=32, gpus=2,
             mem_per_node=122880, limit=4 * HOUR, elapsed=45 * MIN + 10, workdir=os.path.join(runs, "resnet")),
+        job(id="812362", name="vllm-serve llama-3.1-70b", state="RUNNING", reason="None", partition="short",
+            account="proj-ml", alloc=[alloc("romeo-a031", "0-71", "0-3", 491520)], num_cpus=72, gpus=4,
+            mem_per_node=491520, limit=24 * HOUR, elapsed=2 * HOUR + 7 * MIN, workdir=os.path.join(runs, "llm"),
+            stdout=os.path.join(runs, "llm", "vllm-%j.log")),
         job(id="812377", name="motorBike-simpleFoam", state="RUNNING", reason="None", partition="long",
             alloc=[alloc("romeo-c[004-007]", "0-191", "", 1024000)], num_nodes=4, num_cpus=768,
             mem_per_node=1024000, limit=3 * DAY, elapsed=DAY + 5 * HOUR + 22 * MIN, workdir=os.path.join(runs, "motorbike")),
@@ -420,6 +425,113 @@ def train_log(f):
                 % (step, 6.9 - step * 1.1e-4, 2610 + (step * 7) % 30))
 
 
+def vllm_log(f, j):
+    """A vLLM server: it starts, says where it listens, then logs what it does every 10 s"""
+    f.write("INFO 10-29 09:12:03 [__init__.py:239] Automatically detected platform cuda.\n"
+            "INFO 10-29 09:12:05 [api_server.py:1043] vLLM API server version 0.11.0\n"
+            "INFO 10-29 09:12:05 [api_server.py:1044] args: model='meta-llama/Llama-3.1-70B-Instruct', tensor_parallel_size=4, "
+            "port=8000, enable_prefix_caching=True\n"
+            "INFO 10-29 09:14:41 [gpu_model_runner.py:1595] Model loading took 32.88 GiB and 151.2 seconds\n"
+            "INFO 10-29 09:15:02 [launcher.py:28] Available routes are:\n"
+            "INFO 10-29 09:15:02 [launcher.py:36] Route: /metrics, Methods: GET\n"
+            "INFO:     Started server process [2871044]\n"
+            "INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)\n")
+    for k in range(40):
+        f.write("INFO 10-29 09:%02d:%02d [loggers.py:123] Engine 000: Avg prompt throughput: %.1f tokens/s, Avg generation "
+                "throughput: %.1f tokens/s, Running: %d reqs, Waiting: 0 reqs, GPU KV cache usage: %.1f%%, Prefix cache hit rate: %.1f%%\n"
+                % (16 + k // 6, (k * 10) % 60, 4800 + 900 * math.sin(k / 3.0), 1300 + 400 * math.sin(k / 4.0), 9 + k % 7,
+                   40 + 15 * math.sin(k / 5.0), 61.0 + k % 5))
+
+
+def vllm_metrics(j, now):
+    """vLLM's /metrics: counters that grow with a load in waves, histograms of what the requests took"""
+    def load(a):
+        return 0.6 + 0.3 * math.sin(a / 37.0) + 0.1 * math.sin(a / 11.0)
+
+    def cdf(x, median, sigma):
+        return 0.5 * (1 + math.erf((math.log(x) - math.log(median)) / (sigma * math.sqrt(2))))
+
+    sec = [0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0]
+    toks = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    hists = {   # name: (buckets, count per epoch (requests or tokens), median of the load, sigma)
+        "time_to_first_token_seconds": (sec, "req", lambda l: 0.06 + 0.4 * l * l, 0.6),
+        "inter_token_latency_seconds": (sec, "gen", lambda l: 0.016 + 0.014 * l, 0.3),
+        "e2e_request_latency_seconds": (sec, "req", lambda l: 3.0 + 7.0 * l, 0.7),
+        "request_queue_time_seconds": (sec, "req", lambda l: 0.002 + 0.6 * max(0.0, l - 0.7), 1.0),
+        "request_prefill_time_seconds": (sec, "req", lambda l: 0.05 + 0.3 * l, 0.5),
+        "request_decode_time_seconds": (sec, "req", lambda l: 2.8 + 6.0 * l, 0.6),
+        "request_prompt_tokens": (toks, "req", lambda l: 1800.0, 1.0),
+        "request_generation_tokens": (toks, "req", lambda l: 420.0, 0.7),
+    }
+    epoch = 10.0
+    totals = dict(req=0.0, gen=0.0, prompt=0.0)
+    acc = {name: ([0.0] * len(b), 0.0, 0.0) for name, (b, _, _, _) in hists.items()}
+    a = float(j["start"])
+    while a < now:
+        span = min(epoch, now - a)
+        l = load(a)
+        n = dict(req=2.4 * l * span, gen=1400.0 * l * span, prompt=5200.0 * l * span * (1 + 0.3 * math.sin(a / 13.0)))
+        for k in totals:
+            totals[k] += n[k]
+        for name, (buckets, what, median, sigma) in hists.items():
+            counts, total, count = acc[name]
+            m = median(l)
+            for i, le in enumerate(buckets):
+                counts[i] += n[what] * cdf(le, m, sigma)
+            mean = m * math.exp(sigma * sigma / 2)
+            acc[name] = (counts, total + n[what] * mean, count + n[what])
+        a += span
+    lab = 'engine="0",model_name="meta-llama/Llama-3.1-70B-Instruct"'
+    out = ["# HELP vllm:num_requests_running Number of requests in model execution batches.",
+           "# TYPE vllm:num_requests_running gauge"]
+    l = load(now)
+    out.append("vllm:num_requests_running{%s} %d" % (lab, round(4 + 14 * l)))
+    out.append("vllm:num_requests_waiting{%s} %d" % (lab, max(0, round(10 * l - 8))))
+    out.append('vllm:num_requests_waiting_by_reason{%s,reason="capacity"} %d' % (lab, max(0, round(10 * l - 8))))
+    out.append("vllm:kv_cache_usage_perc{%s} %.4f" % (lab, 0.1 + 0.62 * l))
+    out.append("vllm:prompt_tokens_total{%s} %.1f" % (lab, totals["prompt"]))
+    out.append("vllm:generation_tokens_total{%s} %.1f" % (lab, totals["gen"]))
+    done = totals["req"]
+    for reason, share in (("stop", 0.955), ("length", 0.04), ("abort", 0.005), ("error", 0.0)):
+        out.append('vllm:request_success_total{%s,finished_reason="%s"} %.0f' % (lab, reason, done * share))
+    out.append("vllm:num_preemptions_total{%s} %d" % (lab, int((now - j["start"]) // 1500)))
+    out.append("vllm:prefix_cache_queries_total{%s} %.1f" % (lab, totals["prompt"]))
+    out.append("vllm:prefix_cache_hits_total{%s} %.1f" % (lab, totals["prompt"] * 0.62))
+    drafts = totals["gen"] / 2.6
+    out.append("vllm:spec_decode_num_drafts_total{%s} %.0f" % (lab, drafts))
+    out.append("vllm:spec_decode_num_draft_tokens_total{%s} %.0f" % (lab, drafts * 3))
+    out.append("vllm:spec_decode_num_accepted_tokens_total{%s} %.0f" % (lab, drafts * 1.6))
+    for pos, share in enumerate((0.78, 0.52, 0.30)):
+        out.append('vllm:spec_decode_num_accepted_tokens_per_pos_total{%s,position="%d"} %.0f' % (lab, pos, drafts * share))
+    for name, (buckets, _, _, _) in hists.items():
+        counts, total, count = acc[name]
+        out.append("# TYPE vllm:%s histogram" % name)
+        for le, c in zip(buckets, counts):
+            out.append('vllm:%s_bucket{%s,le="%s"} %d' % (name, lab, repr(float(le)), math.floor(c)))
+        out.append('vllm:%s_bucket{%s,le="+Inf"} %d' % (name, lab, math.floor(count)))
+        out.append("vllm:%s_sum{%s} %.4f" % (name, lab, total))
+        out.append("vllm:%s_count{%s} %d" % (name, lab, math.floor(count)))
+    return "\n".join(out) + "\n"
+
+
+def curl():
+    # curl -sS --fail --noproxy * --max-time N http://host:port/path: only the vllm job's server answers
+    url = [a for a in ARGS if a.startswith("http://")]
+    m = re.match(r"http://([^:/]+):(\d+)(/.*)?$", url[0]) if url else None
+    if not m:
+        fail("curl: (3) URL rejected: Bad hostname", 3)
+    host, port, path = m.group(1), int(m.group(2)), m.group(3) or "/"
+    for j in all_jobs():
+        if j["state"] == "RUNNING" and "vllm" in j["name"] and host in node_names(j):
+            if port != 8000:
+                break
+            if path != "/metrics":
+                fail("curl: (22) The requested URL returned error: 404", 22)
+            sys.stdout.write(vllm_metrics(j, time.time()))
+            return
+    fail("curl: (7) Failed to connect to %s port %d after 0 ms: Couldn't connect to server" % (host, port), 7)
+
+
 def make_logs(jobs):
     for j in jobs:
         if j["state"] not in ("RUNNING", "COMPLETED", "COMPLETING"):
@@ -431,6 +543,9 @@ def make_logs(jobs):
                 f.write("Starting %s on %s\n" % (j["name"], j["alloc"][0]["hosts"] if j["alloc"] else "?"))
                 if "resnet" in j["name"]:
                     train_log(f)
+                    continue
+                if "vllm" in j["name"]:
+                    vllm_log(f, j)
                     continue
                 for step in range(0, 60):
                     f.write("step %6d  t=%.4e  residual=%.3e  MLUPS=%7.1f\n"
@@ -1138,7 +1253,8 @@ def srun():
             for g in range(per_node):
                 if train and g == 1:
                     continue
-                name = "python train.py --config resnet50.yaml" if train else "/gpfs/home/demo/runs/lbm/lbm3d"
+                name = ("python train.py --config resnet50.yaml" if train else
+                        "python -m vllm.entrypoints.openai.api_server" if "vllm" in j["name"] else "/gpfs/home/demo/runs/lbm/lbm3d")
                 print("%d: %s, %d, %s, %d" % (task, uuid(task, g), base_pid + task * 100 + g, name, 60000 - g * 5000))
         sys.stdout.flush()
 
@@ -1225,7 +1341,7 @@ Backfilling stats
 
 COMMANDS = {"squeue": squeue, "scontrol": scontrol, "sinfo": sinfo, "sacct": sacct, "sacctmgr": sacctmgr,
             "scancel": scancel, "sstat": sstat, "sprio": sprio, "sshare": sshare, "mmlsquota": mmlsquota,
-            "srun": srun, "sbatch": sbatch, "sdiag": sdiag}
+            "srun": srun, "sbatch": sbatch, "sdiag": sdiag, "curl": curl}
 
 if __name__ == "__main__":
     if CMD not in COMMANDS:

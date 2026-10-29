@@ -1,3 +1,13 @@
+# Changes in RSV 2.3
+
+**New**
+
+- `i`: the server of models a running job runs, live (the fourth view of `m`). vLLM, SGLang, TGI, llama.cpp, Triton and Ollama are found without being told: the engine and its port from the job's output, errors and script, then its Prometheus metrics from the login node (`curl`, nothing runs in the job). One adapter per engine reads them as the same figures: tokens per second, requests running and waiting, KV and prefix cache, latencies (time to the first token, per token, queue, prefill, decode: p50 and p95 from the histograms over the last 30 s), speculative decoding, requests by how they ended and how long they took, and what is wrong (preemptions, a queue, a KV cache nearly full or nearly empty, GPUs busy without tokens). `RSV_METRICS_URL` for a server it doesn't find.
+
+**Changed**
+
+- The live view's graphs are drawn again: solid areas, their top to an eighth of a character in a bright edge, instead of braille dots; the charts' other curves as lines of box characters (─ ╭ ╮ ╰ ╯ │) instead of dots, over a grid of faint plain lines instead of a dotted one. `v` still gives braille or blocks.
+
 # Changes in RSV 2.2
 
 **New**

@@ -25,6 +25,7 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 | `d` | everything `scontrol` says about the job |
 | `n` | the job's GPUs in depth: who uses each, why one is slow, SM activity, memory, links |
 | `m` | the job live: an overview of its CPUs, memory, disk I/O, steps and GPUs, or a task manager's Performance view |
+| `i` | the server of models the job runs (vLLM, SGLang, TGI, llama.cpp, Triton, Ollama), found on its own: tokens per second, requests, latencies, KV and prefix cache, speculative decoding, what is wrong |
 | `c` | cancel the job, or a whole array (asks first) |
 | `H` | hold or release a waiting job (ROMEO refuses both to users, RSV says why) |
 | `Space` | mark jobs: `c` then cancels all of them |
