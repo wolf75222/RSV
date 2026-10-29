@@ -57,9 +57,9 @@ Under it, when there is room, the last lines of the job's output.
 | `a` | History | Your jobs of the last 7 days (`sacct`), what they used, see below. `←` `→` filter by state, `s` sort, `r` read again. |
 | `p` | Cluster | All of ROMEO, read again every 15 s while open, in four tabs: `←` `→` (or `Tab`, `1` to `4`) change tabs everywhere in it. See below. |
 | `t` | Start time | When would a job start? Account, partition, constraint, nodes, cores, GPUs, memory and time: `Enter` asks Slurm (`sbatch --test-only`, nothing is submitted) and shows when and where, or why it can't. |
-| `i` | Model server | The server of models a running job runs, live (the fourth view of `m`): vLLM, SGLang, TGI, llama.cpp, Triton or Ollama, found without being told. RSV reads the job's output, errors and script for the engine and the address it listens on (`Uvicorn running on http://0.0.0.0:8000`, `--port 8000`), then asks each place for its Prometheus metrics (`GET /metrics` on the job's nodes, from the login node: nothing runs in the job). Each engine names its metrics its own way; RSV reads them all as the same figures, and shows what an engine doesn't give as nothing. At the top the engine, the model and its address; what is wrong (requests preempted: the KV cache was full; requests waiting for 10 s or more; KV cache over 90%; requests aborted; GPUs busy but no token; few drafted tokens accepted; KV cache under 5% for minutes with never a queue: it could serve many more at once, or run on fewer GPUs; no request for 5 minutes; most of the prompt from the prefix cache); a tile for each figure with its curve (tokens generated and read per second, requests running and waiting, KV cache, prefix cache hits, time to the first token, time per token). Then the tokens per second and the time to the first token (p50, p95) as charts, the latencies over the last minute (first token, per token, whole request, queue, prefill, decode: p50, p95, mean), where a request's time goes, the requests by how long they took, the caches and speculative decoding (the share of drafted tokens kept, at each position), the requests ended and how, their average prompt and answer, and the GPUs' use beside the tokens. Several servers in one job: `↑` `↓`. No server answering yet (a model still loading): what was read and asked, looked again every 15 s; `r` now. Another server, or one RSV doesn't find: `RSV_METRICS_URL=http://{node}:8000/metrics rsv` (`{node}`: each of the job's nodes; several with commas). |
-| `n` | GPUs | A running job's GPUs, live and in depth (the third view of `m`). On the left, grouped by node, each GPU with its curve, use, SM activity, memory, temperature, power and how many processes run on it, `!` when something is wrong. On the right, the one picked (`↑` `↓`, `Enter` for it alone): what is wrong (no process on it: reserved for nothing; slowed down by its power cap or its temperature; busy but on few SMs; uncorrected memory errors, memory rows to remap), its curves (busy, SM activity and occupancy, tensor cores; memory in use and DRAM activity; PCIe/C2C and NVLink traffic), its clocks against their maximum, power against its limit, ECC errors, and its processes with their step and rank. SM, tensor, DRAM and link figures come from Hopper's GPM counters (`nvidia-smi dmon --gpm-metrics`), what DCGM would give; the first two readings have none. |
-| `m` | Live | A running job live, in two views (`1` `2`, `Tab` or `←` `→`; `3` the GPUs, as `n`; `4` its server of models, as `i`, when it runs one). `1` overview: the CPUs' curve and under it the GPUs' (or the memory's), each with its scale; beside them a gauge for the CPUs, memory, GPUs and their memory, and each GPU with its little curve, use and temperature (each step when there is no GPU); under them `memory` (asked, in use with its curve, free, the largest task and its node, GPU memory), `disk` (the bytes its steps read and write per second, reads above and writes under them, with their totals) and `steps` (each step with the cores it keeps busy and their curve, its memory and largest task). `2` performance, as a task manager's: CPU, memory, disk and each GPU on the left with their little curves, the one picked (`↑` `↓`) on the right with its chart, scale, time and figures. `+` `-` zoom in time (1 to 30 s per column, up to the last hour), `v` draws the graphs as areas (the default: solid, their top to an eighth of a character), in braille or in blocks, `r` reads again. `sstat` every 2 s; the GPUs from one `srun --overlap` step that runs `nvidia-smi --loop-ms=2000` while the view is open and ends with it (one step, not one every few seconds). |
+| `m` | Live | A running job live: its CPUs, memory, disk, steps and GPUs, as an overview or as a task manager's. See [the live view](#the-live-view). |
+| `n` | GPUs | The job's GPUs in depth: who uses each, why one is slow (the third tab of `m`). |
+| `i` | Model server | The server of models the job runs, found on its own: tokens, requests, latencies, caches (the fourth tab of `m`). |
 | `u` | Limits | For each of your accounts: its CPU, GPU and job limits and what your jobs use now (`sacctmgr`, `squeue`), its fairshare and the CPU-hours used (`sshare`), then your disk quotas and your projects' (`mmlsquota`), with a warning when one is over. |
 | `?` | Help | |
 
@@ -67,11 +67,57 @@ Under it, when there is room, the last lines of the job's output.
 
 ![The log of a running job, followed](../img/log.png)
 
+## The live view
+
+`m` on a running job, `n` straight to its GPUs, `i` straight to its server of models. Four tabs: `1` `2` `3` `4`, `Tab` or `←` `→` (`h` `l`); `3` only when the job has GPUs, `4` only when it runs a server of models. The key that opened it closes it (`m` from the first two tabs, `n` from the GPUs, `i` from the server; each goes to its tab otherwise), as do `q` and `Esc`.
+
+Everywhere in it: `+` `-` zoom in time (1 to 30 s per column, up to the last hour), `r` reads again. Nothing more runs once it is closed: its Slurm steps end with it.
+
+![The live view: overview, performance, GPUs, then a model server](../img/live.gif)
+
+### 1 overview
+
+The CPUs' curve and under it the GPUs' (or the memory's, without GPUs), each with its scale. Beside them a gauge for the CPUs, memory, GPUs and their memory, and each GPU with its little curve, use and temperature (each step when there is no GPU). Under them:
+
+- `memory`: asked, in use with its curve, free, the largest task and its node, GPU memory.
+- `disk`: the bytes its steps read and write per second (reads above, writes hanging under them, on one scale), with their totals.
+- `steps`: each step with the cores it keeps busy and their curve, its memory and largest task.
+
+The graphs are solid areas, each column in the colour of its value, its top to an eighth of a character; `v` draws them in braille or in blocks instead.
+
 ![A running job live (m): the overview](../img/live.png)
+
+### 2 performance
+
+As a task manager's: CPU, memory, disk, all the GPUs and each one on the left with their little curves, the one picked (`↑` `↓`) on the right with its chart, its scale and time, and its figures.
 
 ![The same, as a task manager's Performance tab](../img/live-performance.png)
 
+### 3 GPUs (`n`)
+
+On the left, grouped by node, each GPU with its curve, use, SM activity, memory, temperature, power and how many processes run on it, `!` when something is wrong. On the right, the one picked (`↑` `↓`, `Enter` for it alone, `Esc` back):
+
+- What is wrong: no process on it (reserved for nothing); slowed down by its power cap or its temperature; busy but on few SMs; uncorrected memory errors, memory rows to remap.
+- Its curves: busy, SM activity and occupancy, tensor cores; memory in use and DRAM activity; PCIe/C2C and NVLink traffic.
+- Its clocks against their maximum, power against its limit, ECC errors, and its processes with their Slurm step and rank.
+
+SM, tensor, DRAM and link figures come from Hopper's GPM counters (`nvidia-smi dmon --gpm-metrics`), what DCGM would give; the first two readings have none. A job that already uses all the processes it may (8192 on ROMEO, a vLLM with Ray can) can't start `dmon`: the view says so and shows the rest.
+
 ![A job's GPUs in depth (n)](../img/gpus.png)
+
+### 4 inference (`i`)
+
+The server of models the job runs: vLLM, SGLang, TGI, llama.cpp, Triton (and TensorRT-LLM) or Ollama, found without being told. RSV reads the job's output, errors and script for the engine and where it listens (`Uvicorn running on http://0.0.0.0:8000`, `--port 8000`), then asks each place for its Prometheus metrics (`GET /metrics` on the job's nodes, from the login node: nothing runs in the job). Each engine names its metrics its own way: RSV reads them all as the same figures, and leaves out what an engine doesn't give. The tab shows only when a server was found (or `i` was pressed).
+
+- At the top: the engine, the model, its address, the requests and tokens since it started.
+- What is wrong, when something is: requests preempted (the KV cache was full: their work is done again); requests waiting for 10 s or more; the KV cache over 90%; requests aborted; GPUs busy but no token (loading, compiling); few drafted tokens accepted; the KV cache under 5% for minutes with never a queue (it could serve many more requests at once, or run on fewer GPUs); no request for 5 minutes; most of the prompt from the prefix cache (long shared contexts: an agent).
+- A tile for each figure, with its curve: tokens generated and read per second, requests running and waiting, KV cache, prefix cache hits, time to the first token (p50), time per token.
+- Charts: the tokens generated per second (alone: an agent's prompt tokens, mostly cached, can be a thousand times more), the time to the first token (p50, p95).
+- `latency`: over the last minute, p50, p95 and mean of the first token, each token, the whole request, its queue, prefill and decode; where a request's time goes; the requests by how long they took.
+- `cache & drafts`: the KV cache and its peak, the prefix cache hits, preemptions, and speculative decoding: the share of drafted tokens kept, tokens per step, at each position of a draft.
+- `requests`: how many ended and how (stop, length, abort, error), per minute, their average prompt and answer, and the GPUs' use beside the tokens over the last 5 minutes.
+
+Rates are over the last 10 s, latencies and cache hits over the last 30 s (from the histograms and counters then and 30 s before): they follow what the server does now. Several servers in one job: `↑` `↓`. None answering yet (a model still loading): what was read and asked, looked at again every 15 s, `r` now. Another server, or one RSV doesn't find: `RSV_METRICS_URL=http://{node}:8000/metrics rsv` (`{node}`: each of the job's nodes; several with commas).
 
 ![The server of models a job runs (i)](../img/inference.png)
 

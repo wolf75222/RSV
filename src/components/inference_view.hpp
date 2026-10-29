@@ -124,8 +124,9 @@ struct InferenceServer {
         if (r.waiting >= 0) waiting.add(at, r.waiting);
         if (r.kv_usage >= 0) kv.add(at, std::min(1.0, r.kv_usage));
 
-        // Over the last 30 s
-        if (const auto* b = before(at, 30)) {
+        // Over the last 30 s, once there are 10 s: a p95 of the few requests of 2 s says nothing
+        const auto* b = before(at, 30);
+        if (b && !kept.empty() && at - kept.front().at >= 10) {
             const double dq = delta(r.prefix_queries, b->prefix_queries), dh = delta(r.prefix_hits, b->prefix_hits);
             if (dq > 0 && dh >= 0) prefix_hit.add(at, std::min(1.0, dh / dq));
             const auto quantiles = [&](const api::Histogram& now, const api::Histogram& then, Series& p50, Series& p95) {

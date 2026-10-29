@@ -5,7 +5,9 @@
     python3 tests/screenshots.py --ssh romeo --dir '~/RSV'   # on ROMEO (built there), drawn here
 
 Needs pyte and Pillow where it runs (pip install pyte pillow), only the standard library on the remote side.
-Writes img/rsv.gif, img/history.png, img/log.png, img/cluster.png, img/nodes.png, img/node.png and img/hardware.png.
+Writes img/rsv.gif, img/history.png, img/log.png, img/cluster.png, img/nodes.png, img/node.png and img/hardware.png,
+then the live view's: img/live.gif, img/live.png, img/live-performance.png, img/gpus.png and img/inference.png
+(--only main or --only live for one part: the live view waits a minute for its curves).
 """
 
 import argparse
@@ -48,8 +50,74 @@ def main():
     p.add_argument("--out", default=os.path.join(REPO, "img"))
     p.add_argument("--cols", type=int, default=140)
     p.add_argument("--rows", type=int, default=40)
+    p.add_argument("--only", choices=["main", "live"])
     args = p.parse_args()
+    if args.only != "live":
+        main_shots(args)
+    if args.only != "main":
+        live_shots(args)
 
+
+def live_shots(args):
+    """The live view (m) of the 2-node job, then of the model server: a minute first, for curves to draw"""
+    t = Term(command(args), cols=150, rows=46)
+    frames = []
+
+    def shot(seconds, keys=None, settle=0.8):
+        if keys:
+            for k in keys.split(","):
+                t.send(k)
+                t.sleep(0.15)
+        t.sleep(settle)
+        frames.append((t.snapshot(), int(seconds * 1000)))
+        return t.snapshot()
+
+    if not t.wait_for("lbm-d3q19", 20):
+        print(t.text())
+        sys.exit("RSV didn't start")
+    t.sleep(1)
+    t.send("m")
+    t.sleep(60)
+    live_png = shot(3.0, None, 0.2)          # overview: CPUs, GPUs, memory, disk, steps
+    for _ in range(3):
+        shot(0.8, None, 1.8)                 # the curves move
+    shot(2.0, "v", 1.0)                      # v: braille
+    shot(1.5, "v,v", 1.0)                    # back to areas
+    perf_png = shot(3.0, "2", 1.0)           # performance: the resources, the one picked
+    shot(1.6, "j", 0.8)
+    shot(1.6, "j,j,j", 0.8)                  # the GPUs
+    shot(1.6, "3", 12)                       # the GPUs in depth: GPM counters, processes
+    gpus_png = shot(2.4, "j", 1.5)           # the GPU busy on few SMs
+    shot(1.6, "j", 1.0)
+    t.send("q")
+    t.sleep(0.5)
+    t.send("j")
+    t.sleep(0.3)
+    t.send("j")
+    t.sleep(0.3)
+    t.send("i")                              # the vLLM job: its server, found from its log
+    shot(1.6, None, 2.5)
+    t.sleep(45)
+    inference_png = shot(4.0, None, 0.2)
+    for _ in range(3):
+        shot(0.8, None, 1.8)
+    shot(2.0, "1", 1.0)                      # the same job's overview
+    t.send("q")
+    t.sleep(0.3)
+    t.send("q")
+    t.wait_exit(5)
+    t.close()
+
+    os.makedirs(args.out, exist_ok=True)
+    save_gif([render_png(cells) for cells, _ in frames], os.path.join(args.out, "live.gif"), [d for _, d in frames])
+    for cells, name in ((live_png, "live.png"), (perf_png, "live-performance.png"), (gpus_png, "gpus.png"), (inference_png, "inference.png")):
+        render_png(cells, os.path.join(args.out, name))
+    for name in ("live.gif", "live.png", "live-performance.png", "gpus.png", "inference.png"):
+        path = os.path.join(args.out, name)
+        print("%s: %d KB" % (path, os.path.getsize(path) // 1024))
+
+
+def main_shots(args):
     t = Term(command(args), cols=args.cols, rows=args.rows)
     frames = []
 
