@@ -6,17 +6,18 @@
 #include <string>
 #include <vector>
 
-#include <ftxui/dom/canvas.hpp>
 #include <ftxui/dom/elements.hpp>
 
 #include "../utils/format.hpp"
 
-/* Charts for the live view (m), in two styles
-- btop's: one value per column, each character showing the step from the value before to this one (5 x 5 levels
-  in a braille or block character), the rows coloured along a gradient. The idea comes from btop (Apache-2.0,
-  github.com/aristocratos/btop, src/btop_draw.cpp: Draw::Graph and Draw::Meter); the code is RSV's own.
-- A task manager's: a line over a tinted area on FTXUI's canvas, with a grid, its scale on the left and the time
-  under it
+/* Charts for the live view (m)
+- Areas: one value per column, solid from the base, its top to an eighth of a row (▁ ▂ ▃ ▄ ▅ ▆ ▇ █) in a bright
+  edge, the rest darker: no dots, no holes, at any size
+- btop's, on v: each character shows the step from the value before to this one (5 x 5 levels in a braille or block
+  character). The idea comes from btop (Apache-2.0, github.com/aristocratos/btop, src/btop_draw.cpp: Draw::Graph and
+  Draw::Meter); the code is RSV's own.
+- Charts: the first curve as an area, the others as lines over it (─ ╭ ╮ ╰ ╯ │), a faint grid of plain lines, the
+  scale on the left and the time under it
 */
 namespace ui::chart {
 using namespace ftxui;
@@ -46,11 +47,18 @@ inline Gradient gpuGradient() { return {Color::RGB(0x3c, 0x8d, 0x5a), Color::RGB
 
 inline Color faint() { return Color::RGB(0x40, 0x40, 0x40); }   // btop's meter_bg and inactive text
 inline Color graphText() { return Color::RGB(0x80, 0x80, 0x80); }
+inline Color gridColor() { return Color::RGB(0x2c, 0x30, 0x38); }
+inline Color background() { return Color::RGB(0x16, 0x18, 0x1d); }
+
+// The inside of an area, under its bright edge: the colour darkened (`light`: 0 the background, 1 the colour)
+inline Color areaFill(Color c, double light) {
+    return Color::Interpolate(static_cast<float>(std::clamp(light, 0.0, 1.0)), background(), c);
+}
 
 // ---------------------------------------------------------------- btop's graph
 
 /* How a graph is drawn
-- Bars: one value per column, its top to an eighth of a character (▁ ▂ ▃ ▄ ▅ ▆ ▇ █): smooth and solid
+- Bars: an area, one value per column, its top to an eighth of a character (▁ ▂ ▃ ▄ ▅ ▆ ▇ █) in a bright edge
 - Braille, Block: btop's, each character showing the step from the value before (left half) to its own (right)
 */
 enum class Symbols { Bars, Braille, Block };
@@ -125,37 +133,42 @@ inline Element graph(const std::vector<double>& values, int width, int height, c
         const Color c = g.at(double(level + 1) / height);
         Elements runs;
         std::string run;
+        Color run_color;
         int run_kind = -1;   // 0 drawn, 1 drawn inverted (a bar hanging down), 2 the faint base
         auto flush = [&] {
             if (run.empty()) return;
-            Element e = text(run);
-            runs.push_back(run_kind == 2 ? e | color(faint()) : run_kind == 1 ? e | color(c) | inverted : e | color(c));
+            Element e = text(run) | color(run_kind == 2 ? faint() : run_color);
+            runs.push_back(run_kind == 1 ? e | inverted : e);
             run.clear();
         };
-        auto put = [&](const std::string& ch, int kind) {
-            if (kind != run_kind) {
+        auto put = [&](const std::string& ch, int kind, Color col) {
+            if (kind != run_kind || !(col == run_color)) {
                 flush();
                 run_kind = kind;
+                run_color = col;
             }
             run += ch;
         };
         for (int x = 0; x < width; x++) {
             const int cur = levels[static_cast<size_t>(x)];
             if (symbols == Symbols::Bars) {
+                // An area: each column in the colour of its value, its top bright, the rest darker
                 const int k = cur < 0 ? 0 : std::clamp(cur - level * 8, 0, 8);
-                if (k == 0) put(base && level == 0 ? (invert ? "▔" : "▁") : " ", base && level == 0 ? 2 : 0);
-                else if (!invert || k == 8) put(eighths[k], 0);
-                else put(eighths[8 - k], 1);   // from the top: the rest of the character, inverted
+                const bool edge = k > 0 && cur <= (level + 1) * 8;
+                const Color col = g.at(v[static_cast<size_t>(x)]);
+                if (k == 0) put(base && level == 0 ? (invert ? "▔" : "▁") : " ", base && level == 0 ? 2 : 0, c);
+                else if (!invert || k == 8) put(eighths[k], 0, edge ? col : areaFill(col, 0.55));
+                else put(eighths[8 - k], 1, col);   // from the top: the rest of the character, inverted
                 continue;
             }
             const int prev = x > 0 && levels[static_cast<size_t>(x - 1)] >= 0 ? levels[static_cast<size_t>(x - 1)] : cur;
             if (cur < 0) {
-                put(base && level == 0 ? detail::glyph(symbols, !invert, 1, 1) : " ", base && level == 0 ? 2 : 0);
+                put(base && level == 0 ? detail::glyph(symbols, !invert, 1, 1) : " ", base && level == 0 ? 2 : 0, c);
                 continue;
             }
             const int l = std::clamp(prev - level * 4, 0, 4), rr = std::clamp(cur - level * 4, 0, 4);
-            if (base && level == 0 && l == 0 && rr == 0) put(detail::glyph(symbols, !invert, 1, 1), 2);
-            else put(detail::glyph(symbols, !invert, l, rr), 0);
+            if (base && level == 0 && l == 0 && rr == 0) put(detail::glyph(symbols, !invert, 1, 1), 2, c);
+            else put(detail::glyph(symbols, !invert, l, rr), 0, c);
         }
         flush();
         rows.push_back(hbox(std::move(runs)));
@@ -191,9 +204,9 @@ inline Element meter(double ratio, int width, const Gradient& g) {
 // ---------------------------------------------------------------- a task manager's chart
 
 struct Line {
-    std::vector<double> values;   // 0..1, two per column (the canvas' dots), -1: no reading
+    std::vector<double> values;   // 0..1, two per column, -1: no reading
     Color color;
-    bool fill = true;             // the area under it, tinted
+    bool fill = true;             // only the first line's counts: an area under it
 };
 
 /* Lines over a grid: `y_label(f)` names the height f (0..1) on the left, `x_label(columns from the right)` the
@@ -212,60 +225,126 @@ inline int lineColumns(int width, int height, const std::function<std::string(do
     return std::max(4, width - static_cast<int>(detail::labelWidth(std::max(2, height - 1), y_label)) - 1);
 }
 
+/* - The first line, when `fill`: a solid area, to an eighth of a row, its top cell in the line's colour
+   - The others: lines of box characters, a row each, the first ones over the later ones; over the area they keep its
+     colour behind them
+   - The grid: plain faint lines (─ │ ┼) where nothing is drawn
+*/
 inline Element lineChart(const std::vector<Line>& lines, int width, int height, const std::function<std::string(double)>& y_label,
                          const std::function<std::string(int)>& x_label, int x_step = 16) {
+    static const char* eighths[9] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
     const int rows = std::max(2, height - 1);
     const int grid_rows = detail::gridRows(rows);
     const size_t label_w = detail::labelWidth(rows, y_label);
     const int cols = lineColumns(width, height, y_label);
-    const int dots_w = cols * 2, dots_h = rows * 4;
+    x_step = std::max(1, x_step);
 
-    // The rows of the grid lines, from the top
     std::vector<int> grid_at;
-    for (int k = 0; k <= grid_rows; k++) grid_at.push_back(static_cast<int>(std::lround((rows - 1) * double(k) / grid_rows)));
+    std::vector<bool> grid_row(static_cast<size_t>(rows), false);
+    for (int k = 0; k <= grid_rows; k++) {
+        grid_at.push_back(static_cast<int>(std::lround((rows - 1) * double(k) / grid_rows)));
+        grid_row[static_cast<size_t>(grid_at.back())] = true;
+    }
 
-    Element plot = canvas(dots_w, dots_h, [lines, rows, cols, dots_w, dots_h, grid_at, x_step](Canvas& cv) {
-        const auto dim_line = [](Cell& c) {
-            c.foreground_color = Color::RGB(0x34, 0x34, 0x3a);
+    // The area: a height in eighths of a row for each column (the higher of its two values)
+    const bool area = !lines.empty() && lines[0].fill;
+    std::vector<int> level(static_cast<size_t>(cols), -1);
+    if (area) {
+        for (int c = 0; c < cols; c++) {
+            double v = -1;
+            for (int side = 0; side < 2; side++) {
+                const size_t i = static_cast<size_t>(c * 2 + side);
+                if (i < lines[0].values.size()) v = std::max(v, lines[0].values[i]);
+            }
+            if (v >= 0) level[static_cast<size_t>(c)] = std::max(v > 0.005 ? 1 : 0, static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * rows * 8)));
+        }
+    }
+
+    // The lines: one row per cell, drawn with box lines (─ ╭ ╮ ╰ ╯ │); a cell keeps the first line that went through it
+    std::vector<std::string> glyphs(static_cast<size_t>(rows * cols));
+    std::vector<int> owner(static_cast<size_t>(rows * cols), -1);
+    const auto put_line = [&](int c, int row_from_bottom, const char* g, int who) {
+        if (c < 0 || c >= cols || row_from_bottom < 0 || row_from_bottom >= rows) return;
+        const size_t cell = static_cast<size_t>((rows - 1 - row_from_bottom) * cols + c);
+        if (owner[cell] >= 0 && owner[cell] < who) return;
+        owner[cell] = who;
+        glyphs[cell] = g;
+    };
+    for (int who = static_cast<int>(lines.size()) - 1; who >= (area ? 1 : 0); who--) {
+        const auto& v = lines[static_cast<size_t>(who)].values;
+        int prev = -1;
+        for (int c = 0; c < cols; c++) {
+            double x = -1;
+            for (int side = 0; side < 2; side++) {
+                const size_t i = static_cast<size_t>(c * 2 + side);
+                if (i < v.size() && v[i] >= 0) x = x < 0 ? v[i] : (x + v[i]) / 2;
+            }
+            if (x < 0) {
+                prev = -1;
+                continue;
+            }
+            const int y = static_cast<int>(std::lround(std::clamp(x, 0.0, 1.0) * (rows - 1)));
+            if (prev < 0 || prev == y) {
+                put_line(c, y, "─", who);
+            } else if (y > prev) {   // up: from the left at prev, to the right at y
+                put_line(c, prev, "╯", who);
+                for (int k = prev + 1; k < y; k++) put_line(c, k, "│", who);
+                put_line(c, y, "╭", who);
+            } else {                 // down
+                put_line(c, prev, "╮", who);
+                for (int k = y + 1; k < prev; k++) put_line(c, k, "│", who);
+                put_line(c, y, "╰", who);
+            }
+            prev = y;
+        }
+    }
+
+    Elements out_rows;
+    for (int r = 0; r < rows; r++) {
+        const int lv = rows - 1 - r;   // rows under this one
+        const Color fill = area ? areaFill(lines[0].color, 0.55) : Color();
+        Elements runs;
+        std::string run;
+        Color run_fg, run_bg;
+        bool run_has_bg = false, run_bold = false, started = false;
+        const auto flush = [&] {
+            if (run.empty()) return;
+            Element e = text(run) | color(run_fg);
+            if (run_has_bg) e = e | bgcolor(run_bg);
+            if (run_bold) e = e | bold;
+            runs.push_back(e);
+            run.clear();
         };
-        // Grid: dotted rows and columns, under everything
-        for (int r : grid_at)
-            for (int x = 0; x < dots_w; x += 2) cv.DrawPoint(x, r * 4 + (r == rows - 1 ? 3 : 0), true, dim_line);
-        for (int c = cols - 1; c >= 0; c -= x_step)
-            for (int y = 0; y < dots_h; y += 2) cv.DrawPoint(c * 2 + 1, y, true, dim_line);
-
-        const auto dotY = [dots_h](double v) { return dots_h - 1 - static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * (dots_h - 1))); };
-        // Tinted areas, then the lines over them
-        for (const auto& line : lines) {
-            if (!line.fill) continue;
-            const Color tint = Color::Interpolate(0.2f, Color::RGB(0x14, 0x16, 0x1a), line.color);
-            for (int c = 0; c < cols; c++) {
-                int lowest = -1;
-                for (int side = 0; side < 2; side++) {
-                    const size_t i = static_cast<size_t>(c * 2 + side);
-                    if (i < line.values.size() && line.values[i] >= 0) lowest = std::max(lowest, dotY(line.values[i]));
-                }
-                if (lowest < 0) continue;
-                for (int r = lowest / 4 + (lowest % 4 == 3 ? 1 : 0); r < rows; r++)
-                    cv.Style(c * 2, r * 4, [tint](Cell& cell) { cell.background_color = tint; });
+        const auto put = [&](const std::string& ch, Color fg, bool has_bg, Color bg, bool is_bold) {
+            if (!started || !(fg == run_fg) || has_bg != run_has_bg || (has_bg && !(bg == run_bg)) || is_bold != run_bold) {
+                flush();
+                run_fg = fg;
+                run_bg = bg;
+                run_has_bg = has_bg;
+                run_bold = is_bold;
+                started = true;
+            }
+            run += ch;
+        };
+        for (int c = 0; c < cols; c++) {
+            const size_t cell = static_cast<size_t>(r * cols + c);
+            const int lvl = level[static_cast<size_t>(c)];
+            const int k = lvl < 0 ? 0 : std::clamp(lvl - lv * 8, 0, 8);
+            const bool edge = k > 0 && lvl <= (lv + 1) * 8;
+            if (owner[cell] >= 0) {
+                const Color ink = lines[static_cast<size_t>(owner[cell])].color;
+                put(glyphs[cell], ink, k == 8 && !edge, fill, true);
+            } else if (k > 0) {
+                put(eighths[k], edge ? lines[0].color : fill, false, Color(), false);
+            } else {
+                const bool gr = grid_row[static_cast<size_t>(r)], gc = (cols - 1 - c) % x_step == 0;
+                put(gr && gc ? "┼" : gr ? "─" : gc ? "│" : " ", gridColor(), false, Color(), false);
             }
         }
-        for (const auto& line : lines) {
-            const Color col = line.color;
-            const auto ink = [col](Cell& cell) {
-                cell.foreground_color = col;
-                cell.bold = true;
-            };
-            for (size_t i = 0; i < line.values.size() && static_cast<int>(i) < dots_w; i++) {
-                if (line.values[i] < 0) continue;
-                const int x = static_cast<int>(i), y = dotY(line.values[i]);
-                // Two dots thick: one under the other, the line reads as a line and not as dots
-                const int prev = i > 0 && line.values[i - 1] >= 0 ? dotY(line.values[i - 1]) : y;
-                cv.DrawPointLine(x - (i > 0 ? 1 : 0), prev, x, y, ink);
-                cv.DrawPointLine(x - (i > 0 ? 1 : 0), std::min(dots_h - 1, prev + 1), x, std::min(dots_h - 1, y + 1), ink);
-            }
-        }
-    });
+        flush();
+        out_rows.push_back(hbox(std::move(runs)));
+    }
+    Element plot = vbox(std::move(out_rows));
 
     // The scale on the left, at the grid's rows
     Elements left;
@@ -276,7 +355,6 @@ inline Element lineChart(const std::vector<Line>& lines, int width, int height, 
         left.push_back(text(util::padLeft(label, label_w) + " ") | color(graphText()));
     }
     // The time under it, at the grid's columns (the last one is "now")
-    std::string under(static_cast<size_t>(cols), ' ');
     std::vector<std::pair<int, std::string>> ticks;
     for (int c = cols - 1; c >= 0; c -= x_step) ticks.push_back({c, x_label(cols - 1 - c)});
     Elements bottom = {text(std::string(label_w + 1, ' '))};

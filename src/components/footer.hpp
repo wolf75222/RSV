@@ -28,7 +28,7 @@ inline Element footer(int width, const std::string& message, bool message_is_err
     static const std::vector<std::pair<std::string, std::string>> keys = {
         {"?", "help"},    {"q", "quit"},       {"l", "log"},     {"p", "cluster"}, {"c", "cancel"},   {"/", "filter"},
         {"a", "history"}, {"o", "project"},    {"b", "script"},  {"Space", "mark"}, {"t", "start time"}, {"u", "limits"},
-        {"d", "details"}, {"n", "GPUs"},       {"m", "live"},    {"s", "sort"},    {"y", "copy id"},  {"r", "refresh"}};
+        {"d", "details"}, {"n", "GPUs"},       {"m", "live"},    {"i", "model server"}, {"s", "sort"},    {"y", "copy id"},  {"r", "refresh"}};
     Elements hints = {text(" ")};
     int used = 1;
     for (const auto& [k, l] : keys) {
@@ -69,6 +69,7 @@ inline Element helpView(int max_width, int max_height, int refresh_seconds, int&
         row("d", "everything scontrol says about it"),
         row("n", "its GPUs in depth: processes, SM activity, clocks, links"),
         row("m", "live: overview (1) or performance (2), CPUs, memory, disk, GPUs"),
+        row("i", "the server of models it runs (vLLM, SGLang...): tokens, latency, cache"),
         row("c", "cancel it, or a whole array (asks first)"),
         row("H", "hold or release it (ROMEO refuses both to users)"),
         row("y  Y", "copy its id, or its output path"),

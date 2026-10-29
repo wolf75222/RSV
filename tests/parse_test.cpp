@@ -9,6 +9,7 @@
 
 #include "api/arrays.hpp"
 #include "api/cluster.hpp"
+#include "api/inference.hpp"
 #include "api/slurmjobs.hpp"
 #include "api/usage.hpp"
 #include "components/cluster_view.hpp"
@@ -789,7 +790,7 @@ static void monitor() {
     CHECK_EQ(ui::chart::niceMax(1), 1.0);
     CHECK_EQ(ui::chart::bytes(1536), std::string("1.5 KB"));
 
-    // A task manager's chart: the line, the area under it tinted, its scale on the left
+    // A chart: the first line a solid area, its top in the line's colour, its scale on the left; the others thin lines
     {
         auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(10), ftxui::Dimension::Fixed(3));
         ftxui::Render(screen, ui::chart::lineChart({{{0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, ui::theme::cyan(), true}}, 10, 3,
@@ -797,8 +798,16 @@ static void monitor() {
                                                    [](int) { return std::string(""); }, 100));
         CHECK_EQ(screen.PixelAt(0, 0).character, std::string("1"));      // "100" at the top
         CHECK_EQ(screen.PixelAt(2, 1).character, std::string("0"));      // "0" at the bottom
-        CHECK(screen.PixelAt(6, 1).background_color == screen.PixelAt(8, 1).background_color);   // under the line: tinted
-        CHECK(!(screen.PixelAt(8, 1).background_color == ftxui::Color()));
+        CHECK_EQ(screen.PixelAt(8, 0).character, std::string("█"));   // full: the top row is its edge
+        CHECK(screen.PixelAt(8, 0).foreground_color == ui::theme::cyan());
+        CHECK_EQ(screen.PixelAt(8, 1).character, std::string("█"));   // under it: darker
+        CHECK(!(screen.PixelAt(8, 1).foreground_color == ui::theme::cyan()));
+        CHECK_EQ(screen.PixelAt(4, 0).character, std::string("─"));   // nothing there: the grid
+        ftxui::Render(screen, ui::chart::lineChart({{std::vector<double>(12, 0.0), ui::theme::cyan(), false}, {std::vector<double>(12, 1.0), ui::theme::red(), false}}, 10, 3,
+                                                   [](double f) { return std::to_string(static_cast<int>(f * 100)); },
+                                                   [](int) { return std::string(""); }, 100));
+        CHECK(screen.PixelAt(8, 0).bold);                             // a line at the top, red: not the grid
+        CHECK(screen.PixelAt(8, 0).foreground_color == ui::theme::red());
     }
 
     // sstat, step by step: the CPU time between readings at least 6 s apart, memory and bytes summed
@@ -996,6 +1005,154 @@ static void gpu_view() {
     CHECK(m.wantFacts(200));   // never read
 }
 
+// A server of models: its metrics (recorded from vLLM 0.31 on ROMEO, and SGLang's names), found from its log
+static void inference() {
+    const std::string vllm = R"(# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 1.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8",reason="capacity"} 0.0
+vllm:kv_cache_usage_perc{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 0.012318362991557641
+vllm:prefix_cache_queries_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 7.6972003e+07
+vllm:prefix_cache_hits_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 7.556096e+07
+vllm:num_preemptions_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 0.0
+vllm:prompt_tokens_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 7.6972003e+07
+vllm:generation_tokens_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 621960.0
+vllm:request_success_total{engine="0",finished_reason="stop",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 677.0
+vllm:request_success_total{engine="0",finished_reason="abort",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 3.0
+vllm:spec_decode_num_drafts_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 280478.0
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 560956.0
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8"} 340562.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8",position="0"} 200000.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="deepseek-v4.1-flash-1017-1m-tp8",position="1"} 140562.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.1",model_name="m"} 100.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.5",model_name="m"} 500.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="1.0",model_name="m"} 600.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="+Inf",model_name="m"} 679.0
+vllm:time_to_first_token_seconds_count{engine="0",model_name="m"} 679.0
+vllm:time_to_first_token_seconds_sum{engine="0",model_name="m"} 392.5244324207306
+vllm:cache_config_info{block_size="64",cache_dtype="auto",note="a \"quoted\", {braced} value"} 1.0
+)";
+    const auto m = api::parsePrometheus(vllm);
+    CHECK_EQ(api::engineOfMetrics(m), api::Engine::Vllm);
+    CHECK_EQ(m.samples.back().label("note"), std::string("a \"quoted\", {braced} value"));
+    const auto r = api::readMetrics(m);
+    CHECK_EQ(r.model, std::string("deepseek-v4.1-flash-1017-1m-tp8"));
+    CHECK_EQ(r.running, 1.0);
+    CHECK(std::abs(r.kv_usage - 0.0123) < 1e-3);
+    CHECK_EQ(r.generation_tokens, 621960.0);
+    CHECK_EQ(r.requests_done, 680.0);
+    CHECK_EQ(r.requests_failed, 3.0);
+    CHECK_EQ(r.accepted_per_position.size(), 2u);
+    CHECK_EQ(r.ttft.count, 679.0);
+    CHECK_EQ(r.ttft.buckets.size(), 4u);
+    // p50: rank 339.5 in (0.1, 0.5], 239.5 of its 400
+    CHECK(std::abs(r.ttft.quantile(0.5) - (0.1 + 0.4 * 239.5 / 400)) < 1e-9);
+    CHECK_EQ(r.ttft.quantile(0.99), 1.0);   // in +Inf: the last bound
+    api::Histogram older = r.ttft;
+    for (auto& b : older.buckets) b.second -= 50;
+    older.count -= 50;
+    older.sum -= 10;
+    CHECK_EQ(r.ttft.since(older).count, 50.0);
+    CHECK_EQ(r.ttft.since(older).buckets[0].second, 50.0);
+    // A bucket counted while the reading was taken: never fewer than the one under it
+    api::Histogram odd;
+    odd.buckets = {{0.1, 10}, {0.5, 9}, {INFINITY, 10}};
+    odd.count = 10;
+    CHECK(odd.quantile(0.5) <= 0.1);
+    // All in the first bucket: its mean bounds the estimate, not the bucket's 0.3 s
+    api::Histogram queue;
+    queue.buckets = {{0.3, 10}, {INFINITY, 10}};
+    queue.count = 10;
+    queue.sum = 0.0003;
+    CHECK(queue.quantile(0.5) < 0.0001);
+
+    // SGLang's names, Ollama's models
+    const auto sg = api::readMetrics(api::parsePrometheus(
+        "sglang:num_running_reqs{model_name=\"qwen\"} 4\nsglang:num_queue_reqs{model_name=\"qwen\"} 2\nsglang:token_usage{model_name=\"qwen\"} 0.4\n"
+        "sglang:cache_hit_rate{model_name=\"qwen\"} 0.7\nsglang:generation_tokens_total{model_name=\"qwen\"} 1000\n"));
+    CHECK_EQ(sg.engine, api::Engine::Sglang);
+    CHECK_EQ(sg.waiting, 2.0);
+    CHECK_EQ(sg.prefix_hit_rate, 0.7);
+    const auto ol = api::readOllama(R"({"models":[{"name":"llama3:8b","model":"llama3:8b","size":5137025024,"size_vram":5137025024}]})");
+    CHECK_EQ(ol.loaded.size(), 1u);
+    CHECK_EQ(ol.loaded[0].first, std::string("llama3:8b"));
+    CHECK_EQ(ol.loaded[0].second, 5137025024.0);
+
+    // Where it listens, from its log: the server's own line, not huggingface's address nor a word like "report"
+    const std::vector<std::string> nodes = {"romeo-a033", "romeo-a034"};
+    api::ServerHint hint;
+    api::scanForServer("(APIServer pid=3172406) INFO 10-29 00:18:58 [launcher.py:69] Route: /metrics, Methods: GET\n"
+                       "Downloading https://huggingface.co:443/unsloth/model\n"
+                       "the report 4242 says\n"
+                       "(APIServer pid=3172406) INFO:     Uvicorn running on http://0.0.0.0:31361 (Press CTRL+C to quit)\n"
+                       "vllm serve model --port 31361\n",
+                       nodes, hint);
+    CHECK_EQ(hint.engine, api::Engine::Vllm);
+    CHECK_EQ(hint.places.size(), 1u);
+    CHECK_EQ(hint.places[0].second, 31361);
+    const auto where = api::candidates(hint, nodes, "");
+    CHECK_EQ(where.size(), 4u);   // 31361 then vLLM's 8000, on each node
+    CHECK_EQ(where[0].url(), std::string("http://romeo-a033:31361/metrics"));
+    CHECK_EQ(where[2].port, 8000);
+    const auto by_hand = api::candidates(api::ServerHint{}, nodes, "http://{node}:9000/metrics");
+    CHECK_EQ(by_hand.size(), 2u);
+    CHECK_EQ(by_hand[1].url(), std::string("http://romeo-a034:9000/metrics"));
+    api::ServerHint none;
+    api::scanForServer("step 100 loss 2.1\nhttp://example.org:8080/data\n", nodes, none);
+    CHECK_EQ(none.engine, api::Engine::None);
+    CHECK(none.places.empty());
+
+    // Readings in time: rates, the last 30 s, what it says
+    ui::InferenceServer srv;
+    api::InferenceReading a = r, b = r;
+    b.generation_tokens += 3000;   // 300 tokens/s over 10 s
+    b.prompt_tokens += 20000;
+    b.requests_done += 10;
+    b.preemptions = 2;
+    b.ttft = r.ttft;
+    b.ttft.buckets[0].second += 10;
+    for (size_t i = 1; i < b.ttft.buckets.size(); i++) b.ttft.buckets[i].second += 10;
+    b.ttft.count += 10;
+    b.ttft.sum += 0.5;
+    srv.add(a, 1000);
+    srv.add(b, 1010);
+    CHECK_EQ(srv.generation.last(), 300.0);
+    CHECK_EQ(srv.requests.last(), 60.0);   // per minute
+    CHECK(srv.ttft50.last() > 0 && srv.ttft50.last() <= 0.1);   // the 10 new ones, all under 0.1 s
+    CHECK_EQ(srv.preempted_at, 1010.0);
+    const auto win = srv.window(1010, 60);
+    CHECK_EQ(win.done, 10.0);
+    CHECK_EQ(win.ttft.count, 10.0);
+    ui::InferenceView view;
+    bool preempted = false;
+    for (const auto& [msg, c] : view.warnings(srv, 1011, 0.9))
+        if (msg.find("preempted") != std::string::npos) preempted = true;
+    CHECK(preempted);
+
+    // Found: the tab is there; ↑↓ choose among several servers; i closes it
+    ui::MonitorView mv;
+    CHECK_EQ(mv.views().size(), 2u);
+    api::Discovery d;
+    d.servers = {where[0], where[1]};
+    d.first = {r, r};
+    d.hint = hint;
+    mv.inference.setDiscovery(d, 1000);
+    CHECK_EQ(mv.views().size(), 3u);
+    mv.view = 3;
+    bool close = false;
+    mv.onEvent(ftxui::Event::ArrowDown, close);
+    CHECK_EQ(mv.inference.selected, 1);
+    mv.onEvent(ftxui::Event::Character('i'), close);
+    CHECK(close);
+    {
+        auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(140), ftxui::Dimension::Fixed(40));
+        ftxui::Render(screen, mv.render(140, 40));
+        CHECK(screen.ToString().find("vLLM") != std::string::npos);
+        CHECK(screen.ToString().find("tokens generated per second") != std::string::npos);
+    }
+}
+
 int main() {
     durations();
     widths();
@@ -1015,6 +1172,7 @@ int main() {
     arrays();
     monitor();
     gpu_view();
+    inference();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;
