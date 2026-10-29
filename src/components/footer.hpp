@@ -28,7 +28,7 @@ inline Element footer(int width, const std::string& message, bool message_is_err
     static const std::vector<std::pair<std::string, std::string>> keys = {
         {"?", "help"},    {"q", "quit"},       {"l", "log"},     {"p", "cluster"}, {"c", "cancel"},   {"/", "filter"},
         {"a", "history"}, {"o", "project"},    {"b", "script"},  {"Space", "mark"}, {"t", "start time"}, {"u", "limits"},
-        {"d", "details"}, {"n", "GPUs"},       {"s", "sort"},    {"y", "copy id"},  {"r", "refresh"}};
+        {"d", "details"}, {"n", "GPUs"},       {"m", "live"},    {"s", "sort"},    {"y", "copy id"},  {"r", "refresh"}};
     Elements hints = {text(" ")};
     int used = 1;
     for (const auto& [k, l] : keys) {
@@ -68,6 +68,7 @@ inline Element helpView(int max_width, int max_height, int refresh_seconds, int&
         row("b", "the script it was submitted with"),
         row("d", "everything scontrol says about it"),
         row("n", "its GPUs now: use and memory"),
+        row("m", "live, like btop: curves of its CPUs, memory and GPUs"),
         row("c", "cancel it, or a whole array (asks first)"),
         row("H", "hold or release it (ROMEO refuses both to users)"),
         row("y  Y", "copy its id, or its output path"),

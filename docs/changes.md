@@ -1,3 +1,9 @@
+# Changes in RSV 2.2
+
+**New**
+
+- `m`: a running job live, like btop. Its CPUs, memory, GPU memory and GPUs in boxes, each with a curve like a task manager's (a line over a tinted area, a grid, its scale and time span), and each GPU with its own little curve, use, temperature and power. `+` `-` zoom from the last minutes to the last hour. `sstat` every 2 s on a worker of its own (a slow `squeue` leaves no hole in the curves); the GPUs from one `srun --overlap` step running `nvidia-smi --loop-ms` while the view is open, stopped when it closes.
+
 # Changes in RSV 2.1
 
 **New**

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -75,35 +76,27 @@ inline bool waitFor(pid_t pid, int& status, int ms) {
     }
 }
 
-}  // namespace detail
-
-/* Runs a program (found in PATH) and returns its output
-- No shell: the arguments are passed as they are, so a job name or a path can't run anything
-- stdin is /dev/null: a command that prompts (sacctmgr, scancel -i) can't take over the terminal of the UI
-- Stopped after `timeout_seconds` (TERM, then KILL 2 s later), with all its children: a slurmctld that
-  doesn't answer can't hang RSV. Also stopped at once when stopping() is set (the user quits).
+/* Starts a program with stdout and stderr on two pipes, in its own process group (killed with its children)
+- No shell, stdin is /dev/null, nothing else from RSV is inherited, the signals RSV handles are back to default
+- Returns the pid, or -1 with `error` set; out[0] and err[0] are the ends to read
 */
-inline RunResult run(const std::vector<std::string>& args, int timeout_seconds = 15) {
-    RunResult result;
-    if (args.empty()) return result;
-
-    int out_pipe[2], err_pipe[2];
-    if (!detail::makePipe(out_pipe)) {
-        result.err = std::strerror(errno);
-        return result;
+inline pid_t spawn(const std::vector<std::string>& args, int out[2], int err[2], std::string& error) {
+    if (!makePipe(out)) {
+        error = std::strerror(errno);
+        return -1;
     }
-    if (!detail::makePipe(err_pipe)) {
-        result.err = std::strerror(errno);
-        close(out_pipe[0]);
-        close(out_pipe[1]);
-        return result;
+    if (!makePipe(err)) {
+        error = std::strerror(errno);
+        close(out[0]);
+        close(out[1]);
+        return -1;
     }
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, err_pipe[1], STDERR_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
     posix_spawn_file_actions_addclosefrom_np(&actions, 3);   // nothing else from RSV (the terminal) is inherited
 #endif
@@ -132,15 +125,49 @@ inline RunResult run(const std::vector<std::string>& args, int timeout_seconds =
     const int rc = posix_spawnp(&pid, argv[0], &actions, &attr, argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
-    close(out_pipe[1]);
-    close(err_pipe[1]);
+    close(out[1]);
+    close(err[1]);
 
     if (rc != 0) {
-        close(out_pipe[0]);
-        close(err_pipe[0]);
-        result.err = rc == ENOENT ? "command not found" : std::strerror(rc);
-        return result;
+        close(out[0]);
+        close(err[0]);
+        error = rc == ENOENT ? "command not found" : std::strerror(rc);
+        return -1;
     }
+    return pid;
+}
+
+// TERM to its whole group, KILL `grace_ms` later if it is still there; reaps it and returns its status
+inline int terminate(pid_t pid, int grace_ms) {
+    int status = 0;
+    kill(-pid, SIGTERM);
+    if (!waitFor(pid, status, grace_ms)) {
+        kill(-pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR) {
+                status = 255 << 8;
+                break;
+            }
+        }
+    }
+    return status;
+}
+
+}  // namespace detail
+
+/* Runs a program (found in PATH) and returns its output
+- No shell: the arguments are passed as they are, so a job name or a path can't run anything
+- stdin is /dev/null: a command that prompts (sacctmgr, scancel -i) can't take over the terminal of the UI
+- Stopped after `timeout_seconds` (TERM, then KILL 2 s later), with all its children: a slurmctld that
+  doesn't answer can't hang RSV. Also stopped at once when stopping() is set (the user quits).
+*/
+inline RunResult run(const std::vector<std::string>& args, int timeout_seconds = 15) {
+    RunResult result;
+    if (args.empty()) return result;
+
+    int out_pipe[2], err_pipe[2];
+    pid_t pid = detail::spawn(args, out_pipe, err_pipe, result.err);
+    if (pid < 0) return result;
     result.started = true;
 
     using clock = std::chrono::steady_clock;
@@ -182,22 +209,93 @@ inline RunResult run(const std::vector<std::string>& args, int timeout_seconds =
         ended = detail::waitFor(pid, status, static_cast<int>(std::max<long long>(0, left)));
         if (!ended) result.timed_out = true;
     }
-    if (!ended) {
-        kill(-pid, SIGTERM);
-        if (!detail::waitFor(pid, status, stopping() ? 200 : 2000)) {
-            kill(-pid, SIGKILL);
-            while (waitpid(pid, &status, 0) < 0) {
-                if (errno != EINTR) {
-                    status = 255 << 8;
-                    break;
-                }
-            }
-        }
-    }
+    if (!ended) status = detail::terminate(pid, stopping() ? 200 : 2000);
 
     if (WIFEXITED(status)) result.status = WEXITSTATUS(status);
     else if (WIFSIGNALED(status)) result.status = 128 + WTERMSIG(status);
     return result;
 }
+
+/* A program that keeps talking (nvidia-smi --loop through srun): each line of its output as it comes
+- Read on its own thread: `on_line` and `on_end` run there, never on the UI thread (they post their result)
+- on_end gets what went wrong ("" when it was stopped, or ended well)
+- stop() (or the destructor) ends it with all its children: the Slurm step it holds ends with it
+*/
+class LineStream {
+public:
+    LineStream() = default;
+    LineStream(const LineStream&) = delete;
+    LineStream& operator=(const LineStream&) = delete;
+    ~LineStream() { stop(); }
+
+    bool running() const { return thread_.joinable() && !done_; }
+
+    void start(std::vector<std::string> args, std::function<void(const std::string&)> on_line,
+               std::function<void(const std::string&)> on_end) {
+        stop();
+        stop_ = false;
+        done_ = false;
+        thread_ = std::thread([this, args = std::move(args), on_line = std::move(on_line), on_end = std::move(on_end)] {
+            follow(args, on_line, on_end);
+            done_ = true;
+        });
+    }
+
+    void stop() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void follow(const std::vector<std::string>& args, const std::function<void(const std::string&)>& on_line,
+              const std::function<void(const std::string&)>& on_end) {
+        int out[2], err[2];
+        std::string error;
+        const pid_t pid = detail::spawn(args, out, err, error);
+        if (pid < 0) {
+            on_end(args[0] + ": " + error);
+            return;
+        }
+        pollfd fds[2] = {{out[0], POLLIN, 0}, {err[0], POLLIN, 0}};
+        std::string pending, errors;
+        char buffer[8192];
+        while ((fds[0].fd >= 0 || fds[1].fd >= 0) && !stop_ && !stopping()) {
+            const int n = poll(fds, 2, 100);
+            if (n < 0 && errno != EINTR) break;
+            for (int i = 0; i < 2 && n > 0; i++) {
+                if (fds[i].fd < 0 || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                const ssize_t got = read(fds[i].fd, buffer, sizeof buffer);
+                if (got <= 0 && (got == 0 || (errno != EINTR && errno != EAGAIN))) {
+                    close(fds[i].fd);
+                    fds[i].fd = -1;
+                    continue;
+                }
+                if (got <= 0) continue;
+                if (i == 1) {
+                    if (errors.size() < 4096) errors.append(buffer, static_cast<size_t>(got));
+                    continue;
+                }
+                pending.append(buffer, static_cast<size_t>(got));
+                for (size_t nl; (nl = pending.find('\n')) != std::string::npos; pending.erase(0, nl + 1))
+                    on_line(pending.substr(0, nl));
+            }
+        }
+        for (auto& f : fds)
+            if (f.fd >= 0) close(f.fd);
+        const bool asked = stop_ || stopping();
+        int status = 0;
+        if (asked || !detail::waitFor(pid, status, 2000)) status = detail::terminate(pid, stopping() ? 200 : asked ? 1000 : 2000);
+        if (asked) return on_end("");
+        RunResult r;
+        r.started = true;
+        r.err = errors;
+        r.status = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        const std::string e = r.error(args[0]);
+        on_end(e.empty() ? args[0] + ": ended" : e);
+    }
+
+    std::atomic<bool> stop_{false}, done_{false};
+    std::thread thread_;
+};
 
 }  // namespace api

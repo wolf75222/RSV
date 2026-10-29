@@ -17,6 +17,7 @@ scancel never cancels anything real: it marks the job as cancelled in the state 
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -1014,9 +1015,15 @@ def sstat():
         fail("sstat: error: no steps running for job %s" % job_id)
     j = match[0]
     used = NOW - j["start"]
-    eff = 0.42 if j["name"].startswith("train") else 0.91
-    cpu = used * j["num_cpus"] * eff
-    mem = j["mem_per_node"] * j["num_nodes"] * 0.6
+    # A busy share that moves (two waves), so the live view (m) draws curves: its CPU time is the integral
+    train = j["name"].startswith("train")
+    base, waves = (0.42, ((0.25, 90), (0.05, 23))) if train else (0.91, ((0.05, 120), (0.03, 17)))
+    cpu = used * base
+    for amp, period in waves:
+        w = 2 * math.pi / period
+        cpu += amp / w * (math.cos(w * j["start"]) - math.cos(w * NOW))
+    cpu *= j["num_cpus"]
+    mem = j["mem_per_node"] * j["num_nodes"] * (0.45 + 0.25 * ((NOW % 300) / 300.0) if train else 0.6 + 0.04 * math.sin(NOW / 40.0))
     print("%s.batch|1|%dM|cpu=%s,energy=0,fs/disk=123456,mem=%dM,pages=0,vmem=%dM" % (
         job_id, mem / 1024, duration(cpu * 0.1), mem * 0.1, mem * 0.2))
     print("%s.0|%d|%dM|cpu=%s,energy=0,fs/disk=654321,mem=%dM,pages=0,vmem=%dM" % (
@@ -1063,10 +1070,29 @@ def srun():
         fail("srun: error: Unable to create step for job %s: Invalid job id specified" % (jid[0] if jid else "?"))
     j = match[0]
     per_node = max(1, j["gpus"] // j["num_nodes"])
-    for task in range(j["num_nodes"]):
-        for g in range(per_node):
-            util = 3 if j["name"].startswith("train") and g == 1 else 92 - g * 3
-            print("%d: %d, NVIDIA GH200 120GB, %d, %d, 97871" % (task, g, util, 70123 - g * 5000))
+    full = "temperature.gpu" in " ".join(ARGS)   # the live view (m) asks for temperature and power too
+    loop = [int(a.split("=", 1)[1]) for a in ARGS if a.startswith("--loop-ms=")]
+
+    def once(now):
+        for task in range(j["num_nodes"]):
+            for g in range(per_node):
+                if j["name"].startswith("train") and g == 1:
+                    util = 3
+                else:   # each GPU its own wave, the job's steps make them dip together now and then
+                    util = 88 - g * 3 + 8 * math.sin(now / 9.0 + g + task) - (35 if int(now / 20) % 4 == 0 else 0)
+                util = max(0, min(100, util))
+                line = "%d: %d, NVIDIA GH200 120GB, %d, %d, 97871" % (task, g, util, 70123 - g * 5000 + 3000 * math.sin(now / 30.0))
+                if full:
+                    line += ", %d, %.2f, 900.00" % (45 + util * 0.3, 90 + util * 5.5)
+                print(line)
+        sys.stdout.flush()
+
+    if not loop:
+        once(NOW)
+        return
+    while True:   # nvidia-smi --loop-ms: until it is killed (the view closes)
+        once(time.time())
+        time.sleep(loop[0] / 1000.0)
 
 
 def sbatch():

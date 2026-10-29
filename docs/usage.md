@@ -58,12 +58,15 @@ Under it, when there is room, the last lines of the job's output.
 | `p` | Cluster | All of ROMEO, read again every 15 s while open, in four tabs: `←` `→` (or `Tab`, `1` to `4`) change tabs everywhere in it. See below. |
 | `t` | Start time | When would a job start? Account, partition, constraint, nodes, cores, GPUs, memory and time: `Enter` asks Slurm (`sbatch --test-only`, nothing is submitted) and shows when and where, or why it can't. |
 | `n` | GPUs | For a running job with GPUs: each GPU's use and memory, from `nvidia-smi` run in the job itself (`srun --overlap`, only when you press `n`). |
+| `m` | Live | A running job as btop shows a machine: `cpu` (the busy share of its CPUs, cores busy, mean and peak), `mem` (in use, asked, the largest task), `gpu mem` and `gpu` (their mean use and power, then each GPU with its own little curve, use, temperature and power), each with a curve like a task manager's since the view was opened. `+` `-` zoom in time (1 to 30 s per dot: from the last minutes to the last hour), `j` `k` scroll the GPUs, `r` reads again. CPUs and memory come from `sstat` every 2 s; the GPUs from one `srun --overlap` step that runs `nvidia-smi --loop-ms=2000` while the view is open and ends with it (one step, not one every few seconds). |
 | `u` | Limits | For each of your accounts: its CPU, GPU and job limits and what your jobs use now (`sacctmgr`, `squeue`), its fairshare and the CPU-hours used (`sshare`), then your disk quotas and your projects' (`mmlsquota`), with a warning when one is over. |
 | `?` | Help | |
 
 `y` copies the job id, `Y` its output path (see [terminals](terminals.md) for how copying works over SSH).
 
 ![The log of a running job, followed](../img/log.png)
+
+![A running job live (m): its CPUs, memory and GPUs](../img/live.png)
 
 ## Cluster tabs
 
@@ -113,6 +116,7 @@ Above the table, what the jobs of the last 7 days used: CPU hours reserved, used
 | Node zoom | `scontrol -d -o show node <node>`, `squeue -w <node>` | on `Enter`, then every refresh |
 | Start time | `sbatch --test-only` | on `Enter` |
 | GPUs | `srun --jobid=<job> --overlap nvidia-smi` | on `n` |
+| Live | `sstat -j <job>`, `srun --jobid=<job> --overlap nvidia-smi --loop-ms=2000` (one step) | every 2 s while open |
 | Limits | `sacctmgr show assoc`, `sshare -U`, `mmlsquota -Y` | when opened |
 | Cancel, hold | `scancel <ids>`, `scontrol hold <ids>`, `scontrol release <ids>` | when confirmed |
 

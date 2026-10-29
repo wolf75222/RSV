@@ -298,6 +298,13 @@ def render_png(cells, path=None, cell_w=9, cell_h=19, font_size=15, scale=1):
             if ch in "░▒▓":
                 d.rectangle([X, Y, X + cell_w - 1, Y + cell_h - 1], fill=mix(b, f, {"░": 0.22, "▒": 0.45, "▓": 0.7}[ch]))
                 continue
+            if 0x2800 < ord(ch[0]) <= 0x28FF:   # braille (the live view's curves): 2 x 4 dots, drawn as squares
+                bits = ord(ch[0]) - 0x2800
+                for bit, (col, dot) in enumerate(((0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3))):
+                    if bits & (1 << bit):
+                        x0, y0 = X + col * cell_w // 2, Y + dot * cell_h // 4
+                        d.rectangle([x0, y0, x0 + cell_w // 2 - 2, y0 + cell_h // 4 - 2], fill=f)
+                continue
             if ch == "■":
                 d.rectangle([X + 1, cy - 3, X + cell_w - 2, cy + 3], fill=f)
                 continue

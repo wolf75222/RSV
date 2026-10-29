@@ -327,26 +327,38 @@ struct GpuUse {
     std::string node, name;
     int index = 0;
     double util = -1, mem_used_mib = 0, mem_total_mib = 0;
+    double temp_c = -1, power_w = -1, power_limit_w = -1;   // only asked by the live monitor (-1: not given)
 };
 
-// "0: 1, NVIDIA GH200 120GB, 97, 70123, 97871" (srun -l: the task number, one task per node, in the node order)
+/* "0: 1, NVIDIA GH200 120GB, 97, 70123, 97871" (srun -l: the task number, one task per node, in the node order)
+- The live monitor asks for 3 more: "..., 97871, 61, 412.33, 900.00" (temperature, power, its limit; "[N/A]" when unknown)
+*/
+inline bool parseNvidiaSmiLine(const std::string& line, const std::vector<std::string>& hosts, GpuUse& g) {
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos) return false;
+    const long task = util::toLong(util::trim(line.substr(0, colon)), -1);
+    const auto f = util::split(line.substr(colon + 1), ',');
+    if (task < 0 || f.size() < 5) return false;
+    g = GpuUse{};
+    g.node = static_cast<size_t>(task) < hosts.size() ? hosts[static_cast<size_t>(task)] : "task " + std::to_string(task);
+    g.index = static_cast<int>(util::toLong(util::trim(f[0])));
+    g.name = util::trim(f[1]);
+    g.util = util::toDouble(util::trim(f[2]), -1);
+    g.mem_used_mib = util::toDouble(util::trim(f[3]));
+    g.mem_total_mib = util::toDouble(util::trim(f[4]));
+    if (f.size() >= 8) {
+        g.temp_c = util::toDouble(util::trim(f[5]), -1);
+        g.power_w = util::toDouble(util::trim(f[6]), -1);
+        g.power_limit_w = util::toDouble(util::trim(f[7]), -1);
+    }
+    return true;
+}
+
 inline std::vector<GpuUse> parseNvidiaSmi(const std::string& out, const std::vector<std::string>& hosts) {
     std::vector<GpuUse> r;
-    for (const auto& line : util::lines(out)) {
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        const long task = util::toLong(util::trim(line.substr(0, colon)), -1);
-        const auto f = util::split(line.substr(colon + 1), ',');
-        if (task < 0 || f.size() < 5) continue;
-        GpuUse g;
-        g.node = static_cast<size_t>(task) < hosts.size() ? hosts[static_cast<size_t>(task)] : "task " + std::to_string(task);
-        g.index = static_cast<int>(util::toLong(util::trim(f[0])));
-        g.name = util::trim(f[1]);
-        g.util = util::toDouble(util::trim(f[2]), -1);
-        g.mem_used_mib = util::toDouble(util::trim(f[3]));
-        g.mem_total_mib = util::toDouble(util::trim(f[4]));
-        r.push_back(g);
-    }
+    GpuUse g;
+    for (const auto& line : util::lines(out))
+        if (parseNvidiaSmiLine(line, hosts, g)) r.push_back(g);
     return r;
 }
 
@@ -370,6 +382,21 @@ inline Fetched<std::vector<GpuUse>> fetchGpus(const std::string& job_id, const s
     r.data = parseNvidiaSmi(res.out, hosts);
     if (r.data.empty()) r.error = res.error("srun").empty() ? "nvidia-smi showed no GPU" : res.error("srun");
     return r;
+}
+
+/* The same step, but it stays: nvidia-smi --loop-ms answers every `interval_ms` until it is stopped (live monitor)
+- One step for as long as the monitor is open, instead of one every few seconds: sacct isn't filled with them
+*/
+inline std::vector<std::string> gpuStreamArgs(const std::string& job_id, size_t nodes, int gpus_per_node, int interval_ms) {
+    std::vector<std::string> args = {"srun", "--jobid=" + job_id, "--overlap", "--nodes=" + std::to_string(nodes),
+                                     "--ntasks-per-node=1", "-l", "--quiet"};
+    if (gpus_per_node > 0) args.push_back("--gres=gpu:" + std::to_string(gpus_per_node));
+    for (const char* a : {"nvidia-smi",
+                          "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+                          "--format=csv,noheader,nounits"})
+        args.push_back(a);
+    args.push_back("--loop-ms=" + std::to_string(interval_ms));
+    return args;
 }
 
 }  // namespace api
