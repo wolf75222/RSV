@@ -140,7 +140,7 @@ struct MonitorView {
     std::map<std::pair<std::string, int>, GpuTrack> gpu_tracks;   // by node, then index
 
     int view = 0;               // 0 overview, 1 performance
-    chart::Symbols symbols = chart::Symbols::Bars;    // the graphs of the first view (g: bars, braille, blocks)
+    chart::Symbols symbols = chart::Symbols::Braille;   // the graphs of the first view (g: braille, bars, blocks)
     int zoom = 1;
     int selected = 0, side_offset = 0, item_count = 1;
     std::function<void()> reload;
@@ -223,8 +223,8 @@ struct MonitorView {
         } else if (e == Event::Character('2')) {
             view = 1;
         } else if (e == Event::Character('g')) {
-            symbols = symbols == chart::Symbols::Bars ? chart::Symbols::Braille
-                      : symbols == chart::Symbols::Braille ? chart::Symbols::Block : chart::Symbols::Bars;
+            symbols = symbols == chart::Symbols::Braille ? chart::Symbols::Bars
+                      : symbols == chart::Symbols::Bars ? chart::Symbols::Block : chart::Symbols::Braille;
         } else if (e == Event::Tab || e == Event::TabReverse) {
             view = 1 - view;
         } else if (e == Event::Character('+') || e == Event::Character('=')) {
@@ -708,7 +708,7 @@ struct MonitorView {
 
         Elements keys = keyHints({{"1 2", "view"}, {"+ -", "zoom"}});
         if (view == 0)
-            keys.push_back(keyHint("g", symbols == chart::Symbols::Bars ? "braille" : symbols == chart::Symbols::Braille ? "blocks" : "bars"));
+            keys.push_back(keyHint("g", symbols == chart::Symbols::Braille ? "bars" : symbols == chart::Symbols::Bars ? "blocks" : "braille"));
         if (view == 1) keys.push_back(keyHint("↑↓", "resource"));
         for (auto& k : keyHints({{"r", "read again"}, {"q", "close"}})) keys.push_back(k);
         const std::string when =

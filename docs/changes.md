@@ -2,7 +2,7 @@
 
 **New**
 
-- `m`: a running job live, in two views. `1` overview: the CPUs' and GPUs' (or memory's) curves with their scale, gauges, each GPU with its little curve and temperature, memory, disk reads and writes, the job's steps. `2` performance, as a task manager's: CPU, memory, disk and each GPU with a chart, its scale and time, and their figures. A small chart module: graphs drawn to an eighth of a character with colour gradients (or braille, or blocks: `g`), sparklines, gradient meters, line charts on FTXUI's canvas. `+` `-` zoom up to the last hour. `sstat` every 2 s on a worker of its own; the GPUs from one `srun --overlap` step running `nvidia-smi --loop-ms` while the view is open, stopped when it closes.
+- `m`: a running job live, in two views. `1` overview: the CPUs' and GPUs' (or memory's) curves with their scale, gauges, each GPU with its little curve and temperature, memory, disk reads and writes, the job's steps. `2` performance, as a task manager's: CPU, memory, disk and each GPU with a chart, its scale and time, and their figures. A small chart module: graphs in braille with colour gradients (or bars to an eighth of a character, or blocks: `g`), sparklines, gradient meters, line charts on FTXUI's canvas. `+` `-` zoom up to the last hour. `sstat` every 2 s on a worker of its own; the GPUs from one `srun --overlap` step running `nvidia-smi --loop-ms` while the view is open, stopped when it closes.
 
 # Changes in RSV 2.1
 
