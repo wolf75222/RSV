@@ -81,8 +81,11 @@ def live_shots(args):
     live_png = shot(3.0, None, 0.2)          # overview: CPUs, GPUs, memory, disk, steps
     for _ in range(3):
         shot(0.8, None, 1.8)                 # the curves move
-    shot(2.0, "v", 1.0)                      # v: braille
+    shot(2.0, "v", 1.0)                      # v: braille, as btop's (two readings a character)
     shot(1.5, "v,v", 1.0)                    # back to areas
+    shot(2.4, "enter", 1.0)                  # the busiest step in depth: its graph, what it runs, its I/O
+    shot(1.6, "j", 1.0)
+    shot(1.0, "esc,k", 0.6)
     perf_png = shot(3.0, "2", 1.0)           # performance: the resources, the one picked
     shot(1.6, "j", 0.8)
     shot(1.6, "j,j,j", 0.8)                  # the GPUs

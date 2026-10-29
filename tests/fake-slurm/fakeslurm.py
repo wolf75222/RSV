@@ -719,7 +719,22 @@ def options(args, with_value):
 
 # ---------------------------------------------------------------- commands
 
+def squeue_steps():
+    """squeue -s -j ID -o %i|%j: the steps of a running job, with what they run"""
+    jid = ARGS[ARGS.index("-j") + 1] if "-j" in ARGS else ""
+    for j in all_jobs():
+        if j["job_id"] != jid or j["state"] != "RUNNING":
+            continue
+        main = ("python" if j["name"].startswith("train") else "vllm" if "vllm" in j["name"] else
+                "simpleFoam" if "Foam" in j["name"] else "lbm3d")
+        print("%s.batch|batch" % jid)
+        print("%s.0|%s" % (jid, main))
+        print("%s.1|dataloader" % jid if j["name"].startswith("train") else "%s.extern|extern" % jid)
+
+
 def squeue():
+    if "-s" in ARGS:
+        return squeue_steps()
     opts, _ = options(ARGS, {"u", "user", "t", "states", "o", "format", "O", "Format", "j", "jobs", "p", "partition", "M", "S", "sort",
                              "A", "account", "w", "nodelist"})
     jobs = all_jobs()

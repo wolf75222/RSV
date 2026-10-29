@@ -549,7 +549,7 @@ struct InferenceView : LivePieces {
             }
         }
         const std::string span = win.seconds > 0 ? "last " + util::duration(static_cast<long>(win.seconds + 0.5)) : "";
-        return box("latency", text(span) | color(chart::graphText()), vbox(std::move(lines)), chart::tempGradient().mid, width, height);
+        return box("latency", text(span) | color(chart::titleColor()), vbox(std::move(lines)), chart::tempGradient().mid, width, height);
     }
 
     // The caches and the drafts: how full, how often they serve, how many drafted tokens are kept

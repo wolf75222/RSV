@@ -1,3 +1,14 @@
+# Changes in RSV 2.4
+
+**Changed**
+
+- The live view's overview as btop's: its boxes with their titles and numbers on the border (`¹cpu` `²mem` `³io` `⁴steps`) and their keys there too; a box in the cpu box with a meter for each resource and each GPU's little braille graph; each GPU its own graph side by side when there is room; `io` as btop's network box, each direction on its own scale with its rate, top and total.
+- `v`: braille and blocks drawn as btop does (`Draw::Graph`): two readings per character, its tables of characters, a baseline dot where there is a reading, each row coloured by its height.
+
+**New**
+
+- The steps of the overview as btop's processes: what each runs (`squeue -s`), `↑` `↓` to pick one, `Enter` for it in depth (its graph of cores, memory, largest task, reads and writes).
+
 # Changes in RSV 2.3
 
 **New**

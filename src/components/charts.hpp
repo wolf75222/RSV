@@ -48,6 +48,19 @@ inline Gradient gpuGradient() { return {Color::RGB(0x3c, 0x8d, 0x5a), Color::RGB
 inline Color faint() { return Color::RGB(0x40, 0x40, 0x40); }   // btop's meter_bg and inactive text
 inline Color graphText() { return Color::RGB(0x80, 0x80, 0x80); }
 inline Color gridColor() { return Color::RGB(0x2c, 0x30, 0x38); }
+
+// The boxes' frames: each in the colour of what it shows (RSV's own colours); titles bright, keys in the accent
+inline Color cpuBox() { return Color::RGB(0x77, 0xca, 0x9b); }
+inline Color memBox() { return Color::RGB(0xd9, 0x62, 0x6d); }
+inline Color netBox() { return Color::RGB(0x4f, 0x43, 0xa3); }
+inline Color procBox() { return Color::RGB(0xcb, 0xc0, 0x6c); }
+inline Color titleColor() { return Color::RGB(0xee, 0xee, 0xee); }
+inline Color hiColor() { return Color::RGB(0x5f, 0xaf, 0xff); }
+inline Color divColor() { return Color::RGB(0x40, 0x40, 0x40); }
+inline std::string superscript(int n) {
+    static const char* digits[10] = {"⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹"};
+    return n >= 0 && n <= 9 ? digits[n] : "";
+}
 inline Color background() { return Color::RGB(0x16, 0x18, 0x1d); }
 
 // The inside of an area, under its bright edge: the colour darkened (`light`: 0 the background, 1 the colour)
@@ -79,37 +92,70 @@ inline std::string utf8(int cp) {
     return s;
 }
 
-/* The character for a left and a right level (0..4 dots each), filled from the bottom (up) or the top (down)
-- Braille: the left column's dots are 1 2 3 7 from the top, the right one's 4 5 6 8
-- Blocks: a quarter of a character per half and per two levels (▖ ▌ ▗ ▐ and what they make together)
-*/
+/* The character for a left and a right level (0..4 each): btop's tables (src/btop_draw.cpp, Symbols::graph_symbols),
+   filled from the bottom (up) or from the top (down) */
 inline const std::string& glyph(Symbols s, bool up, int left, int right) {
-    static std::vector<std::string> tables[4];
-    auto& t = tables[(s == Symbols::Block ? 2 : 0) + (up ? 0 : 1)];
-    if (t.empty()) {
-        for (int l = 0; l <= 4; l++)
-            for (int r = 0; r <= 4; r++) {
-                if (s == Symbols::Braille) {
-                    static const int lb[4] = {0x40, 0x04, 0x02, 0x01}, rb[4] = {0x80, 0x20, 0x10, 0x08};   // from the bottom
-                    int bits = 0;
-                    for (int d = 0; d < l; d++) bits |= up ? lb[d] : lb[3 - d];
-                    for (int d = 0; d < r; d++) bits |= up ? rb[d] : rb[3 - d];
-                    t.push_back(bits ? utf8(0x2800 + bits) : " ");
-                } else {
-                    // Each half: 0 nothing, 1 its quarter near the base, 2 all of it
-                    const int lh = l == 0 ? 0 : l <= 2 ? 1 : 2, rh = r == 0 ? 0 : r <= 2 ? 1 : 2;
-                    static const char* upChars[3][3] = {{" ", "▗", "▐"}, {"▖", "▄", "▟"}, {"▌", "▙", "█"}};
-                    static const char* downChars[3][3] = {{" ", "▝", "▐"}, {"▘", "▀", "▜"}, {"▌", "▛", "█"}};
-                    t.push_back((up ? upChars : downChars)[lh][rh]);
-                }
+    static const std::vector<std::string> braille_up = {
+        " ", "⢀", "⢠", "⢰", "⢸", "⡀", "⣀", "⣠", "⣰", "⣸", "⡄", "⣄", "⣤", "⣴", "⣼", "⡆", "⣆", "⣦", "⣶", "⣾", "⡇", "⣇", "⣧", "⣷", "⣿"};
+    static const std::vector<std::string> braille_down = {
+        " ", "⠈", "⠘", "⠸", "⢸", "⠁", "⠉", "⠙", "⠹", "⢹", "⠃", "⠋", "⠛", "⠻", "⢻", "⠇", "⠏", "⠟", "⠿", "⢿", "⡇", "⡏", "⡟", "⡿", "⣿"};
+    static const std::vector<std::string> block_up = {
+        " ", "▗", "▗", "▐", "▐", "▖", "▄", "▄", "▟", "▟", "▖", "▄", "▄", "▟", "▟", "▌", "▙", "▙", "█", "█", "▌", "▙", "▙", "█", "█"};
+    static const std::vector<std::string> block_down = {
+        " ", "▝", "▝", "▐", "▐", "▘", "▀", "▀", "▜", "▜", "▘", "▀", "▀", "▜", "▜", "▌", "▛", "▛", "█", "█", "▌", "▛", "▛", "█", "█"};
+    const auto& t = s == Symbols::Block ? (up ? block_up : block_down) : (up ? braille_up : braille_down);
+    return t[static_cast<size_t>(std::clamp(left, 0, 4) * 5 + std::clamp(right, 0, 4))];
+}
+
+/* btop's graph (Draw::Graph::_create): TWO readings per character, the left half the older one
+- Each row is a band of the height: a reading fills it to 0..4 dots (+0.1 before rounding, as btop)
+- `no_zero`: the bottom row shows at least one dot where there is a reading: a baseline that says "0", not "nothing"
+- Rows coloured along the gradient by their height (the top one the high end); one row: each character by its value
+*/
+inline Element btopGraph(const std::vector<double>& values, int width, int height, const Gradient& g, bool invert, Symbols symbols, bool no_zero) {
+    const int n = static_cast<int>(values.size()), samples = width * 2;
+    std::vector<double> v(static_cast<size_t>(samples), -1);
+    for (int i = 0; i < samples && i < n; i++) v[static_cast<size_t>(samples - 1 - i)] = values[static_cast<size_t>(n - 1 - i)];
+    const double mod = height == 1 ? 0.3 : 0.1;
+    Elements rows;
+    for (int r = 0; r < height; r++) {
+        const int horizon = invert ? height - 1 - r : r;   // bands from the top of an upright graph
+        const double high = height > 1 ? double(height - horizon) / height : 1, low = height > 1 ? double(height - horizon - 1) / height : 0;
+        const bool bottom = horizon == height - 1;
+        const auto level = [&](double x) {
+            if (x < 0) return 0;
+            const int least = no_zero && bottom ? 1 : 0;
+            if (x >= high - 1e-9) return 4;
+            if (x <= low) return least;
+            return std::clamp(static_cast<int>(std::lround((x - low) * 4 / (high - low) + mod)), least, 4);
+        };
+        const Color row_color = invert ? g.at(double(r + 1) / height) : g.at(1.0 - double(r) / height);
+        Elements runs;
+        std::string run;
+        Color run_color = row_color;
+        for (int x = 0; x < width; x++) {
+            const double a = v[static_cast<size_t>(2 * x)], b = v[static_cast<size_t>(2 * x + 1)];
+            const std::string& ch = (a < 0 && b < 0) ? glyph(symbols, !invert, 0, 0) : glyph(symbols, !invert, level(a), level(b));
+            const Color c = height == 1 ? g.at(std::max(a, b)) : row_color;
+            if (!(c == run_color) && !run.empty()) {
+                runs.push_back(text(run) | color(run_color));
+                run.clear();
             }
+            run_color = c;
+            run += ch;
+        }
+        if (!run.empty()) runs.push_back(text(run) | color(run_color));
+        rows.push_back(hbox(std::move(runs)));
     }
-    return t[static_cast<size_t>(left * 5 + right)];
+    return vbox(std::move(rows)) | size(WIDTH, EQUAL, width);
 }
 
 }  // namespace detail
 
-/* A graph of the last `values` (0..1, -1: no reading), one per column, the newest on the right
+// How many readings a column of a graph drawn so takes: btop's take two
+inline int perColumn(Symbols s) { return s == Symbols::Bars ? 1 : 2; }
+
+/* A graph of the last `values` (0..1, -1: no reading), the newest on the right: one per column (areas), two (btop's)
 - The rows are coloured along `g`, the top ones with its high end
 - `invert` hangs it from the top (the writes under the reads)
 - `base`: a faint line along the bottom where there is nothing (small graphs read better with it)
@@ -118,10 +164,11 @@ inline Element graph(const std::vector<double>& values, int width, int height, c
                      Symbols symbols = Symbols::Bars, bool base = false) {
     width = std::max(1, width);
     height = std::max(1, height);
+    if (symbols != Symbols::Bars) return detail::btopGraph(values, width, height, g, invert, symbols, true);
     std::vector<double> v(static_cast<size_t>(width), -1);
     const int n = static_cast<int>(values.size());
     for (int x = 0; x < width && x < n; x++) v[static_cast<size_t>(width - 1 - x)] = values[static_cast<size_t>(n - 1 - x)];
-    const int per_row = symbols == Symbols::Bars ? 8 : 4;
+    const int per_row = 8;
     std::vector<int> levels(v.size());
     for (size_t i = 0; i < v.size(); i++)
         levels[i] = v[i] < 0 ? -1 : std::max(v[i] > 0.005 ? 1 : 0, static_cast<int>(std::lround(std::clamp(v[i], 0.0, 1.0) * height * per_row)));
@@ -151,24 +198,13 @@ inline Element graph(const std::vector<double>& values, int width, int height, c
         };
         for (int x = 0; x < width; x++) {
             const int cur = levels[static_cast<size_t>(x)];
-            if (symbols == Symbols::Bars) {
-                // An area: each column in the colour of its value, its top bright, the rest darker
-                const int k = cur < 0 ? 0 : std::clamp(cur - level * 8, 0, 8);
-                const bool edge = k > 0 && cur <= (level + 1) * 8;
-                const Color col = g.at(v[static_cast<size_t>(x)]);
-                if (k == 0) put(base && level == 0 ? (invert ? "▔" : "▁") : " ", base && level == 0 ? 2 : 0, c);
-                else if (!invert || k == 8) put(eighths[k], 0, edge ? col : areaFill(col, 0.55));
-                else put(eighths[8 - k], 1, col);   // from the top: the rest of the character, inverted
-                continue;
-            }
-            const int prev = x > 0 && levels[static_cast<size_t>(x - 1)] >= 0 ? levels[static_cast<size_t>(x - 1)] : cur;
-            if (cur < 0) {
-                put(base && level == 0 ? detail::glyph(symbols, !invert, 1, 1) : " ", base && level == 0 ? 2 : 0, c);
-                continue;
-            }
-            const int l = std::clamp(prev - level * 4, 0, 4), rr = std::clamp(cur - level * 4, 0, 4);
-            if (base && level == 0 && l == 0 && rr == 0) put(detail::glyph(symbols, !invert, 1, 1), 2, c);
-            else put(detail::glyph(symbols, !invert, l, rr), 0, c);
+            // An area: each column in the colour of its value, its top bright, the rest darker
+            const int k = cur < 0 ? 0 : std::clamp(cur - level * 8, 0, 8);
+            const bool edge = k > 0 && cur <= (level + 1) * 8;
+            const Color col = g.at(v[static_cast<size_t>(x)]);
+            if (k == 0) put(base && level == 0 ? (invert ? "▔" : "▁") : " ", base && level == 0 ? 2 : 0, c);
+            else if (!invert || k == 8) put(eighths[k], 0, edge ? col : areaFill(col, 0.55));
+            else put(eighths[8 - k], 1, col);   // from the top: the rest of the character, inverted
         }
         flush();
         rows.push_back(hbox(std::move(runs)));
