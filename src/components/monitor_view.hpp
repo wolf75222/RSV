@@ -6,6 +6,7 @@
 #include <ctime>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -131,16 +132,34 @@ struct MonitorView {
         double seen = 0;
     };
     std::map<std::string, StepTrack> steps;
-    std::string own_step;       // the view's own step (nvidia-smi): not one of the job's
+    std::set<std::string> own_steps;     // the view's own steps (nvidia-smi...): not the job's
+    std::set<std::string> known_steps;   // every step sstat showed: a new one is looked up by name
 
     struct GpuTrack {
         api::GpuUse last;
-        Series util, mem;
-        double seen = 0;
+        Series util, mem;                    // shares, 0..1
+        Series sm_active, sm_occupancy, tensor, dram, fp32;   // GPM, shares
+        Series pcie_rx, pcie_tx, nvlink_rx, nvlink_tx;        // GPM, bytes per second
+        Series power, temp;
+        double seen = 0, gpm_seen = 0;
     };
     std::map<std::pair<std::string, int>, GpuTrack> gpu_tracks;   // by node, then index
 
-    int view = 0;               // 0 overview, 1 performance
+    // The GPUs, in depth (3, or n): who uses each, why one is slow
+    struct AppTrack {
+        api::GpuApp app;
+        double seen = 0;
+    };
+    std::map<std::pair<std::string, long>, AppTrack> apps;   // by node and pid
+    api::GpuFacts facts;
+    double facts_at = 0;
+    bool facts_loading = false;
+    std::string gpm_error, apps_error;
+    bool gpm_waiting = false;
+    int gpu_selected = 0;
+    bool gpu_zoom = false;      // Enter: the selected GPU alone, the whole width
+
+    int view = 0;               // 0 overview, 1 performance, 2 GPUs
     chart::Symbols symbols = chart::Symbols::Braille;   // the graphs of the first view (g: braille, bars, blocks)
     int zoom = 1;
     int selected = 0, side_offset = 0, item_count = 1;
@@ -156,9 +175,10 @@ struct MonitorView {
         if (!error.empty()) return;
         double cpu_total = 0, mem_total = 0, read = 0, write = 0;
         max_task_mib = 0;
-        steps.erase(own_step);
+        for (const auto& id : own_steps) steps.erase(id);
         for (const auto& s : list) {
-            if (s.id == own_step) continue;
+            known_steps.insert(s.id);
+            if (own_steps.count(s.id)) continue;
             cpu_total += s.cpu_seconds;
             mem_total += s.mem_mib;
             read += s.read_bytes;
@@ -197,6 +217,8 @@ struct MonitorView {
         t.seen = at;
         if (g.util >= 0) t.util.add(at, g.util / 100);
         if (g.mem_total_mib > 0) t.mem.add(at, g.mem_used_mib / g.mem_total_mib);
+        if (g.power_w >= 0) t.power.add(at, g.power_w);
+        if (g.temp_c >= 0) t.temp.add(at, g.temp_c);
 
         double util = 0, used = 0, total = 0, power = 0;
         int n = 0;
@@ -215,6 +237,52 @@ struct MonitorView {
         gpu_power.add(at, power);
     }
 
+    // dmon's GPM sample of one GPU: what its SMs, tensor cores, memory and links really do
+    void addGpm(const api::GpmSample& g, double at) {
+        gpm_waiting = false;
+        gpm_error.clear();
+        auto& t = gpu_tracks[{g.node, g.index}];
+        t.gpm_seen = at;
+        const auto put = [&](const char* key, Series& series, double scale) {
+            const auto it = g.values.find(key);
+            if (it != g.values.end() && it->second >= 0) series.add(at, it->second * scale);
+        };
+        put("smutil", t.sm_active, 0.01);
+        put("smocc", t.sm_occupancy, 0.01);
+        put("mmaact", t.tensor, 0.01);
+        put("dram", t.dram, 0.01);
+        put("fp32", t.fp32, 0.01);
+        put("pcirx", t.pcie_rx, 1048576.0);
+        put("pcitx", t.pcie_tx, 1048576.0);
+        put("nvlrx", t.nvlink_rx, 1048576.0);
+        put("nvltx", t.nvlink_tx, 1048576.0);
+    }
+
+    // A process nvidia-smi saw on a GPU; those not seen for 20 s are gone
+    void addApp(const api::GpuApp& a, double at) {
+        apps_error.clear();
+        apps[{a.node, a.pid}] = {a, at};
+        for (auto it = apps.begin(); it != apps.end();) it = at - it->second.seen > 20 ? apps.erase(it) : std::next(it);
+    }
+
+    // The processes on a GPU, by its uuid
+    std::vector<const AppTrack*> appsOn(const std::string& uuid) const {
+        std::vector<const AppTrack*> r;
+        for (const auto& [key, a] : apps)
+            if (!uuid.empty() && a.app.uuid == uuid) r.push_back(&a);
+        return r;
+    }
+
+    // Slurm's pids again when a process they don't have shows up (it started since), at most every 30 s
+    bool wantFacts(double now) const {
+        if (facts_loading || gpus <= 0) return false;
+        if (facts_at == 0) return true;
+        if (now - facts_at < 30) return false;
+        for (const auto& [key, a] : apps)
+            if (!facts.pids.count(key)) return true;
+        return false;
+    }
+
     /* 1 2 or Tab: the views; + - zoom; g how the graphs are drawn; r reads again (and starts the GPU step again); q, Esc or m close
        The arrows or j k pick a resource (the second view) */
     bool onEvent(Event e, bool& close) {
@@ -228,8 +296,19 @@ struct MonitorView {
         } else if (e == Event::Character('g')) {
             symbols = symbols == chart::Symbols::Braille ? chart::Symbols::Bars
                       : symbols == chart::Symbols::Bars ? chart::Symbols::Block : chart::Symbols::Braille;
+        } else if (e == Event::Character('3') || e == Event::Character('n')) {
+            if (gpus > 0) view = 2;
         } else if (e == Event::Tab || e == Event::TabReverse) {
-            view = 1 - view;
+            const int views = gpus > 0 ? 3 : 2;
+            view = (view + (e == Event::Tab ? 1 : views - 1)) % views;
+        } else if (view == 2 && (e == Event::ArrowDown || e == Event::Character('j'))) {
+            gpu_selected = std::min(static_cast<int>(gpu_tracks.size()) - 1, gpu_selected + 1);
+        } else if (view == 2 && (e == Event::ArrowUp || e == Event::Character('k'))) {
+            gpu_selected = std::max(0, gpu_selected - 1);
+        } else if (view == 2 && e == Event::Return) {
+            gpu_zoom = !gpu_zoom;
+        } else if (view == 2 && gpu_zoom && e == Event::Escape) {
+            gpu_zoom = false;
         } else if (e == Event::Character('+') || e == Event::Character('=')) {
             zoom = std::max(0, zoom - 1);
         } else if (e == Event::Character('-') || e == Event::Character('_')) {
@@ -688,6 +767,189 @@ struct MonitorView {
         return hbox({vbox(std::move(rows)) | size(WIDTH, EQUAL, side_w), separator() | color(chart::faint()), text(" "), pane});
     }
 
+    // ---------------------------------------------------------------- 3: the GPUs, in depth
+
+    // What is wrong with a GPU, the worst first: each one a line in the colour it deserves
+    std::vector<std::pair<std::string, Color>> gpuWarnings(const GpuTrack& t, double now) const {
+        std::vector<std::pair<std::string, Color>> w;
+        const auto& g = t.last;
+        if (now - t.seen > 15) w.push_back({"no answer for " + util::duration(static_cast<long>(now - t.seen)), theme::red()});
+        if (g.ecc_uncorrected > 0) w.push_back({std::to_string(static_cast<long>(g.ecc_uncorrected)) + " uncorrected memory errors: tell the admins", theme::red()});
+        const auto rows = facts.remapped.find(g.uuid);
+        if (rows != facts.remapped.end() && rows->second.second) w.push_back({"memory row remapping failed: tell the admins", theme::red()});
+        if (rows != facts.remapped.end() && rows->second.first) w.push_back({"memory rows wait for a GPU reset", theme::yellow()});
+        if (!apps.empty() || facts_at > 0) {
+            if (appsOn(g.uuid).empty() && !g.uuid.empty())
+                w.push_back({"no process on it: reserved for nothing (CUDA_VISIBLE_DEVICES? one GPU per task?)", theme::yellow()});
+        }
+        const auto reasons = api::clockReasons(g.reasons);
+        if (!reasons.empty()) {
+            std::string r;
+            for (const auto& x : reasons) r += (r.empty() ? "" : ", ") + x;
+            w.push_back({"slowed down: " + r, theme::yellow()});
+        }
+        if (g.util >= 50 && !t.sm_active.empty() && t.sm_active.last() < 0.25)
+            w.push_back({"busy " + pct(g.util / 100) + " of the time but only " + pct(t.sm_active.last()) + " of its SMs work: small kernels?", theme::yellow()});
+        return w;
+    }
+
+    // One GPU of the list: its little curve, what it does, its warnings in one mark
+    Element gpuRow(const std::pair<const std::pair<std::string, int>, GpuTrack>& e, bool on, int width, double now) const {
+        const auto& t = e.second;
+        const auto& g = t.last;
+        const double u = g.util < 0 ? -1 : g.util / 100;
+        const int spark_w = std::max(6, width - 4 - 5 - 9 - 7 - 6 - 7 - 3 - 2);
+        const auto warn = gpuWarnings(t, now);
+        Element mark = warn.empty() ? text(" ") : text("!") | bold | color(warn.front().second);
+        const size_t n_apps = appsOn(g.uuid).size();
+        Element row = hbox({text(on ? "▌" : " ") | color(chart::gpuGradient().mid), text(util::padLeft(std::to_string(e.first.second), 2) + " "),
+                            chart::sparkline(resample(t.util, now, ZOOMS[zoom], spark_w, 1), spark_w, chart::gpuGradient()),
+                            text(util::padLeft(pct(u), 5)) | bold | color(chart::gpuGradient().at(std::max(0.0, u))),
+                            text(t.sm_active.empty() ? "         " : util::padLeft("SM " + pct(t.sm_active.last()), 9)) | color(chart::cachedGradient().mid),
+                            text(util::padLeft(g.mem_total_mib > 0 ? pct(g.mem_used_mib / g.mem_total_mib) : "-", 5) + " m") | color(chart::graphText()),
+                            text(g.temp_c < 0 ? "      " : util::padLeft(std::to_string(static_cast<int>(g.temp_c)) + "°C", 6)) |
+                                color(chart::tempGradient().at((g.temp_c - 30) / 60)),
+                            text(util::padLeft(g.power_w < 0 ? "" : watts(g.power_w), 7)) | color(chart::graphText()),
+                            text(util::padLeft(n_apps == 0 ? "-" : std::to_string(n_apps), 3)) | color(n_apps == 0 ? theme::yellow() : Color::Default),
+                            text(" "), mark});
+        return on ? row | bgcolor(Color::RGB(0x22, 0x26, 0x2e)) : row;
+    }
+
+    // The list, grouped by node: a line for the node, then its GPUs
+    Element gpuList(int width, int height, double now) {
+        Elements lines = {hbox({text("    GPU") | color(chart::graphText()), filler(),
+                                text("use      SM   mem  temp  power  procs") | color(chart::graphText())})};
+        std::string node;
+        int i = 0, selected_line = 0;
+        for (const auto& e : gpu_tracks) {
+            if (e.first.first != node) {
+                node = e.first.first;
+                int count = 0;
+                size_t procs = 0;
+                for (const auto& [k, t] : gpu_tracks)
+                    if (k.first == node) {
+                        count++;
+                        procs += appsOn(t.last.uuid).size();
+                    }
+                lines.push_back(hbox({text(node) | bold, text("  " + std::to_string(count) + (count == 1 ? " GPU · " : " GPUs · ") +
+                                                              std::to_string(procs) + (procs == 1 ? " process " : " processes ")) |
+                                                         color(chart::graphText()),
+                                      separatorLight() | color(chart::faint()) | flex}));
+            }
+            if (i == gpu_selected) selected_line = static_cast<int>(lines.size());
+            lines.push_back(gpuRow(e, i == gpu_selected, width, now));
+            i++;
+        }
+        if (gpu_tracks.empty()) lines.push_back(text(gpu_waiting ? "starting nvidia-smi in the job..." : "no GPU answered") | dim);
+        int offset = std::max(0, selected_line - height + 2);
+        return fitOrScroll(lines, offset, height) | size(WIDTH, EQUAL, width);
+    }
+
+    // The selected GPU: its warnings, its curves (what it does, its memory, its links), its figures and processes
+    Element gpuDetail(int width, int height, double now) const {
+        if (gpu_tracks.empty()) return text("");
+        auto it = gpu_tracks.begin();
+        std::advance(it, std::clamp(gpu_selected, 0, static_cast<int>(gpu_tracks.size()) - 1));
+        const auto& [key, t] = *it;
+        const auto& g = t.last;
+        const double step = ZOOMS[zoom];
+        const auto pctLabel = [](double f) { return std::to_string(static_cast<int>(std::lround(f * 100))) + "%"; };
+        const auto x_label = [step](int from_right) {
+            const long sec = std::lround(from_right * step);
+            return from_right == 0 ? std::string("now") : "-" + util::duration(sec);
+        };
+
+        Elements out = {hbox({text("GPU " + std::to_string(key.second)) | bold | color(chart::gpuGradient().high),
+                              text("  " + key.first + " · " + g.name + (g.pstate.empty() ? "" : " · " + g.pstate)) | color(chart::graphText())})};
+        for (const auto& [msg, c] : gpuWarnings(t, now)) out.push_back(text("! " + msg) | color(c));
+        if (!gpm_error.empty()) out.push_back(text(util::cut("SM, tensor and link figures: " + gpm_error, static_cast<size_t>(width))) | color(chart::graphText()));
+
+        // Figures in columns
+        std::vector<std::pair<std::string, std::string>> stats = {
+            {"Use", pct(g.util < 0 ? -1 : g.util / 100)},
+            {"SM active", t.sm_active.empty() ? "-" : pct(t.sm_active.last())},
+            {"SM occupancy", t.sm_occupancy.empty() ? "-" : pct(t.sm_occupancy.last())},
+            {"Tensor cores", t.tensor.empty() ? "-" : pct(t.tensor.last())},
+            {"Memory", util::mib(g.mem_used_mib) + " / " + util::mib(g.mem_total_mib)},
+            {"DRAM busy", t.dram.empty() ? "-" : pct(t.dram.last())},
+            {"SM clock", g.sm_mhz < 0 ? "-" : std::to_string(static_cast<int>(g.sm_mhz)) + " / " + std::to_string(static_cast<int>(g.sm_max_mhz)) + " MHz"},
+            {"Memory clock", g.mem_mhz < 0 ? "-" : std::to_string(static_cast<int>(g.mem_mhz)) + " / " + std::to_string(static_cast<int>(g.mem_max_mhz)) + " MHz"},
+            {"Power", g.power_w < 0 ? "-" : watts(g.power_w) + (g.power_limit_w > 0 ? " / " + watts(g.power_limit_w) : "")},
+            {"Temperature", g.temp_c < 0 ? "-" : std::to_string(static_cast<int>(g.temp_c)) + " °C"},
+            {"ECC errors", g.ecc_corrected < 0 ? "-" : std::to_string(static_cast<long>(g.ecc_uncorrected)) + " uncorr. · " + std::to_string(static_cast<long>(g.ecc_corrected)) + " corr."},
+            {"PCIe / C2C", t.pcie_rx.empty() ? "-" : chart::bytes(t.pcie_rx.last()) + "/s in · " + chart::bytes(t.pcie_tx.last()) + "/s out"},
+            {"NVLink", t.nvlink_rx.empty() ? "-" : chart::bytes(t.nvlink_rx.last()) + "/s in · " + chart::bytes(t.nvlink_tx.last()) + "/s out"}};
+        const int col_w = 27, per_row = std::max(1, width / col_w);
+        Elements stat_rows;
+        for (size_t i = 0; i < stats.size(); i += static_cast<size_t>(per_row)) {
+            Elements labels, values;
+            for (size_t k = i; k < std::min(stats.size(), i + static_cast<size_t>(per_row)); k++) {
+                labels.push_back(text(stats[k].first) | color(chart::graphText()) | size(WIDTH, EQUAL, col_w));
+                values.push_back(text(util::cut(stats[k].second, col_w - 1)) | bold | size(WIDTH, EQUAL, col_w));
+            }
+            stat_rows.push_back(hbox(std::move(labels)));
+            stat_rows.push_back(hbox(std::move(values)));
+        }
+
+        // Its processes: which step and rank each one is
+        Elements procs = {hbox({text(util::padRight("pid", 9)), text(util::padRight("process", static_cast<size_t>(std::max(10, width - 40)))),
+                                text(util::padLeft("memory", 8)), text(util::padLeft("step", 9)), text(util::padLeft("rank", 6))}) |
+                          color(chart::graphText())};
+        for (const auto* a : appsOn(g.uuid)) {
+            const auto sp = facts.pids.find({a->app.node, a->app.pid});
+            procs.push_back(hbox({text(util::padRight(std::to_string(a->app.pid), 9)),
+                                  text(util::padRight(util::cutMiddle(a->app.name, static_cast<size_t>(std::max(10, width - 41))),
+                                                      static_cast<size_t>(std::max(10, width - 40)))) | bold,
+                                  text(util::padLeft(util::mib(a->app.mem_mib), 8)),
+                                  text(util::padLeft(sp == facts.pids.end() ? "?" : sp->second.step, 9)) | color(chart::cpuGradient().low),
+                                  text(util::padLeft(sp == facts.pids.end() || sp->second.rank < 0 ? "-" : std::to_string(sp->second.rank), 6))}));
+        }
+        if (procs.size() == 1) procs.push_back(text(apps_error.empty() ? "no process on this GPU" : apps_error) | color(chart::graphText()));
+
+        // The curves share what is left
+        const int fixed = static_cast<int>(out.size()) + static_cast<int>(stat_rows.size()) + 1 + static_cast<int>(procs.size()) + 3 * 2;
+        const int chart_h = std::max(4, (height - fixed) / 3);
+        const auto chartOf = [&](const std::string& title, std::vector<std::pair<std::string, std::pair<const Series*, Color>>> curves,
+                                 double scale, std::function<std::string(double)> y_label) {
+            const int cols = chart::lineColumns(width, chart_h, y_label);
+            std::vector<chart::Line> lines;
+            Elements legend = {text(title) | bold, text("   ")};
+            for (const auto& [name, sc] : curves) {
+                lines.push_back({resample(*sc.first, now, step / 2, cols * 2, scale), sc.second, lines.empty()});
+                legend.push_back(text("━ ") | bold | color(sc.second));
+                legend.push_back(text(name + "  ") | color(chart::graphText()));
+            }
+            double tick = 10;
+            for (double x : {10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600})
+                if ((tick = x) >= cols / 5.0 * step) break;
+            return vbox({hbox(std::move(legend)), chart::lineChart(lines, width, chart_h, y_label, x_label, std::max(4, static_cast<int>(tick / step)))});
+        };
+        out.push_back(chartOf("activity", {{"busy", {&t.util, chart::gpuGradient().mid}}, {"SM active", {&t.sm_active, chart::cachedGradient().mid}},
+                                           {"SM occupancy", {&t.sm_occupancy, chart::availableGradient().mid}}, {"tensor", {&t.tensor, chart::writeGradient().high}}},
+                              1, pctLabel));
+        out.push_back(chartOf("memory", {{"in use", {&t.mem, chart::cachedGradient().mid}}, {"DRAM busy", {&t.dram, chart::usedGradient().mid}}}, 1, pctLabel));
+        const double top = chart::niceMax(std::max({t.pcie_rx.peak(), t.pcie_tx.peak(), t.nvlink_rx.peak(), t.nvlink_tx.peak(), 1e6}));
+        out.push_back(chartOf("links", {{"PCIe in", {&t.pcie_rx, chart::readGradient().high}}, {"PCIe out", {&t.pcie_tx, chart::writeGradient().high}},
+                                        {"NVLink in", {&t.nvlink_rx, chart::freeGradient().mid}}, {"NVLink out", {&t.nvlink_tx, chart::tempGradient().high}}},
+                          top, [top](double f) { return chart::bytes(f * top) + "/s"; }));
+        out.push_back(vbox(std::move(stat_rows)));
+        out.push_back(text(""));
+        out.push_back(vbox(std::move(procs)));
+        return vbox(std::move(out)) | size(WIDTH, EQUAL, width);
+    }
+
+    Element gpuView(int width, int height, double now) {
+        gpu_selected = std::clamp(gpu_selected, 0, std::max(0, static_cast<int>(gpu_tracks.size()) - 1));
+        if (gpu_zoom) return gpuDetail(width, height, now);
+        if (width >= 130) {
+            const int list_w = std::clamp(width * 2 / 5, 60, 80);
+            return hbox({gpuList(list_w, height, now), text(" "), separatorLight() | color(chart::faint()), text(" "),
+                         gpuDetail(width - list_w - 3, height, now)});
+        }
+        const int list_h = std::min(height / 3, static_cast<int>(gpu_tracks.size()) + 3);
+        return vbox({gpuList(width, list_h, now), separatorLight() | color(chart::faint()), gpuDetail(width, height - list_h - 1, now)});
+    }
+
     // ---------------------------------------------------------------- the whole
 
     Element render(int max_width, int max_height) {
@@ -699,17 +961,25 @@ struct MonitorView {
             Element t = text(" " + std::to_string(i + 1) + " " + name + " ");
             return view == i ? t | bold | inverted | color(theme::accent()) : t | color(chart::graphText());
         };
-        Elements head = {tab(0, "overview"), tab(1, "performance"), text("  "), text(state) | bold | color(stateColor(state)),
-                         text(" · " + partition) | color(chart::graphText()), filler()};
+        Elements head = {tab(0, "overview"), tab(1, "performance")};
+        if (gpus > 0) head.push_back(tab(2, "gpus"));
+        for (auto& e : Elements{text("  "), text(state) | bold | color(stateColor(state)), text(" · " + partition) | color(chart::graphText()),
+                                filler()})
+            head.push_back(std::move(e));
         if (!cpu_error.empty() || !gpu_error.empty())
             head.push_back(text(util::cut(cpu_error.empty() ? gpu_error : cpu_error, static_cast<size_t>(inner_w / 2))) | color(theme::red()));
         else if (ended)
             head.push_back(text("ended: the curves keep what it did") | color(theme::yellow()));
 
         const int body_h = inner_h - 2;
-        Element body = view == 0 ? overview(inner_w, body_h, now) : performance(inner_w, body_h, now);
+        if (view == 2 && gpus <= 0) view = 0;
+        Element body = view == 0 ? overview(inner_w, body_h, now) : view == 1 ? performance(inner_w, body_h, now) : gpuView(inner_w, body_h, now);
 
-        Elements keys = keyHints({{"1 2", "view"}, {"+ -", "zoom"}});
+        Elements keys = keyHints({{gpus > 0 ? "1 2 3" : "1 2", "view"}, {"+ -", "zoom"}});
+        if (view == 2) {
+            keys.push_back(keyHint("↑↓", "GPU"));
+            keys.push_back(keyHint("Enter", gpu_zoom ? "list" : "zoom"));
+        }
         if (view == 0)
             keys.push_back(keyHint("g", symbols == chart::Symbols::Braille ? "bars" : symbols == chart::Symbols::Bars ? "blocks" : "braille"));
         if (view == 1) keys.push_back(keyHint("↑↓", "resource"));
