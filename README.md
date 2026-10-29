@@ -14,54 +14,31 @@ git clone https://github.com/wolf75222/RSV.git ~/RSV && ~/RSV/install.sh
 
 Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 
+## What it does
+
+- Your jobs, their time left or expected start, and why they wait, in plain words. An array is one row.
+- Their nodes, cores and GPUs, their log followed live, their script and `scontrol` details.
+- A running job live: CPUs, memory, disk, GPUs in depth, and the model server it runs (vLLM, SGLang, Ollama…).
+- History and efficiency over 7 days, your project's jobs, the whole cluster live, your limits and quotas.
+- Never freezes, works over SSH in any terminal.
+
+[See more](docs/features.md)
+
+![A job live: overview, performance, GPUs, its model server](img/live.gif)
+
 ## Keys
 
 | Key | |
 |---|---|
-| `↑` `↓` or `j` `k` | move (`g` `G`: first, last) |
-| `l` or `Enter` | the job's log, followed as it grows (`Tab`: errors, `/` search, `e` next error) |
-| `Enter` on an array | its tasks, under it (`←` folds them) |
-| `b` | the script the job was submitted with |
-| `d` | everything `scontrol` says about the job |
-| `n` | the job's GPUs in depth: who uses each, why one is slow, SM activity, memory, links |
-| `m` | the job live: an overview of its CPUs, memory, disk I/O, steps and GPUs, or a task manager's Performance view |
-| `i` | the server of models the job runs (vLLM, SGLang, TGI, llama.cpp, Triton, Ollama), found on its own: tokens per second, requests, latencies, KV and prefix cache, speculative decoding, what is wrong |
-| `c` | cancel the job, or a whole array (asks first) |
-| `H` | hold or release a waiting job (ROMEO refuses both to users, RSV says why) |
-| `Space` | mark jobs: `c` then cancels all of them |
-| `y` | copy the job id |
-| `/` | filter |
-| `s` | sort |
-| `o` | your project: everyone's jobs in your accounts, read-only |
-| `a` | the last 7 days: what each job used, CPU and GPU hours, what was wasted |
-| `p` | the whole cluster, live: overview, queue, nodes, hardware |
-| `t` | when would a job start? |
-| `u` | your accounts: limits, fairshare, disk quotas |
-| `?` | help |
-| `q` | quit |
+| `↑` `↓` or `j` `k` | move |
+| `l` or `Enter` | the job's log, followed live |
+| `m` / `n` / `i` | the job live / its GPUs / its model server |
+| `c` | cancel (asks first, `Space` marks several) |
+| `a` / `p` / `u` | history / cluster / your accounts |
+| `?` / `q` | help / quit |
 
-## What it does
-
-- Lists your jobs with the time they have left, or when a pending one should start, and why it waits, in plain words.
-- An array is one row with its progress (done, running, waiting, failed), its tasks under it on `Enter`: 200 tasks no longer make 200 rows.
-- Shows where a job runs: its nodes, with their cores (`■`) and GPUs (`●`) in use.
-- Follows the job's output live, with search and its error lines in red, and shows its last lines under the details. Paths open in VS Code (Remote-SSH) with a click.
-- The script a waiting or running job was submitted with.
-- Running jobs: how busy their CPUs are and their memory now. Pending ones: their priority and rank in the queue.
-- A running job live (`m`): curves of its CPUs, GPUs, memory and disk reads and writes, its steps, and a task manager's Performance view.
-- Its GPUs in depth (`n`): who uses each (Slurm step and rank), why one is slow (power cap, heat, few SMs busy, memory errors), SM and tensor activity, DRAM, PCIe and NVLink.
-- The server of models it runs (`i`): vLLM, SGLang, TGI, llama.cpp, Triton or Ollama, found on its own: tokens per second, requests, latencies, KV and prefix cache, speculative decoding, and what is wrong (preemptions, a queue, a job far bigger than its load).
-- History with CPU, memory and time efficiency, CPU and GPU hours, what was reserved but idle and the time asked but not used.
-- Your project: your colleagues' jobs in your accounts, read-only.
-- Several jobs at once: mark them, then cancel them, after a confirmation that lists them.
-- The whole cluster, live: CPUs, GPUs, load, memory and storage in use with their curve since you opened it, reservations and maintenances, partitions and their rules, everyone's queue and why it waits, the nodes down and why, a map of every node (yours marked) with a zoom on one, and the hardware of each kind of node.
-- When would a job start? Slurm's own estimate for the job you describe, without submitting it.
-- Your accounts: their limits, fairshare and disk quotas.
-- Never freezes: Slurm is asked in the background, with timeouts, and less often when it is slow. Quits when the SSH connection drops.
-- Works in any terminal, over SSH too: 24-bit colors, aligned columns whatever the names, small windows.
-
-![A job live: overview, performance, GPUs, its model server](img/live.gif)
+[All the keys](docs/usage.md)
 
 ## Docs
 
-[Usage](docs/usage.md) · [Terminals](docs/terminals.md) · [Changes](docs/changes.md) · [Development](docs/development.md)
+[Features](docs/features.md) · [Usage](docs/usage.md) · [Terminals](docs/terminals.md) · [Changes](docs/changes.md) · [Development](docs/development.md)
