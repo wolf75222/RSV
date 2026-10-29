@@ -49,14 +49,14 @@ inline Color faint() { return Color::RGB(0x40, 0x40, 0x40); }   // btop's meter_
 inline Color graphText() { return Color::RGB(0x80, 0x80, 0x80); }
 inline Color gridColor() { return Color::RGB(0x2c, 0x30, 0x38); }
 
-// btop's boxes: muted frames, each its colour; titles bright, the key in them red (its default theme)
-inline Color cpuBox() { return Color::RGB(0x55, 0x6d, 0x59); }
-inline Color memBox() { return Color::RGB(0x6c, 0x6c, 0x4b); }
-inline Color netBox() { return Color::RGB(0x5c, 0x58, 0x8d); }
-inline Color procBox() { return Color::RGB(0x80, 0x52, 0x52); }
+// The boxes' frames: each in the colour of what it shows (RSV's own colours); titles bright, keys in the accent
+inline Color cpuBox() { return Color::RGB(0x77, 0xca, 0x9b); }
+inline Color memBox() { return Color::RGB(0xd9, 0x62, 0x6d); }
+inline Color netBox() { return Color::RGB(0x4f, 0x43, 0xa3); }
+inline Color procBox() { return Color::RGB(0xcb, 0xc0, 0x6c); }
 inline Color titleColor() { return Color::RGB(0xee, 0xee, 0xee); }
-inline Color hiColor() { return Color::RGB(0xb5, 0x40, 0x40); }
-inline Color divColor() { return Color::RGB(0x30, 0x30, 0x30); }
+inline Color hiColor() { return Color::RGB(0x5f, 0xaf, 0xff); }
+inline Color divColor() { return Color::RGB(0x40, 0x40, 0x40); }
 inline std::string superscript(int n) {
     static const char* digits[10] = {"⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹"};
     return n >= 0 && n <= 9 ? digits[n] : "";

@@ -587,7 +587,7 @@ struct MonitorView : LivePieces {
                                 col(c < 0 ? "-" : std::to_string(static_cast<long>(std::lround(c))), 7) | bold | color(chart::cpuGradient().low), text("  "),
                                 chart::graph(resample(t.cores, now, step, graph_w * 2, std::max(1, cpus)), graph_w, 1, chart::cpuGradient(), false, chart::Symbols::Braille),
                                 col(util::mib(t.last.mem_mib), 7), col(util::mib(t.last.max_rss_mib), 8)});
-            lines.push_back(on ? row | bgcolor(Color::RGB(0x6a, 0x2f, 0x2f)) : row);
+            lines.push_back(on ? row | bgcolor(Color::RGB(0x22, 0x26, 0x2e)) : row);
         }
         if (steps.empty()) lines.push_back(text("reading sstat...") | dim);
         lines.push_back(filler());

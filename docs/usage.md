@@ -77,7 +77,7 @@ Everywhere in it: `+` `-` zoom in time (1 to 30 s per column, up to the last hou
 
 ### 1 overview
 
-Laid out as btop's boxes: muted frames, each title on its border with its number (`¹cpu`, `²mem`, `³io`, `⁴steps`), the keys that act on a box on its border too (`- 2s per column +`, `v`, `↑↓ select`, `Enter details`).
+Laid out as btop's boxes: each title on its border with its number (`¹cpu`, `²mem`, `³io`, `⁴steps`), the keys that act on a box on its border too (`- 2s per column +`, `v`, `↑↓ select`, `Enter details`).
 
 - `cpu`: the CPUs' graph and under it the GPUs' (each GPU its own graph, side by side with its name and use, when each gets 10 columns; the memory's without GPUs), with their scale. Beside them, in a box of its own named after the nodes, a meter for the CPUs, memory, GPUs and their memory, and each GPU with its little graph (braille, coloured by its value), use and temperature (each step when there is no GPU).
 - `mem`: asked; used with its graph; free, the largest task and its node, GPU memory with their meters.
