@@ -47,7 +47,10 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 - Shows where a job runs: its nodes, with their cores (`■`) and GPUs (`●`) in use.
 - Follows the job's output live, with search and its error lines in red, and shows its last lines under the details. Paths open in VS Code (Remote-SSH) with a click.
 - The script a waiting or running job was submitted with.
-- Running jobs: how busy their CPUs are and their memory now, GPUs on demand. Pending ones: their priority and rank in the queue.
+- Running jobs: how busy their CPUs are and their memory now. Pending ones: their priority and rank in the queue.
+- A running job live (`m`): curves of its CPUs, GPUs, memory and disk reads and writes, its steps, and a task manager's Performance view.
+- Its GPUs in depth (`n`): who uses each (Slurm step and rank), why one is slow (power cap, heat, few SMs busy, memory errors), SM and tensor activity, DRAM, PCIe and NVLink.
+- The server of models it runs (`i`): vLLM, SGLang, TGI, llama.cpp, Triton or Ollama, found on its own: tokens per second, requests, latencies, KV and prefix cache, speculative decoding, and what is wrong (preemptions, a queue, a job far bigger than its load).
 - History with CPU, memory and time efficiency, CPU and GPU hours, what was reserved but idle and the time asked but not used.
 - Your project: your colleagues' jobs in your accounts, read-only.
 - Several jobs at once: mark them, then cancel them, after a confirmation that lists them.
@@ -56,6 +59,8 @@ Then run `rsv`. To update: `cd ~/RSV && git pull && ./install.sh`.
 - Your accounts: their limits, fairshare and disk quotas.
 - Never freezes: Slurm is asked in the background, with timeouts, and less often when it is slow. Quits when the SSH connection drops.
 - Works in any terminal, over SSH too: 24-bit colors, aligned columns whatever the names, small windows.
+
+![A job live: overview, performance, GPUs, its model server](img/live.gif)
 
 ## Docs
 
