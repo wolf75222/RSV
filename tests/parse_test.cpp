@@ -824,6 +824,13 @@ static void monitor() {
     CHECK_EQ(m.reads.last(), 5e7);
     CHECK_EQ(m.steps.size(), 2u);
     CHECK_EQ(m.steps["1.0"].cores.last(), 0.5);
+    // The view's own step (nvidia-smi) isn't one of the job's
+    api::StepUse own;
+    own.id = "1.3";
+    own.cpu_seconds = 1;
+    m.own_step = "1.3";
+    m.setSteps({batch, s0, own}, 1014, "");
+    CHECK_EQ(m.steps.count("1.3"), 0u);
     m.setSteps({}, 1014, "sstat: error");
     CHECK_EQ(m.cpu_error, std::string("sstat: error"));
 

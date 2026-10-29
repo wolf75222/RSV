@@ -715,17 +715,22 @@ private:
         if (monitor_loading_ || Clock::now() - monitor_sstat_time_ < std::chrono::seconds(2)) return;
         monitor_loading_ = true;
         monitor_sstat_time_ = Clock::now();
-        monitor_worker_.post([this, generation = monitor_generation_, id = monitor_.job_id] {
+        // The GPU step once it runs: found by its name, then left out of the job's steps
+        const bool find_own = monitor_.gpus > 0 && monitor_.own_step.empty() && gpu_stream_.running();
+        monitor_worker_.post([this, generation = monitor_generation_, id = monitor_.job_id, find_own] {
             api::Fetched<std::vector<api::StepUse>> r;
+            std::string own;
             try {
+                if (find_own) own = api::stepNamed(id, api::liveStepName());
                 r = api::fetchSteps(id);
             } catch (const std::exception& e) {
                 r.error = std::string("sstat: ") + e.what();
             }
             const double at = ui::MonitorView::nowSeconds();
-            post([this, generation, at, r = std::move(r)]() mutable {
+            post([this, generation, at, own, r = std::move(r)]() mutable {
                 if (generation != monitor_generation_) return;
                 monitor_loading_ = false;
+                if (!own.empty()) monitor_.own_step = own;
                 monitor_.setSteps(r.data, at, r.error);
             });
         });
@@ -739,6 +744,7 @@ private:
             return;
         }
         monitor_.gpu_waiting = true;
+        monitor_.own_step.clear();   // a new step, found again by its name
         const int per_node = std::max(1, monitor_.gpus / monitor_.nodes);
         const uint64_t generation = monitor_generation_;
         gpu_stream_.start(

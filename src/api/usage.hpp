@@ -429,12 +429,26 @@ inline Fetched<std::vector<GpuUse>> fetchGpus(const std::string& job_id, const s
     return r;
 }
 
+// The name of the live view's own step: it is left out of the job's steps
+inline std::string liveStepName() { return "rsv-live"; }
+
+// The id of a running step of the job by its name (squeue -s), "" when there is none
+inline std::string stepNamed(const std::string& job_id, const std::string& name) {
+    const RunResult res = run({"squeue", "-h", "-s", "-j", job_id, "-o", "%i|%j"}, 10);
+    if (!res.ok()) return "";
+    for (const auto& line : util::lines(res.out)) {
+        const auto f = util::split(line, '|');
+        if (f.size() >= 2 && util::trim(f[1]) == name) return util::trim(f[0]);
+    }
+    return "";
+}
+
 /* The same step, but it stays: nvidia-smi --loop-ms answers every `interval_ms` until it is stopped (live monitor)
 - One step for as long as the monitor is open, instead of one every few seconds: sacct isn't filled with them
 */
 inline std::vector<std::string> gpuStreamArgs(const std::string& job_id, size_t nodes, int gpus_per_node, int interval_ms) {
     std::vector<std::string> args = {"srun", "--jobid=" + job_id, "--overlap", "--nodes=" + std::to_string(nodes),
-                                     "--ntasks-per-node=1", "-l", "--quiet"};
+                                     "--ntasks-per-node=1", "-l", "--quiet", "--job-name=" + liveStepName()};
     if (gpus_per_node > 0) args.push_back("--gres=gpu:" + std::to_string(gpus_per_node));
     for (const char* a : {"nvidia-smi",
                           "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",

@@ -131,6 +131,7 @@ struct MonitorView {
         double seen = 0;
     };
     std::map<std::string, StepTrack> steps;
+    std::string own_step;       // the view's own step (nvidia-smi): not one of the job's
 
     struct GpuTrack {
         api::GpuUse last;
@@ -155,7 +156,9 @@ struct MonitorView {
         if (!error.empty()) return;
         double cpu_total = 0, mem_total = 0, read = 0, write = 0;
         max_task_mib = 0;
+        steps.erase(own_step);
         for (const auto& s : list) {
+            if (s.id == own_step) continue;
             cpu_total += s.cpu_seconds;
             mem_total += s.mem_mib;
             read += s.read_bytes;
