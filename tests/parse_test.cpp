@@ -828,7 +828,7 @@ static void monitor() {
     api::StepUse own;
     own.id = "1.3";
     own.cpu_seconds = 1;
-    m.own_step = "1.3";
+    m.own_steps = {"1.3"};
     m.setSteps({batch, s0, own}, 1014, "");
     CHECK_EQ(m.steps.count("1.3"), 0u);
     m.setSteps({}, 1014, "sstat: error");
@@ -894,6 +894,108 @@ static void monitor() {
     }
 }
 
+// The GPU view (n): nvidia-smi's long query, dmon's GPM metrics, the processes, Slurm's pids (lines from ROMEO)
+static void gpu_view() {
+    const std::vector<std::string> hosts = {"romeo-a033", "romeo-a034"};
+    api::GpuUse g;
+    CHECK(api::parseNvidiaSmiLine("1: 2, NVIDIA GH200 120GB, 97, 85431, 97871, 61, 404.10, 900.00, GPU-101ef618-df2f-2e12-5517-3df32723fdd7, "
+                                  "1755, 1980, 2619, 2619, 0x0000000000000004, 0, 3, P0",
+                                  hosts, g));
+    CHECK_EQ(g.node, std::string("romeo-a034"));
+    CHECK_EQ(g.uuid, std::string("GPU-101ef618-df2f-2e12-5517-3df32723fdd7"));
+    CHECK_EQ(g.sm_mhz, 1755.0);
+    CHECK_EQ(g.sm_max_mhz, 1980.0);
+    CHECK_EQ(g.reasons, 4ull);
+    CHECK_EQ(g.ecc_corrected, 3.0);
+    CHECK_EQ(g.pstate, std::string("P0"));
+    CHECK_EQ(api::clockReasons(0x4).size(), 1u);
+    CHECK(api::clockReasons(0x1).empty());   // idle doesn't slow it down
+    CHECK_EQ(api::clockReasons(0x24).size(), 2u);
+
+    // dmon: the header names the columns, "-" until GPM has two samples
+    api::DmonParser dmon;
+    api::GpmSample gs;
+    CHECK(!dmon.parse("0: # gpu    pwr  gtemp  mtemp     sm    mem    enc    dec    jpg    ofa   mclk   pclk     smutil      smocc     mmaact       dram       fp32      pcitx      pcirx      nvlrx      nvltx ", hosts, gs));
+    CHECK(!dmon.parse("0: # Idx      W      C      C      %      %      %      %      %      %    MHz    MHz      GPM:%      GPM:%      GPM:%      GPM:%      GPM:%  GPM:MiB/s  GPM:MiB/s  GPM:MiB/s  GPM:MiB/s ", hosts, gs));
+    CHECK(dmon.parse("0:     1    151     50     57      0      0      0      0      0      0   2619   1980          -          -          -          -          -          -          -          -          - ", hosts, gs));
+    CHECK_EQ(gs.index, 1);
+    CHECK_EQ(gs.values.count("smutil"), 0u);
+    CHECK(dmon.parse("0:    0    403     61     58    100      1      0      0      0      0   2619   1980         99         97          0          0         83          5          7          0          0 ", hosts, gs));
+    CHECK_EQ(gs.values["smutil"], 99.0);
+    CHECK_EQ(gs.values["smocc"], 97.0);
+    CHECK_EQ(gs.values["pcirx"], 7.0);
+    CHECK(!dmon.parse("1:    0    403     61", hosts, gs));   // a node whose header wasn't seen yet
+
+    api::GpuApp app;
+    CHECK(api::parseGpuApp("1: GPU-6b906958-ff92-d4ad-4d76-f3fde7e33dd3, 3187804, ray::RayWorkerProc.run, 85392", hosts, app));
+    CHECK_EQ(app.node, std::string("romeo-a034"));
+    CHECK_EQ(app.pid, 3187804L);
+    CHECK_EQ(app.name, std::string("ray::RayWorkerProc.run"));
+    CHECK_EQ(app.mem_mib, 85392.0);
+    CHECK(api::parseGpuApp("0: GPU-1, 12, python a.py --x=1,2, 512", hosts, app));
+    CHECK_EQ(app.name, std::string("python a.py --x=1,2"));
+
+    const auto pids = api::parseListpids("0: PID      JOBID    STEPID   LOCALID GLOBALID\n"
+                                         "0: 2753396  789214   0        0       0       \n"
+                                         "0: 2753381  789214   0        -       -       \n"
+                                         "0: -1       789214   extern   0       0       \n"
+                                         "1: 2753397  789214   0        0       1       \n",
+                                         hosts);
+    CHECK_EQ(pids.size(), 3u);
+    const auto pid = [&](const char* node, long p) { return pids.at(std::make_pair(std::string(node), p)); };
+    CHECK_EQ(pid("romeo-a034", 2753397).rank, 1L);
+    CHECK_EQ(pid("romeo-a033", 2753381).rank, -1L);
+    CHECK_EQ(pid("romeo-a033", 2753396).step, std::string("0"));
+
+    // The view: GPM into each GPU's curves, processes per GPU, the warnings
+    ui::MonitorView m;
+    m.gpus = 2;
+    api::GpuUse a = g, b = g;
+    a.node = b.node = "romeo-a033";
+    a.index = 0;
+    b.index = 1;
+    a.uuid = "GPU-a";
+    b.uuid = "GPU-b";
+    a.reasons = 0;
+    b.reasons = 0x4;
+    m.addGpu(a, 100);
+    m.addGpu(b, 100);
+    api::GpmSample sample;
+    sample.node = "romeo-a033";
+    sample.index = 0;
+    sample.values = {{"smutil", 10}, {"pcirx", 2}};
+    m.addGpm(sample, 101);
+    const auto& t0 = m.gpu_tracks[std::make_pair(std::string("romeo-a033"), 0)];
+    CHECK_EQ(t0.sm_active.last(), 0.1);
+    CHECK_EQ(t0.pcie_rx.last(), 2.0 * 1048576);
+    api::GpuApp p1;
+    p1.node = "romeo-a033";
+    p1.uuid = "GPU-a";
+    p1.pid = 7;
+    m.addApp(p1, 101);
+    CHECK_EQ(m.appsOn("GPU-a").size(), 1u);
+    CHECK(m.appsOn("GPU-b").empty());
+    const auto wa = m.gpuWarnings(t0, 102);
+    bool few_sms = false;
+    for (const auto& [msg, c] : wa) few_sms = few_sms || msg.find("SMs") != std::string::npos;
+    CHECK(few_sms);   // busy 97% of the time on 10% of its SMs
+    const auto wb = m.gpuWarnings(m.gpu_tracks[std::make_pair(std::string("romeo-a033"), 1)], 102);
+    bool idle = false, capped = false;
+    for (const auto& [msg, c] : wb) {
+        idle = idle || msg.find("no process") != std::string::npos;
+        capped = capped || msg.find("power cap") != std::string::npos;
+    }
+    CHECK(idle);
+    CHECK(capped);
+    m.addApp(p1, 130);   // seen again 29 s later: still there; one not seen for 20 s goes
+    api::GpuApp p2 = p1;
+    p2.pid = 8;
+    m.addApp(p2, 131);
+    m.addApp(p2, 160);
+    CHECK_EQ(m.apps.count(std::make_pair(std::string("romeo-a033"), 7L)), 0u);
+    CHECK(m.wantFacts(200));   // never read
+}
+
 int main() {
     durations();
     widths();
@@ -912,6 +1014,7 @@ int main() {
     node_hardware();
     arrays();
     monitor();
+    gpu_view();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

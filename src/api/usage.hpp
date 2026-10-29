@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -372,11 +373,31 @@ struct GpuUse {
     std::string node, name;
     int index = 0;
     double util = -1, mem_used_mib = 0, mem_total_mib = 0;
-    double temp_c = -1, power_w = -1, power_limit_w = -1;   // only asked by the live monitor (-1: not given)
+    double temp_c = -1, power_w = -1, power_limit_w = -1;   // only asked by the live view (-1: not given)
+    // The live view's longer query (-1 or empty: not given)
+    std::string uuid, pstate;
+    double sm_mhz = -1, sm_max_mhz = -1, mem_mhz = -1, mem_max_mhz = -1;
+    unsigned long long reasons = 0;   // clocks_event_reasons.active: why its clocks are lowered (see clockReasons)
+    double ecc_uncorrected = -1, ecc_corrected = -1;
 };
 
+/* What NVML's clock event reasons mean, the ones that slow a GPU down
+- 0x1 (idle) and 0x2 (the clocks an application asked for) don't: they are left out
+*/
+inline std::vector<std::string> clockReasons(unsigned long long mask) {
+    std::vector<std::string> r;
+    if (mask & 0x4) r.push_back("power cap");
+    if (mask & 0x8) r.push_back("hardware slowdown");
+    if (mask & 0x10) r.push_back("sync boost");
+    if (mask & 0x20) r.push_back("too hot");
+    if (mask & 0x40) r.push_back("too hot (hardware)");
+    if (mask & 0x80) r.push_back("power brake");
+    return r;
+}
+
 /* "0: 1, NVIDIA GH200 120GB, 97, 70123, 97871" (srun -l: the task number, one task per node, in the node order)
-- The live monitor asks for 3 more: "..., 97871, 61, 412.33, 900.00" (temperature, power, its limit; "[N/A]" when unknown)
+- The live view asks for more: temperature, power and its limit, then its uuid, clocks (SM and memory, now and at most),
+  why they are lowered (a hex mask), ECC errors (uncorrected, corrected) and its performance state; "[N/A]" when unknown
 */
 inline bool parseNvidiaSmiLine(const std::string& line, const std::vector<std::string>& hosts, GpuUse& g) {
     const size_t colon = line.find(':');
@@ -396,6 +417,17 @@ inline bool parseNvidiaSmiLine(const std::string& line, const std::vector<std::s
         g.power_w = util::toDouble(util::trim(f[6]), -1);
         g.power_limit_w = util::toDouble(util::trim(f[7]), -1);
     }
+    if (f.size() >= 17) {
+        g.uuid = util::trim(f[8]);
+        g.sm_mhz = util::toDouble(util::trim(f[9]), -1);
+        g.sm_max_mhz = util::toDouble(util::trim(f[10]), -1);
+        g.mem_mhz = util::toDouble(util::trim(f[11]), -1);
+        g.mem_max_mhz = util::toDouble(util::trim(f[12]), -1);
+        g.reasons = std::strtoull(util::trim(f[13]).c_str(), nullptr, 16);
+        g.ecc_uncorrected = util::toDouble(util::trim(f[14]), -1);
+        g.ecc_corrected = util::toDouble(util::trim(f[15]), -1);
+        g.pstate = util::trim(f[16]);
+    }
     return true;
 }
 
@@ -407,55 +439,186 @@ inline std::vector<GpuUse> parseNvidiaSmi(const std::string& out, const std::vec
     return r;
 }
 
-/* One small step in the job itself (srun --overlap: it shares what the job already has, asks for nothing more)
-- Run only when asked (a key): it starts a process on each node of the job
-*/
-inline Fetched<std::vector<GpuUse>> fetchGpus(const std::string& job_id, const std::string& nodelist, int gpus_per_node) {
-    Fetched<std::vector<GpuUse>> r;
-    const auto hosts = expandHostlist(nodelist);
-    if (hosts.empty()) {
-        r.error = "the job has no node";
-        return r;
-    }
-    std::vector<std::string> args = {"srun", "--jobid=" + job_id, "--overlap", "--nodes=" + std::to_string(hosts.size()),
-                                     "--ntasks-per-node=1", "-l", "--quiet"};
-    if (gpus_per_node > 0) args.push_back("--gres=gpu:" + std::to_string(gpus_per_node));
-    for (const char* a : {"nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
-                          "--format=csv,noheader,nounits"})
-        args.push_back(a);
-    const RunResult res = run(args, 30);
-    r.data = parseNvidiaSmi(res.out, hosts);
-    if (r.data.empty()) r.error = res.error("srun").empty() ? "nvidia-smi showed no GPU" : res.error("srun");
-    return r;
-}
-
-// The name of the live view's own step: it is left out of the job's steps
+// The name of the live view's own steps (rsv-live, rsv-live-gpm...): they are left out of the job's steps
 inline std::string liveStepName() { return "rsv-live"; }
 
-// The id of a running step of the job by its name (squeue -s), "" when there is none
-inline std::string stepNamed(const std::string& job_id, const std::string& name) {
+// The ids of the job's running steps whose name starts with `prefix` (squeue -s): the live view's own
+inline std::set<std::string> stepsNamed(const std::string& job_id, const std::string& prefix) {
+    std::set<std::string> r;
     const RunResult res = run({"squeue", "-h", "-s", "-j", job_id, "-o", "%i|%j"}, 10);
-    if (!res.ok()) return "";
     for (const auto& line : util::lines(res.out)) {
         const auto f = util::split(line, '|');
-        if (f.size() >= 2 && util::trim(f[1]) == name) return util::trim(f[0]);
+        if (f.size() >= 2 && util::startsWith(util::trim(f[1]), prefix)) r.insert(util::trim(f[0]));
     }
-    return "";
+    return r;
 }
 
 /* The same step, but it stays: nvidia-smi --loop-ms answers every `interval_ms` until it is stopped (live monitor)
 - One step for as long as the monitor is open, instead of one every few seconds: sacct isn't filled with them
 */
+inline std::vector<std::string> liveStep(const std::string& job_id, size_t nodes, int gpus_per_node, const std::string& name);
+
 inline std::vector<std::string> gpuStreamArgs(const std::string& job_id, size_t nodes, int gpus_per_node, int interval_ms) {
-    std::vector<std::string> args = {"srun", "--jobid=" + job_id, "--overlap", "--nodes=" + std::to_string(nodes),
-                                     "--ntasks-per-node=1", "-l", "--quiet", "--job-name=" + liveStepName()};
-    if (gpus_per_node > 0) args.push_back("--gres=gpu:" + std::to_string(gpus_per_node));
+    auto args = liveStep(job_id, nodes, gpus_per_node, liveStepName());
     for (const char* a : {"nvidia-smi",
-                          "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+                          "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,"
+                          "uuid,clocks.sm,clocks.max.sm,clocks.mem,clocks.max.mem,clocks_event_reasons.active,"
+                          "ecc.errors.uncorrected.volatile.total,ecc.errors.corrected.volatile.total,pstate",
                           "--format=csv,noheader,nounits"})
         args.push_back(a);
     args.push_back("--loop-ms=" + std::to_string(interval_ms));
     return args;
+}
+
+// The start of every step of the live view: one task on each node of the job, its output lines labelled
+inline std::vector<std::string> liveStep(const std::string& job_id, size_t nodes, int gpus_per_node, const std::string& name) {
+    std::vector<std::string> args = {"srun", "--jobid=" + job_id, "--overlap", "--nodes=" + std::to_string(nodes),
+                                     "--ntasks-per-node=1", "-l", "--quiet", "--job-name=" + name};
+    if (gpus_per_node > 0) args.push_back("--gres=gpu:" + std::to_string(gpus_per_node));
+    return args;
+}
+
+// ---------------------------------------------------------------- what the GPUs do inside (GPM, through nvidia-smi dmon)
+
+/* Hopper's GPU performance metrics, what DCGM would give: dmon prints them every `interval_s` seconds
+- 2 SM activity, 3 SM occupancy, 5 tensor activity, 10 DRAM activity, 12 FP32 activity (%), 20 21 PCIe TX RX,
+  60 61 NVLink RX TX (MiB/s)
+- The first two readings are "-": GPM needs two samples
+- dmon starts threads: a job that already uses all the processes it may (8192 on ROMEO) can't run it
+*/
+inline std::vector<std::string> gpmStreamArgs(const std::string& job_id, size_t nodes, int gpus_per_node, int interval_s) {
+    auto args = liveStep(job_id, nodes, gpus_per_node, liveStepName() + "-gpm");
+    for (const auto& a : {std::string("nvidia-smi"), std::string("dmon"), std::string("--gpm-metrics"),
+                                std::string("2,3,5,10,12,20,21,60,61"), std::string("-d"), std::to_string(interval_s)})
+        args.push_back(a);
+    return args;
+}
+
+struct GpmSample {
+    std::string node;
+    int index = -1;
+    std::map<std::string, double> values;   // by dmon's column name: smutil, smocc, mmaact, dram, fp32, pcitx...
+};
+
+/* dmon's lines: per task (srun -l), a header naming the columns ("# gpu pwr gtemp ... smutil smocc ...") and rows
+- A column without a value ("-") is left out of the sample
+*/
+struct DmonParser {
+    std::map<long, std::vector<std::string>> columns;   // by task
+
+    bool parse(const std::string& line, const std::vector<std::string>& hosts, GpmSample& out) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) return false;
+        const long task = util::toLong(util::trim(line.substr(0, colon)), -1);
+        if (task < 0) return false;
+        std::string rest = util::trim(line.substr(colon + 1));
+        std::vector<std::string> words;
+        for (const auto& w : util::split(rest, ' '))
+            if (!w.empty()) words.push_back(w);
+        if (words.empty()) return false;
+        if (words[0] == "#") {
+            if (words.size() > 2 && words[1] == "gpu") columns[task] = std::vector<std::string>(words.begin() + 1, words.end());
+            return false;
+        }
+        const auto it = columns.find(task);
+        if (it == columns.end() || words.size() != it->second.size()) return false;
+        out = GpmSample{};
+        out.node = static_cast<size_t>(task) < hosts.size() ? hosts[static_cast<size_t>(task)] : "task " + std::to_string(task);
+        out.index = static_cast<int>(util::toLong(words[0], -1));
+        for (size_t i = 1; i < words.size(); i++)
+            if (words[i] != "-") out.values[it->second[i]] = util::toDouble(words[i], -1);
+        return out.index >= 0;
+    }
+};
+
+// ---------------------------------------------------------------- who uses each GPU
+
+struct GpuApp {
+    std::string node, uuid, name;
+    long pid = -1;
+    double mem_mib = 0;
+};
+
+inline std::vector<std::string> appsStreamArgs(const std::string& job_id, size_t nodes, int gpus_per_node, int interval_ms) {
+    auto args = liveStep(job_id, nodes, gpus_per_node, liveStepName() + "-apps");
+    for (const auto& a : {std::string("nvidia-smi"), std::string("--query-compute-apps=gpu_uuid,pid,process_name,used_memory"),
+                                std::string("--format=csv,noheader,nounits"), "--loop-ms=" + std::to_string(interval_ms)})
+        args.push_back(a);
+    return args;
+}
+
+// "0: GPU-101ef618-..., 3187803, ray::RayWorkerProc.run, 85408" (a name with commas keeps them)
+inline bool parseGpuApp(const std::string& line, const std::vector<std::string>& hosts, GpuApp& a) {
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos) return false;
+    const long task = util::toLong(util::trim(line.substr(0, colon)), -1);
+    const auto f = util::split(line.substr(colon + 1), ',');
+    if (task < 0 || f.size() < 4) return false;
+    a = GpuApp{};
+    a.node = static_cast<size_t>(task) < hosts.size() ? hosts[static_cast<size_t>(task)] : "task " + std::to_string(task);
+    a.uuid = util::trim(f[0]);
+    a.pid = util::toLong(util::trim(f[1]), -1);
+    for (size_t i = 2; i + 1 < f.size(); i++) a.name += (i > 2 ? "," : "") + f[i];
+    a.name = util::trim(a.name);
+    a.mem_mib = util::toDouble(util::trim(f.back()));
+    return a.pid > 0 && util::startsWith(a.uuid, "GPU-");
+}
+
+// ---------------------------------------------------------------- which step and rank each process belongs to
+
+struct StepPid {
+    std::string step;     // 0, batch, extern
+    long rank = -1;       // its global task id when it is one of the step's tasks (-1: a child of one)
+};
+
+/* scontrol listpids on each node: "PID JOBID STEPID LOCALID GLOBALID", "-" for a task's children
+- Keyed by node then pid: the pids of compute-apps are the node's own
+*/
+inline std::map<std::pair<std::string, long>, StepPid> parseListpids(const std::string& out, const std::vector<std::string>& hosts) {
+    std::map<std::pair<std::string, long>, StepPid> r;
+    for (const auto& line : util::lines(out)) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const long task = util::toLong(util::trim(line.substr(0, colon)), -1);
+        std::vector<std::string> w;
+        for (const auto& x : util::split(line.substr(colon + 1), ' '))
+            if (!x.empty()) w.push_back(util::trim(x));
+        if (task < 0 || w.size() < 5) continue;
+        const long pid = util::toLong(w[0], -1);
+        if (pid <= 0) continue;
+        const std::string node = static_cast<size_t>(task) < hosts.size() ? hosts[static_cast<size_t>(task)] : "task " + std::to_string(task);
+        r[{node, pid}] = {w[2], w[4] == "-" ? -1 : util::toLong(w[4], -1)};
+    }
+    return r;
+}
+
+// Once (when the GPU view opens, and on r): the job's pids on each node, and the GPUs' remapped memory rows
+struct GpuFacts {
+    std::map<std::pair<std::string, long>, StepPid> pids;
+    std::map<std::string, std::pair<bool, bool>> remapped;   // by uuid: rows waiting for a reset, a remapping that failed
+    std::string error;
+};
+
+inline GpuFacts fetchGpuFacts(const std::string& job_id, const std::string& nodelist, int gpus_per_node) {
+    GpuFacts f;
+    const auto hosts = expandHostlist(nodelist);
+    if (hosts.empty()) return f;
+    auto pids = liveStep(job_id, hosts.size(), 0, liveStepName() + "-pids");
+    for (const char* a : {"scontrol", "listpids"}) pids.push_back(a);
+    const RunResult p = run(pids, 30);
+    f.pids = parseListpids(p.out, hosts);
+    if (f.pids.empty()) f.error = p.error("srun scontrol listpids");
+    auto rows = liveStep(job_id, hosts.size(), gpus_per_node, liveStepName() + "-rows");
+    for (const char* a : {"nvidia-smi", "--query-remapped-rows=gpu_uuid,remapped_rows.pending,remapped_rows.failure", "--format=csv,noheader"})
+        rows.push_back(a);
+    const RunResult m = run(rows, 30);
+    for (const auto& line : util::lines(m.out)) {
+        const size_t colon = line.find(':');
+        const auto x = util::split(colon == std::string::npos ? line : line.substr(colon + 1), ',');
+        if (x.size() >= 3 && util::startsWith(util::trim(x[0]), "GPU-"))
+            f.remapped[util::trim(x[0])] = {util::trim(x[1]) == "Yes", util::trim(x[2]) == "Yes"};
+    }
+    return f;
 }
 
 }  // namespace api

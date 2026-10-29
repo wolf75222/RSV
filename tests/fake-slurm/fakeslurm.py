@@ -1080,35 +1080,93 @@ def mmlsquota():
 
 
 def srun():
-    # srun --jobid=ID --overlap ... -l nvidia-smi ...: one line per GPU, labelled with the task (node) number
+    # srun --jobid=ID --overlap ... -l <command>: one task per node, each line labelled with it
     jid = [a.split("=", 1)[1] for a in ARGS if a.startswith("--jobid=")]
     match = [j for j in all_jobs() if jid and j["job_id"] == jid[0] and j["state"] == "RUNNING"]
-    if not match or "nvidia-smi" not in ARGS:
+    known = ("nvidia-smi" in ARGS) or ("scontrol" in ARGS and "listpids" in ARGS)
+    if not match or not known:
         fail("srun: error: Unable to create step for job %s: Invalid job id specified" % (jid[0] if jid else "?"))
     j = match[0]
     per_node = max(1, j["gpus"] // j["num_nodes"])
-    full = "temperature.gpu" in " ".join(ARGS)   # the live view (m) asks for temperature and power too
+    hosts = node_names(j) or ["romeo-a012"]
+    train = j["name"].startswith("train")
+    joined = " ".join(ARGS)
     loop = [int(a.split("=", 1)[1]) for a in ARGS if a.startswith("--loop-ms=")]
+    base_pid = 2753000 + int(j["job_id"]) % 1000 * 10
 
-    def once(now):
+    def uuid(task, g):
+        return "GPU-%08x-%04x-0000-0000-%012x" % (int(j["job_id"]), task, g)
+
+    def util_of(task, g, now):
+        if train and g == 1:
+            return 3   # reserved, nothing on it
+        u = 88 - g * 3 + 8 * math.sin(now / 9.0 + g + task) - (35 if int(now / 20) % 4 == 0 else 0)
+        return max(0, min(100, u))
+
+    def gpus_once(now):
         for task in range(j["num_nodes"]):
             for g in range(per_node):
-                if j["name"].startswith("train") and g == 1:
-                    util = 3
-                else:   # each GPU its own wave, the job's steps make them dip together now and then
-                    util = 88 - g * 3 + 8 * math.sin(now / 9.0 + g + task) - (35 if int(now / 20) % 4 == 0 else 0)
-                util = max(0, min(100, util))
+                util = util_of(task, g, now)
                 line = "%d: %d, NVIDIA GH200 120GB, %d, %d, 97871" % (task, g, util, 70123 - g * 5000 + 3000 * math.sin(now / 30.0))
-                if full:
+                if "temperature.gpu" in joined:
                     line += ", %d, %.2f, 900.00" % (45 + util * 0.3, 90 + util * 5.5)
+                if "uuid" in joined:
+                    hot = task == 0 and g == 2 and int(now / 30) % 2 == 0   # power capped half the time
+                    sm = 1755 if hot else 1980
+                    line += ", %s, %d, 1980, 2619, 2619, 0x%016x, %d, %d, P0" % (
+                        uuid(task, g), sm, 0x4 if hot else (0x1 if util < 5 else 0), 0, 3 if g == 3 else 0)
                 print(line)
         sys.stdout.flush()
 
+    def gpm_once(now, header):
+        for task in range(j["num_nodes"]):
+            if header:
+                print("%d: # gpu    pwr  gtemp  mtemp     sm    mem    enc    dec    jpg    ofa   mclk   pclk     smutil      smocc     mmaact       dram       fp32      pcitx      pcirx      nvlrx      nvltx " % task)
+                print("%d: # Idx      W      C      C      %%      %%      %%      %%      %%      %%    MHz    MHz      GPM:%%      GPM:%%      GPM:%%      GPM:%%      GPM:%%  GPM:MiB/s  GPM:MiB/s  GPM:MiB/s  GPM:MiB/s " % task)
+            for g in range(per_node):
+                util = util_of(task, g, now)
+                sm_act = util * (0.25 if g == 1 else 0.9)          # GPU 1: busy, but on few SMs
+                vals = ["%.0f" % (90 + util * 5.5), "%d" % (45 + util * 0.3), "56", "%d" % util, "3", "0", "0", "0", "0", "2619", "1980",
+                        "%d" % sm_act, "%d" % (sm_act * 0.8), "%d" % (util * 0.6 if train else 0), "%d" % (20 + util * 0.4), "%d" % (util * 0.7),
+                        "%d" % (900 + 600 * math.sin(now / 7.0)), "%d" % (1200 + 800 * math.sin(now / 5.0)),
+                        "%d" % ((30000 + 20000 * math.sin(now / 11.0)) if train else 0), "%d" % ((28000 + 20000 * math.sin(now / 11.0)) if train else 0)]
+                print("%d: %4d %s" % (task, g, " ".join("%6s" % v for v in vals)))
+        sys.stdout.flush()
+
+    def apps_once():
+        for task in range(j["num_nodes"]):
+            for g in range(per_node):
+                if train and g == 1:
+                    continue
+                name = "python train.py --config resnet50.yaml" if train else "/gpfs/home/demo/runs/lbm/lbm3d"
+                print("%d: %s, %d, %s, %d" % (task, uuid(task, g), base_pid + task * 100 + g, name, 60000 - g * 5000))
+        sys.stdout.flush()
+
+    if "listpids" in ARGS:
+        for task in range(j["num_nodes"]):
+            print("%d: PID      JOBID    STEPID   LOCALID GLOBALID" % task)
+            for g in range(per_node):
+                print("%d: %-8d %-8s 0        %-7d %-7d" % (task, base_pid + task * 100 + g, j["job_id"], g, task * per_node + g))
+            print("%d: %-8d %-8s batch    0       0" % (task, base_pid + 99, j["job_id"]))
+        return
+    if any(a.startswith("--query-remapped-rows") for a in ARGS):
+        for task in range(j["num_nodes"]):
+            for g in range(per_node):
+                print("%d: %s, %s, No" % (task, uuid(task, g), "Yes" if (task, g) == (1, 0) else "No"))
+        return
+    if "dmon" in ARGS:
+        delay = float(ARGS[ARGS.index("-d") + 1]) if "-d" in ARGS else 1
+        n = 0
+        while True:
+            gpm_once(time.time(), n % 10 == 0)
+            n += 1
+            time.sleep(delay)
+    one = apps_once if any(a.startswith("--query-compute-apps") for a in ARGS) else (lambda: gpus_once(time.time()))
     if not loop:
-        once(NOW)
+        one() if one is apps_once else gpus_once(NOW)
         return
     while True:   # nvidia-smi --loop-ms: until it is killed (the view closes)
-        once(time.time())
+        one()
         time.sleep(loop[0] / 1000.0)
 
 
