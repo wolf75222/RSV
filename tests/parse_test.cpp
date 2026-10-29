@@ -765,15 +765,25 @@ static void monitor() {
     // btop's graph: each character shows the value before (left) and its own (right); blocks or braille
     {
         auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(3), ftxui::Dimension::Fixed(1));
-        ftxui::Render(screen, ui::chart::graph({0, 1, 1}, 3, 1, ui::chart::cpuGradient()));
+        ftxui::Render(screen, ui::chart::graph({0, 1, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Braille));
         CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));   // 0 then nothing before: empty
         CHECK_EQ(screen.PixelAt(1, 0).character, std::string("⢸"));   // from 0 to full
         CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
         ftxui::Render(screen, ui::chart::graph({0.5, 0.5, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Block));
         CHECK_EQ(screen.PixelAt(1, 0).character, std::string("▄"));
         CHECK_EQ(screen.PixelAt(2, 0).character, std::string("▟"));
-        ftxui::Render(screen, ui::chart::graph({1, 1, 1}, 3, 1, ui::chart::cpuGradient(), true));   // hanging from the top
+        ftxui::Render(screen, ui::chart::graph({1, 1, 1}, 3, 1, ui::chart::cpuGradient(), true, ui::chart::Symbols::Braille));   // hanging
         CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
+        // Bars: each column's height to an eighth; hanging, the rest of the character inverted
+        ftxui::Render(screen, ui::chart::graph({0, 0.5, 1}, 3, 1, ui::chart::cpuGradient()));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));
+        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("▄"));
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("█"));
+        ftxui::Render(screen, ui::chart::graph({0.25, 0.25, 0.25}, 3, 1, ui::chart::cpuGradient(), true));
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("▆"));
+        CHECK(screen.PixelAt(2, 0).inverted);
+        ftxui::Render(screen, ui::chart::sparkline({-1, -1, 0.5}, 3, ui::chart::cpuGradient()));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string("▁"));   // the faint base where there is nothing
     }
     CHECK_EQ(ui::chart::niceMax(340e6), 500e6);
     CHECK_EQ(ui::chart::niceMax(1), 1.0);

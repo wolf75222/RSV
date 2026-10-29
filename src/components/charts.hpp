@@ -49,7 +49,11 @@ inline Color graphText() { return Color::RGB(0x80, 0x80, 0x80); }
 
 // ---------------------------------------------------------------- btop's graph
 
-enum class Symbols { Braille, Block };
+/* How a graph is drawn
+- Bars: one value per column, its top to an eighth of a character (▁ ▂ ▃ ▄ ▅ ▆ ▇ █): smooth and solid
+- Braille, Block: btop's, each character showing the step from the value before (left half) to its own (right)
+*/
+enum class Symbols { Bars, Braille, Block };
 
 namespace detail {
 
@@ -97,45 +101,84 @@ inline const std::string& glyph(Symbols s, bool up, int left, int right) {
 
 }  // namespace detail
 
-/* btop's graph: `values` (0..1, -1: no reading) are the last ones, one per column, the newest on the right
-- Each character shows the value before on its left half and its own on the right: the curve has no steps
-- The rows are coloured along `g`, the top ones with its high end; `invert` hangs the graph from the top
-  (btop's lower graphs, the writes under the reads)
-- `base`: a faint line where there is nothing (btop's small graphs)
+/* A graph of the last `values` (0..1, -1: no reading), one per column, the newest on the right
+- The rows are coloured along `g`, the top ones with its high end
+- `invert` hangs it from the top (the writes under the reads)
+- `base`: a faint line along the bottom where there is nothing (small graphs read better with it)
 */
 inline Element graph(const std::vector<double>& values, int width, int height, const Gradient& g, bool invert = false,
-                     Symbols symbols = Symbols::Braille, bool base = false) {
+                     Symbols symbols = Symbols::Bars, bool base = false) {
     width = std::max(1, width);
     height = std::max(1, height);
     std::vector<double> v(static_cast<size_t>(width), -1);
     const int n = static_cast<int>(values.size());
     for (int x = 0; x < width && x < n; x++) v[static_cast<size_t>(width - 1 - x)] = values[static_cast<size_t>(n - 1 - x)];
-    std::vector<int> dots(v.size());
+    const int per_row = symbols == Symbols::Bars ? 8 : 4;
+    std::vector<int> levels(v.size());
     for (size_t i = 0; i < v.size(); i++)
-        dots[i] = v[i] < 0 ? -1 : std::max(v[i] > 0.005 ? 1 : 0, static_cast<int>(std::lround(std::clamp(v[i], 0.0, 1.0) * height * 4)));
+        levels[i] = v[i] < 0 ? -1 : std::max(v[i] > 0.005 ? 1 : 0, static_cast<int>(std::lround(std::clamp(v[i], 0.0, 1.0) * height * per_row)));
+    static const char* eighths[9] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+
     Elements rows;
     for (int r = 0; r < height; r++) {
-        const int level = invert ? r : height - 1 - r;   // how many rows lie between this one and the base
-        std::string line;
-        bool any = false;
+        const int level = invert ? r : height - 1 - r;   // rows between this one and the base
+        const Color c = g.at(double(level + 1) / height);
+        Elements runs;
+        std::string run;
+        int run_kind = -1;   // 0 drawn, 1 drawn inverted (a bar hanging down), 2 the faint base
+        auto flush = [&] {
+            if (run.empty()) return;
+            Element e = text(run);
+            runs.push_back(run_kind == 2 ? e | color(faint()) : run_kind == 1 ? e | color(c) | inverted : e | color(c));
+            run.clear();
+        };
+        auto put = [&](const std::string& ch, int kind) {
+            if (kind != run_kind) {
+                flush();
+                run_kind = kind;
+            }
+            run += ch;
+        };
         for (int x = 0; x < width; x++) {
-            const int cur = dots[static_cast<size_t>(x)], prev = x > 0 && dots[static_cast<size_t>(x - 1)] >= 0 ? dots[static_cast<size_t>(x - 1)] : cur;
+            const int cur = levels[static_cast<size_t>(x)];
+            if (symbols == Symbols::Bars) {
+                const int k = cur < 0 ? 0 : std::clamp(cur - level * 8, 0, 8);
+                if (k == 0) put(base && level == 0 ? (invert ? "▔" : "▁") : " ", base && level == 0 ? 2 : 0);
+                else if (!invert || k == 8) put(eighths[k], 0);
+                else put(eighths[8 - k], 1);   // from the top: the rest of the character, inverted
+                continue;
+            }
+            const int prev = x > 0 && levels[static_cast<size_t>(x - 1)] >= 0 ? levels[static_cast<size_t>(x - 1)] : cur;
             if (cur < 0) {
-                line += base && level == 0 ? detail::glyph(symbols, !invert, 1, 1) : " ";
+                put(base && level == 0 ? detail::glyph(symbols, !invert, 1, 1) : " ", base && level == 0 ? 2 : 0);
                 continue;
             }
             const int l = std::clamp(prev - level * 4, 0, 4), rr = std::clamp(cur - level * 4, 0, 4);
-            any = any || l || rr;
-            line += base && level == 0 && l == 0 && rr == 0 ? detail::glyph(symbols, !invert, 1, 1) : detail::glyph(symbols, !invert, l, rr);
+            if (base && level == 0 && l == 0 && rr == 0) put(detail::glyph(symbols, !invert, 1, 1), 2);
+            else put(detail::glyph(symbols, !invert, l, rr), 0);
         }
-        Element e = text(line) | color(g.at(double(level + 1) / height));
-        if (!any && base && level == 0) e = text(line) | color(faint());
-        rows.push_back(e);
+        flush();
+        rows.push_back(hbox(std::move(runs)));
     }
     return vbox(std::move(rows)) | size(WIDTH, EQUAL, width);
 }
 
-/* btop's meter: `width` squares, the filled ones coloured along `g` by where they are, the others faint */
+// A one-line graph: the last values, each column's height to an eighth and its colour along `g` by its value
+inline Element sparkline(const std::vector<double>& values, int width, const Gradient& g) {
+    static const char* eighths[9] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+    width = std::max(1, width);
+    const int n = static_cast<int>(values.size());
+    Elements cells;
+    for (int x = 0; x < width; x++) {
+        const int i = n - width + x;
+        const double v = i >= 0 && i < n ? values[static_cast<size_t>(i)] : -1;
+        const int k = v < 0 ? 0 : std::max(v > 0.005 ? 1 : 0, static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * 8)));
+        cells.push_back(k == 0 ? text("▁") | color(faint()) : text(eighths[k]) | color(g.at(v)));
+    }
+    return hbox(std::move(cells));
+}
+
+/* A meter: `width` squares, the filled ones coloured along `g` by where they are, the others faint */
 inline Element meter(double ratio, int width, const Gradient& g) {
     width = std::max(1, width);
     const int filled = ratio < 0 ? 0 : static_cast<int>(std::lround(std::clamp(ratio, 0.0, 1.0) * width));
@@ -183,7 +226,7 @@ inline Element lineChart(const std::vector<Line>& lines, int width, int height, 
 
     Element plot = canvas(dots_w, dots_h, [lines, rows, cols, dots_w, dots_h, grid_at, x_step](Canvas& cv) {
         const auto dim_line = [](Cell& c) {
-            c.foreground_color = faint();
+            c.foreground_color = Color::RGB(0x34, 0x34, 0x3a);
         };
         // Grid: dotted rows and columns, under everything
         for (int r : grid_at)
@@ -195,7 +238,7 @@ inline Element lineChart(const std::vector<Line>& lines, int width, int height, 
         // Tinted areas, then the lines over them
         for (const auto& line : lines) {
             if (!line.fill) continue;
-            const Color tint = Color::Interpolate(0.25f, Color::RGB(0, 0, 0), line.color);
+            const Color tint = Color::Interpolate(0.2f, Color::RGB(0x14, 0x16, 0x1a), line.color);
             for (int c = 0; c < cols; c++) {
                 int lowest = -1;
                 for (int side = 0; side < 2; side++) {
@@ -216,8 +259,10 @@ inline Element lineChart(const std::vector<Line>& lines, int width, int height, 
             for (size_t i = 0; i < line.values.size() && static_cast<int>(i) < dots_w; i++) {
                 if (line.values[i] < 0) continue;
                 const int x = static_cast<int>(i), y = dotY(line.values[i]);
-                if (i > 0 && line.values[i - 1] >= 0) cv.DrawPointLine(x - 1, dotY(line.values[i - 1]), x, y, ink);
-                else cv.DrawPoint(x, y, true, ink);
+                // Two dots thick: one under the other, the line reads as a line and not as dots
+                const int prev = i > 0 && line.values[i - 1] >= 0 ? dotY(line.values[i - 1]) : y;
+                cv.DrawPointLine(x - (i > 0 ? 1 : 0), prev, x, y, ink);
+                cv.DrawPointLine(x - (i > 0 ? 1 : 0), std::min(dots_h - 1, prev + 1), x, std::min(dots_h - 1, y + 1), ink);
             }
         }
     });

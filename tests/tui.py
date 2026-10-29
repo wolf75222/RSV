@@ -295,6 +295,13 @@ def render_png(cells, path=None, cell_w=9, cell_h=19, font_size=15, scale=1):
                 w = (cell_w * ("▏▎▍▌▋▊▉".index(ch) + 1)) // 8
                 d.rectangle([X, Y, X + max(1, w) - 1, Y + cell_h - 1], fill=f)
                 continue
+            if ch in "▁▂▃▄▅▆▇":   # lower eighths (the live view's bars)
+                h = (cell_h * ("▁▂▃▄▅▆▇".index(ch) + 1)) // 8
+                d.rectangle([X, Y + cell_h - max(1, h), X + cell_w - 1, Y + cell_h - 1], fill=f)
+                continue
+            if ch == "▔":
+                d.rectangle([X, Y, X + cell_w - 1, Y + max(1, cell_h // 8) - 1], fill=f)
+                continue
             if ch in "░▒▓":
                 d.rectangle([X, Y, X + cell_w - 1, Y + cell_h - 1], fill=mix(b, f, {"░": 0.22, "▒": 0.45, "▓": 0.7}[ch]))
                 continue
