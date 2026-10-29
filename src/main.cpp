@@ -682,6 +682,7 @@ private:
         monitor_.mem_limit_mib = j.mem_mib;
         monitor_.started = j.start;
         monitor_.limit = j.limit;
+        monitor_.nodelist = j.nodelist;
         monitor_nodelist_ = j.nodelist;
         monitor_.reload = [this] {
             if (monitor_.ended) return;
@@ -715,16 +716,17 @@ private:
         monitor_loading_ = true;
         monitor_sstat_time_ = Clock::now();
         monitor_worker_.post([this, generation = monitor_generation_, id = monitor_.job_id] {
-            api::Fetched<api::LiveUse> r;
+            api::Fetched<std::vector<api::StepUse>> r;
             try {
-                r = api::fetchLiveUse(id);
+                r = api::fetchSteps(id);
             } catch (const std::exception& e) {
                 r.error = std::string("sstat: ") + e.what();
             }
-            post([this, generation, r = std::move(r)]() mutable {
+            const double at = ui::MonitorView::nowSeconds();
+            post([this, generation, at, r = std::move(r)]() mutable {
                 if (generation != monitor_generation_) return;
                 monitor_loading_ = false;
-                monitor_.setLive(std::move(r.data), r.error);
+                monitor_.setSteps(r.data, at, r.error);
             });
         });
     }

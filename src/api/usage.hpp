@@ -85,6 +85,51 @@ inline Fetched<LiveUse> fetchLiveUse(const std::string& job_id) {
     return r;
 }
 
+/* Each running step of a job, for the live view (m): what sstat says of it now
+- TRESUsageInTot fs/disk: the bytes its tasks read; TRESUsageOutTot fs/disk: the bytes they wrote
+- MaxRSSNode: the node of its largest task
+*/
+struct StepUse {
+    std::string id;           // 812345.0, 812345.batch
+    int tasks = 0;
+    double cpu_seconds = 0, mem_mib = 0, max_rss_mib = 0;
+    double read_bytes = 0, write_bytes = 0;
+    std::string max_rss_node;
+};
+
+inline std::string stepsFormat() { return "JobID,NTasks,MaxRSS,MaxRSSNode,TRESUsageInTot,TRESUsageOutTot"; }
+
+inline std::vector<StepUse> parseSteps(const std::string& out) {
+    std::vector<StepUse> r;
+    for (const auto& line : util::lines(out)) {
+        const auto f = util::split(line, '|');
+        if (f.size() < 6 || f[0].empty()) continue;
+        StepUse s;
+        s.id = util::trim(f[0]);
+        s.tasks = static_cast<int>(util::toLong(f[1]));
+        s.max_rss_mib = util::parseMiB(f[2], 1.0 / 1024 / 1024);
+        s.max_rss_node = util::trim(f[3]);
+        parseUsageTres(f[4], s.cpu_seconds, s.mem_mib);
+        for (const auto& [field, sink] : {std::pair<const std::string*, double*>{&f[4], &s.read_bytes}, {&f[5], &s.write_bytes}})
+            for (const auto& item : util::split(*field, ','))
+                if (util::startsWith(item, "fs/disk=")) *sink = util::toDouble(item.substr(8));
+        r.push_back(s);
+    }
+    return r;
+}
+
+inline Fetched<std::vector<StepUse>> fetchSteps(const std::string& job_id) {
+    Fetched<std::vector<StepUse>> r;
+    const RunResult res = run({"sstat", "-a", "-n", "-P", "--format=" + stepsFormat(), "-j", job_id}, 15);
+    if (!res.ok()) {
+        r.error = res.error("sstat");
+        return r;
+    }
+    r.data = parseSteps(res.out);
+    if (r.data.empty()) r.error = "no step running";
+    return r;
+}
+
 // ---------------------------------------------------------------- pending jobs: priority and rank (sprio)
 
 struct Priority {

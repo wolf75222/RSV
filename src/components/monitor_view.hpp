@@ -11,18 +11,18 @@
 #include <vector>
 
 #include <ftxui/component/event.hpp>
-#include <ftxui/dom/canvas.hpp>
 #include <ftxui/dom/elements.hpp>
 
 #include "../api/usage.hpp"
+#include "charts.hpp"
 #include "theme.hpp"
 
 namespace ui {
 using namespace ftxui;
 
-// ---------------------------------------------------------------- curves
+// ---------------------------------------------------------------- readings in time
 
-/* Readings of one quantity in time: (seconds since the epoch, value)
+/* Readings of one quantity: (seconds since the epoch, value)
 - Two readings less than half a second apart are one: nvidia-smi gives the GPUs of a node one line each
 - An hour is kept: the longest the widest zoom shows
 */
@@ -37,164 +37,101 @@ struct Series {
     }
     bool empty() const { return points.empty(); }
     double last() const { return points.empty() ? -1 : points.back().second; }
-    double peak() const {
+    double peak(double since = 0) const {
         double p = 0;
-        for (const auto& [at, v] : points) p = std::max(p, v);
+        for (const auto& [at, v] : points)
+            if (at >= since) p = std::max(p, v);
         return p;
     }
 };
 
-/* The series as `dots` values, one per `step` seconds, the newest at the right (at `now`), each divided by `scale`
-- Several readings in a dot: their mean. None: the one before holds (sstat answers every 2 s, a dot can be 1 s)
+/* The series as `n` values, one per `step` seconds, the newest at the right (at `now`), each divided by `scale`
+- Several readings in one: their mean. None: the one before holds (sstat answers every 2 s)
 - -1 before the first reading: nothing is drawn there
 */
-inline std::vector<double> resample(const Series& s, double now, double step, int dots, double scale) {
-    std::vector<double> out(static_cast<size_t>(std::max(0, dots)), -1);
+inline std::vector<double> resample(const Series& s, double now, double step, int n, double scale) {
+    std::vector<double> out(static_cast<size_t>(std::max(0, n)), -1);
     if (s.empty() || scale <= 0) return out;
     size_t k = 0;
     double held = -1;
-    const double first = now - dots * step;
+    const double first = now - n * step;
     while (k < s.points.size() && s.points[k].first <= first) held = s.points[k++].second;
-    for (int i = 0; i < dots; i++) {
+    for (int i = 0; i < n; i++) {
         const double end = first + (i + 1) * step;
         double sum = 0;
-        int n = 0;
+        int count = 0;
         while (k < s.points.size() && s.points[k].first <= end) {
             sum += s.points[k++].second;
-            n++;
+            count++;
         }
-        if (n > 0) held = sum / n;
+        if (count > 0) held = sum / count;
         if (held >= 0) out[static_cast<size_t>(i)] = std::clamp(held / scale, 0.0, 1.0);
     }
     return out;
 }
 
-/* An area graph in braille, like btop: each character is 2 dots wide and 4 high, so `values` has 2 per column
-- `heat`: the higher rows go yellow then red (memory: full is a danger); otherwise all in `base` (busy is good)
-- `grid`: a faint line at each quarter of the height, where the curve doesn't cover it
+/* How fast a total grows (CPU seconds, bytes), from readings far enough apart
+- sstat counts CPU time in whole seconds and doesn't say when it took it: over 2 s, a second more or less is 50%
+  on 1 CPU. The base is a reading at least `window` seconds older: the curve is smooth.
+- Less than before (a step ended): it starts again from this reading
 */
-inline Element brailleGraph(const std::vector<double>& values, int height, Color base, bool heat, bool grid = false) {
-    static const int left[4] = {0x40, 0x04, 0x02, 0x01}, right[4] = {0x80, 0x20, 0x10, 0x08};   // from the bottom
-    height = std::max(1, height);
-    const int columns = static_cast<int>(values.size() + 1) / 2;
-    std::vector<int> dots(values.size());
-    for (size_t i = 0; i < values.size(); i++) {
-        const double v = values[i];
-        dots[i] = v < 0 ? 0 : std::max(v > 0.004 ? 1 : 0, static_cast<int>(std::lround(v * height * 4)));
+struct Rate {
+    double window = 6;
+    std::vector<std::pair<double, double>> readings;
+
+    // The rate per second, -1 until there are two readings 1.5 s apart
+    double add(double at, double total) {
+        if (!readings.empty() && total < readings.back().second) readings.clear();
+        readings.emplace_back(at, total);
+        const std::pair<double, double>* base = nullptr;
+        for (const auto& r : readings)
+            if (at - r.first >= window || (!base && at - r.first >= 1.5)) base = &r;
+        const double rate = base ? (total - base->second) / (at - base->first) : -1;
+        while (readings.size() > 2 && at - readings[1].first >= window) readings.erase(readings.begin());
+        return rate;
     }
-    Elements rows;
-    for (int r = 0; r < height; r++) {
-        const int below = (height - 1 - r) * 4;   // dots under this row
-        const double top = double(height - r) / height;
-        const Color c = !heat ? base : top > 0.85 ? theme::red() : top > 0.6 ? theme::yellow() : base;
-        const bool grid_row = grid && height >= 8 && r > 0 && r % (height / 4) == 0 && r < height - 1;
-        Elements runs;
-        std::string line;
-        bool blank = false;   // what `line` holds: grid or curve
-        auto flush = [&] {
-            if (!line.empty()) runs.push_back(blank ? text(line) | color(theme::gray()) | dim : text(line) | color(c));
-            line.clear();
-        };
-        for (int col = 0; col < columns; col++) {
-            const size_t a = static_cast<size_t>(col) * 2, b = a + 1;
-            const int la = std::clamp(dots[a] - below, 0, 4), lb = b < dots.size() ? std::clamp(dots[b] - below, 0, 4) : 0;
-            int bits = 0;
-            for (int d = 0; d < la; d++) bits |= left[d];
-            for (int d = 0; d < lb; d++) bits |= right[d];
-            if ((bits == 0) != blank) {
-                flush();
-                blank = bits == 0;
-            }
-            if (bits == 0) {
-                line += grid_row ? "╌" : " ";
-                continue;
-            }
-            const int cp = 0x2800 + bits;   // U+2800..U+28FF in UTF-8: 3 bytes
-            line += static_cast<char>(0xE0 | (cp >> 12));
-            line += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            line += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-        flush();
-        rows.push_back(hbox(std::move(runs)));
-    }
-    return vbox(std::move(rows));
-}
-
-/* A curve like a task manager's, drawn on FTXUI's canvas: a line over a tinted area, a faint grid behind
-- The canvas has 2 x 4 braille dots per character: `values` has 2 per column, -1 where there is no reading yet
-- Its line (DrawPointLine) joins each value to the one before; the characters under it get a tinted background
-- The grid: a line at each quarter of the height, and one every `grid_step` columns from the right (now)
-*/
-inline Element curve(const std::vector<double>& values, int height, Color c, int grid_step = 10) {
-    height = std::max(1, height);
-    const int columns = static_cast<int>(values.size() + 1) / 2;
-    return canvas(columns * 2, height * 4, [values, height, columns, c, grid_step](Canvas& cv) {
-        const int dots_h = height * 4;
-        const Color tint = Color::Interpolate(0.22f, Color::RGB(0, 0, 0), c);
-        auto dotY = [&](double v) { return dots_h - 1 - std::clamp(static_cast<int>(std::lround(v * (dots_h - 1))), 0, dots_h - 1); };
-
-        // The grid first: the curve is drawn over it
-        const auto faint = [](Cell& cell) {
-            cell.foreground_color = theme::gray();
-            cell.dim = true;
-        };
-        for (int r = 1; r < height - 1 && height >= 4; r++) {
-            if (r % std::max(1, height / 4) != 0) continue;
-            for (int col = 0; col < columns; col++) cv.DrawText(col * 2, r * 4, "╌", faint);
-        }
-        for (int col = columns - 1 - grid_step; grid_step > 0 && col > 0; col -= grid_step)
-            for (int r = 0; r < height; r++) cv.DrawText(col * 2, r * 4, height >= 4 && r > 0 && r < height - 1 && r % std::max(1, height / 4) == 0 ? "┼" : "┆", faint);
-
-        // The area under the line: each character whose bottom is below the lower of its two values
-        for (int col = 0; col < columns; col++) {
-            int lowest = -1;   // the largest dot row (the canvas counts from the top)
-            for (int side = 0; side < 2; side++) {
-                const size_t i = static_cast<size_t>(col * 2 + side);
-                if (i < values.size() && values[i] >= 0) lowest = std::max(lowest, dotY(values[i]));
-            }
-            if (lowest < 0) continue;
-            for (int r = lowest / 4 + (lowest % 4 == 3 ? 1 : 0); r < height; r++)
-                cv.Style(col * 2, r * 4, [tint](Cell& cell) { cell.background_color = tint; });
-        }
-
-        // The line, from each value to the next
-        const auto ink = [c](Cell& cell) {
-            cell.foreground_color = c;
-            cell.bold = true;
-            cell.dim = false;
-        };
-        for (size_t i = 0; i < values.size(); i++) {
-            if (values[i] < 0) continue;
-            const int x = static_cast<int>(i), y = dotY(values[i]);
-            if (i > 0 && values[i - 1] >= 0) cv.DrawPointLine(x - 1, dotY(values[i - 1]), x, y, ink);
-            else cv.DrawPoint(x, y, true, ink);
-        }
-    });
-}
+};
 
 // ---------------------------------------------------------------- the view
 
-/* A running job, live (m), like btop: the curves of its CPUs, its memory and its GPUs since the view was opened
-- sstat every 2 s (main.cpp, on a worker of its own: a slow squeue doesn't stop the curves)
-- The GPUs: one srun --overlap step that stays, nvidia-smi --loop-ms in it; it ends when the view closes
-- + and - change how much time a dot is: from 1 s (the last minutes) to 30 s (the last hour)
+/* A running job, live (m), in two views
+- 1, btop's: the CPUs with the GPUs (or the memory) hanging under them, beside them a gauge for each and every GPU
+  with its little curve; under them the memory, the disk reads and writes (btop's net box) and the steps (its
+  processes)
+- 2, a task manager's Performance tab: the resources on the left with their little curves, the one picked on the
+  right with its big chart, its scale and the time, and its figures
+- sstat every 2 s (main.cpp, on a worker of its own); the GPUs from one srun --overlap step that runs
+  nvidia-smi --loop-ms while the view is open
 */
 struct MonitorView {
-    static constexpr double ZOOMS[] = {1, 2, 5, 10, 30};
+    static constexpr double ZOOMS[] = {1, 2, 5, 10, 30};   // seconds per column
 
-    std::string title, job_id, state, partition;
+    std::string title, job_id, state, partition, nodelist;
     int cpus = 1, gpus = 0, nodes = 1;
     double mem_limit_mib = 0;   // all its nodes (0: it asked for none)
     std::time_t started = 0;
     long limit = util::UNKNOWN;
 
-    bool ended = false;         // it left the queue, or isn't running any more: the curves stay
+    bool ended = false;         // not running any more: the curves stay
     std::string cpu_error, gpu_error;
-    bool gpu_waiting = false;   // the step is starting, nothing from nvidia-smi yet
+    bool gpu_waiting = false;   // the GPU step is starting
 
-    Series cpu, mem, gpu, gpu_mem, gpu_power;
-    api::LiveUse live;
-    bool has_live = false;
+    // The whole job
+    Series cpu;                 // share of its CPUs busy
+    Series mem;                 // MiB in use, all its steps
+    Series reads, writes;       // bytes per second
+    Series gpu, gpu_mem, gpu_power;
+    Rate cpu_rate, read_rate{4, {}}, write_rate{4, {}};
+    double cpu_seconds = -1, mem_mib = -1, max_task_mib = 0, read_total = 0, write_total = 0;
+    std::string max_task_node;
+
+    struct StepTrack {
+        api::StepUse last;
+        Series cores;           // how many cores it keeps busy
+        Rate rate;
+        double seen = 0;
+    };
+    std::map<std::string, StepTrack> steps;
 
     struct GpuTrack {
         api::GpuUse last;
@@ -203,40 +140,53 @@ struct MonitorView {
     };
     std::map<std::pair<std::string, int>, GpuTrack> gpu_tracks;   // by node, then index
 
-    int zoom = 0;               // index in ZOOMS
+    int view = 0;               // 0 btop's, 1 the task manager's
+    chart::Symbols symbols = chart::Symbols::Block;   // the big graphs of the first view (g: braille, as btop)
+    int zoom = 1;
+    int selected = 0, side_offset = 0, item_count = 1;
     std::function<void()> reload;
 
     static double nowSeconds() {
         return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
-    /* sstat: the memory as it is, and how busy its CPUs were since a reading far enough back
-    - sstat counts CPU time in whole seconds, and doesn't say when it took it: over 2 s, a second more or less
-      is 50% on 1 CPU. The base is a reading at least 6 s older (20/cpus s under 4 CPUs): the curve is smooth.
-    - Less CPU time than before (a step ended): the readings start again from this one
-    */
-    std::vector<api::LiveUse> readings;
-
-    void setLive(api::LiveUse now, const std::string& error) {
+    // sstat: each step's CPU time, memory and bytes; the job's are their sums
+    void setSteps(const std::vector<api::StepUse>& list, double at, const std::string& error) {
         cpu_error = error;
         if (!error.empty()) return;
-        if (!readings.empty() && now.cpu_seconds < readings.back().cpu_seconds) readings.clear();
-        readings.push_back(now);
-        const double window = std::clamp(20.0 / std::max(1, cpus), 6.0, 20.0);
-        const api::LiveUse* base = nullptr;
-        for (const auto& r : readings)
-            if (now.at - r.at >= window || (!base && now.at - r.at >= 1.5)) base = &r;
-        if (base) {
-            now.busy = std::clamp((now.cpu_seconds - base->cpu_seconds) / ((now.at - base->at) * cpus), 0.0, 1.0);
-            cpu.add(now.at, now.busy);
+        double cpu_total = 0, mem_total = 0, read = 0, write = 0;
+        max_task_mib = 0;
+        for (const auto& s : list) {
+            cpu_total += s.cpu_seconds;
+            mem_total += s.mem_mib;
+            read += s.read_bytes;
+            write += s.write_bytes;
+            if (s.max_rss_mib > max_task_mib) {
+                max_task_mib = s.max_rss_mib;
+                max_task_node = s.max_rss_node;
+            }
+            auto& t = steps[s.id];
+            t.rate.window = std::clamp(20.0 / std::max(1, s.tasks), 6.0, 20.0);
+            t.last = s;
+            t.seen = at;
+            const double cores = t.rate.add(at, s.cpu_seconds);
+            if (cores >= 0) t.cores.add(at, cores);
         }
-        while (readings.size() > 2 && now.at - readings[1].at >= window) readings.erase(readings.begin());
-        mem.add(now.at, now.mem_mib);
-        live = now;
-        has_live = true;
+        for (auto it = steps.begin(); it != steps.end();) it = at - it->second.seen > 30 ? steps.erase(it) : std::next(it);
+        cpu_rate.window = std::clamp(20.0 / std::max(1, cpus), 6.0, 20.0);
+        const double busy = cpu_rate.add(at, cpu_total);
+        if (busy >= 0) cpu.add(at, std::min(1.0, busy / cpus));
+        cpu_seconds = cpu_total;
+        mem_mib = mem_total;
+        mem.add(at, mem_total);
+        read_total = read;
+        write_total = write;
+        const double r = read_rate.add(at, read), w = write_rate.add(at, write);
+        if (r >= 0) reads.add(at, r);
+        if (w >= 0) writes.add(at, w);
     }
 
-    // A line from nvidia-smi: that GPU's curves, and those of all of them together (mean use, memory, power)
+    // A line from nvidia-smi: that GPU's curves, and those of all of them together
     void addGpu(const api::GpuUse& g, double at) {
         gpu_waiting = false;
         gpu_error.clear();
@@ -263,9 +213,40 @@ struct MonitorView {
         gpu_power.add(at, power);
     }
 
-    // ---------------------------------------------------------------- what it shows
+    /* 1 2 or Tab: the views; + - zoom; g blocks or braille; r reads again (and starts the GPU step again); q, Esc or m close
+       The arrows or j k pick a resource (the second view) */
+    bool onEvent(Event e, bool& close) {
+        const int n = std::max(1, item_count);
+        if (e == Event::Character('r')) {
+            if (reload) reload();
+        } else if (e == Event::Character('1')) {
+            view = 0;
+        } else if (e == Event::Character('2')) {
+            view = 1;
+        } else if (e == Event::Character('g')) {
+            symbols = symbols == chart::Symbols::Block ? chart::Symbols::Braille : chart::Symbols::Block;
+        } else if (e == Event::Tab || e == Event::TabReverse) {
+            view = 1 - view;
+        } else if (e == Event::Character('+') || e == Event::Character('=')) {
+            zoom = std::max(0, zoom - 1);
+        } else if (e == Event::Character('-') || e == Event::Character('_')) {
+            zoom = std::min(static_cast<int>(std::size(ZOOMS)) - 1, zoom + 1);
+        } else if (e == Event::ArrowDown || e == Event::Character('j')) {
+            view = 1;
+            selected = (selected + 1) % n;
+        } else if (e == Event::ArrowUp || e == Event::Character('k')) {
+            view = 1;
+            selected = (selected + n - 1) % n;
+        } else if (e.is_mouse()) {
+            if (view == 1 && e.mouse().button == Mouse::WheelDown) selected = std::min(n - 1, selected + 1);
+            else if (view == 1 && e.mouse().button == Mouse::WheelUp) selected = std::max(0, selected - 1);
+        } else {
+            close = e == Event::Escape || e == Event::Character('q') || e == Event::Character('m');
+        }
+        return true;
+    }
 
-    int gpu_offset = 0, gpu_page = 8;
+    // ---------------------------------------------------------------- pieces
 
     static std::string watts(double w) {
         if (w >= 1000) {
@@ -274,215 +255,460 @@ struct MonitorView {
         }
         return std::to_string(static_cast<long>(w + 0.5)) + " W";
     }
-
-    // q or Esc closes, + and - zoom, r reads again (and starts the GPU step again if it ended), j/k scroll the GPUs
-    bool onEvent(Event e, bool& close) {
-        if (e == Event::Character('r')) {
-            if (reload) reload();
-        } else if (e == Event::Character('+') || e == Event::Character('=')) {
-            zoom = std::max(0, zoom - 1);
-        } else if (e == Event::Character('-') || e == Event::Character('_')) {
-            zoom = std::min(static_cast<int>(std::size(ZOOMS)) - 1, zoom + 1);
-        } else if (!scrollKey(e, gpu_offset, gpu_page) && !e.is_mouse()) {
-            close = e == Event::Escape || e == Event::Character('q') || e == Event::Character('m');
-        }
-        return true;
+    static std::string pct(double r) { return r < 0 ? "-" : std::to_string(static_cast<int>(std::lround(r * 100))) + "%"; }
+    static std::string shortNode(const std::string& node) {
+        const size_t dash = node.rfind('-');
+        return dash == std::string::npos ? node : node.substr(dash + 1);
     }
-
-    // "Used    ▕██████░░░░▏ 62%  320G": a gauge as btop draws them
-    static Element meter(const std::string& label, double ratio, const std::string& value, int width, Color c) {
-        const int bar_w = std::max(4, width - 10 - 6 - static_cast<int>(util::width(value)) - 1);
-        return hbox({text(util::padRight(label, 10)) | dim, bar(std::clamp(ratio, 0.0, 1.0), bar_w, c),
-                     text(util::padLeft(ratio < 0 ? "-" : percent(ratio), 5) + " ") | bold, text(value)});
+    static std::string stepName(const std::string& id) {
+        const size_t dot = id.find('.');
+        return dot == std::string::npos ? id : id.substr(dot + 1);
     }
+    double memScale() const { return mem_limit_mib > 0 ? mem_limit_mib : std::max(1.0, mem.peak() * 1.25); }
 
-    static Element row(const std::string& label, const std::string& value) {
-        return hbox({text(util::padRight(label, 10)) | dim, text(value) | bold});
-    }
-
-    // The mean and the highest of what the curve shows now
-    static std::pair<double, double> meanPeak(const std::vector<double>& v) {
-        double sum = 0, peak = -1;
-        int n = 0;
-        for (double x : v)
-            if (x >= 0) {
-                sum += x;
-                peak = std::max(peak, x);
-                n++;
-            }
-        return {n > 0 ? sum / n : -1, peak};
-    }
-
-    /* A curve with its scale, as a task manager shows it: what it is and its top above, its time span and 0 under
-       (`height` counts those two lines) */
-    Element plot(const std::vector<double>& values, const std::string& what, const std::string& top, Color c, int width,
-                 int height, double window) const {
-        const int h = std::max(1, height - 2);
-        Element body = values.empty() || std::all_of(values.begin(), values.end(), [](double v) { return v < 0; })
-                           ? vbox({text("waiting for a reading...") | dim, filler()}) | size(HEIGHT, EQUAL, h)
-                           : curve(values, h, c, std::max(6, width / 6));
-        return vbox({hbox({text(what) | dim, filler(), text(top) | dim}), body,
-                     hbox({text(util::duration(static_cast<long>(window))) | dim, filler(), text("0") | dim})}) |
+    // A box as btop draws them: its name, and what it says now, on the top border
+    static Element box(const std::string& name, Element right, Element content, Color frame, int width, int height) {
+        Elements top = {text("─") | color(frame), text(name) | bold | color(Color::RGB(0xee, 0xee, 0xee)), filler()};
+        if (right) top.push_back(hbox({text(" "), right, text(" ")}));
+        top.push_back(text("─") | color(frame));
+        return dbox({content | flex | borderStyled(ROUNDED, frame), vbox({hbox(std::move(top)), filler()})}) | clear_under |
                size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height);
     }
 
-    // A box of the dashboard, its name and figure on the top border
-    static Element box(const std::string& name, const std::string& figure, Element content, Color c, int width, int height) {
-        return panel(name, content | flex, c, text(figure) | bold) | size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height);
+    // "CPU  ■■■■■■■■■■■■  91%", as in btop's processor box
+    static Element gauge(const std::string& label, double ratio, int width, const chart::Gradient& g) {
+        const int w = std::max(3, width - 5 - 5);
+        return hbox({text(util::padRight(label, 5)) | bold, chart::meter(ratio, w, g),
+                     text(util::padLeft(pct(ratio), 5)) | bold | color(g.at(std::max(0.0, ratio)))});
     }
 
-    Element render(int max_width, int max_height) {
-        const int inner_w = std::max(40, max_width - 2), inner_h = std::max(12, max_height - 2);
-        const double now = nowSeconds(), step = ZOOMS[zoom];
-        const std::time_t now_t = static_cast<std::time_t>(now);
-        const bool has_gpus = gpus > 0, wide = inner_w >= 100;
-
-        // The job, in one line
-        Elements head = {text(state) | bold | color(stateColor(state)),
-                         text(" · " + std::to_string(nodes) + (nodes == 1 ? " node · " : " nodes · ") + thousands(cpus) +
-                              (cpus == 1 ? " CPU" : " CPUs") + (has_gpus ? " · " + std::to_string(gpus) + (gpus == 1 ? " GPU" : " GPUs") : "")) |
-                             dim};
-        if (started > 0) {
-            const long ran = static_cast<long>(now_t - started);
-            head.push_back(text(" · run " + util::duration(ran)) | dim);
-            if (limit > 0) head.push_back(text(" · " + util::duration(std::max(0L, limit - ran)) + " left") | dim);
+    // The scale beside a graph: its top at the top (at the bottom for one hanging down), 0 where it starts
+    static Element axis(int height, const std::string& top, bool hanging = false, int width = 5) {
+        Elements rows;
+        for (int r = 0; r < height; r++) {
+            const bool at_top = hanging ? r == height - 1 : r == 0;
+            const bool at_zero = !hanging && r == height - 1;   // a hanging graph shares the 0 of the one above
+            rows.push_back(text(util::padLeft(at_top ? top : at_zero && height > 2 ? "0" : "", static_cast<size_t>(width - 1)) + " ") |
+                           color(chart::graphText()));
         }
-        if (!partition.empty()) head.push_back(text(" · " + partition) | dim);
+        return vbox(std::move(rows));
+    }
 
-        // Heights: the CPU on top, memory under it, the GPUs at the bottom (btop's cpu, mem and proc)
-        const int body_h = inner_h - 2;
-        const int cpu_h = has_gpus ? std::max(8, body_h * 3 / 10) : body_h / 2;
-        const int mem_h = has_gpus ? std::max(8, body_h * 3 / 10) : body_h - cpu_h;
-        const int gpu_h = has_gpus ? std::max(6, body_h - cpu_h - mem_h) : 0;
+    // ---------------------------------------------------------------- 1: btop's
 
-        // cpu: its curve, and beside it (btop's processor box) the figures
-        const int info_w = wide ? 36 : 0;
-        const int cpu_plot_w = inner_w - 2 - (wide ? info_w + 1 : 0);
-        const double cpu_window = step * cpu_plot_w * 2;
-        const auto cpu_values = resample(cpu, now, step, cpu_plot_w * 2, 1);
+    Element overview(int width, int height, double now) {
+        const double step = ZOOMS[zoom];
+        const bool has_gpus = gpus > 0, wide = width >= 100;
+        const int cpu_h = std::clamp(height * 9 / 20, 8, std::max(8, height - 10));
+        const int low_h = height - cpu_h;
+
+        // cpu: its curve, and hanging from the middle the GPUs' (else the memory's), as btop puts its lower graph
+        const int side_w = wide ? std::clamp(width * 2 / 5, 44, 64) : 0;
+        const int graph_w = width - 2 - (wide ? side_w + 1 : 0) - 5;
+        const int graphs_h = cpu_h - 3;
+        const int up_h = (graphs_h + 1) / 2, down_h = graphs_h - up_h;
         const double busy = cpu.last();
-        Element cpu_content = plot(cpu_values, "busy share of its CPUs", "100%", theme::cyan(), cpu_plot_w, cpu_h - 2, cpu_window);
+        const Series& under = has_gpus ? gpu : mem;
+        const chart::Gradient under_g = has_gpus ? chart::gpuGradient() : chart::usedGradient();
+        const double under_now = has_gpus ? gpu.last() : mem_mib < 0 ? -1 : mem_mib / memScale();
+        Elements left = {hbox({axis(up_h, "100%"), chart::graph(resample(cpu, now, step, graph_w, 1), graph_w, up_h, chart::cpuGradient(), false, symbols)}),
+                         hbox({axis(down_h, has_gpus ? "100%" : util::mib(memScale()), true),
+                               chart::graph(resample(under, now, step, graph_w, has_gpus ? 1 : memScale()), graph_w, down_h, under_g, true, symbols)})};
+        Elements legend = {text("▲ cpu ") | color(chart::graphText()), text(pct(busy)) | bold | color(chart::cpuGradient().at(std::max(0.0, busy))),
+                           text(has_gpus ? "   ▼ gpu " : "   ▼ mem ") | color(chart::graphText()),
+                           text(pct(under_now)) | bold | color(under_g.at(std::max(0.0, under_now))), filler()};
+        if (started > 0) {
+            const long ran = static_cast<long>(static_cast<std::time_t>(now) - started);
+            legend.push_back(text("up " + util::duration(ran) + (limit > 0 ? " · " + util::duration(std::max(0L, limit - ran)) + " left" : "")) |
+                             color(chart::graphText()));
+        }
+        left.push_back(hbox(std::move(legend)));
+        Element cpu_content = vbox(std::move(left)) | size(WIDTH, EQUAL, graph_w + 5);
+
         if (wide) {
-            const auto [mean, peak] = meanPeak(cpu_values);
-            Elements info = {meter("CPU", busy, "", info_w - 2, efficiencyColor(std::max(0.0, busy))),
-                             row("cores", busy < 0 ? "-" : std::to_string(static_cast<long>(busy * cpus + 0.5)) + " / " + thousands(cpus) + " busy"),
-                             row("mean", mean < 0 ? "-" : percent(mean) + "   peak " + percent(peak)),
-                             row("CPU time", has_live ? util::duration(static_cast<long>(live.cpu_seconds)) : "-")};
-            if (started > 0) info.push_back(row("run", util::duration(static_cast<long>(now_t - started)) +
-                                                           (limit > 0 ? " · " + util::duration(std::max(0L, limit - static_cast<long>(now_t - started))) + " left" : "")));
-            cpu_content = hbox({cpu_content, text(" "),
-                                vbox(std::move(info)) | size(WIDTH, EQUAL, info_w - 2) | borderStyled(ROUNDED, theme::gray()) |
-                                    size(HEIGHT, EQUAL, std::min(cpu_h - 2, 7))});
-        }
-        Elements boxes = {box("cpu", busy < 0 ? "" : percent(busy), cpu_content, theme::cyan(), inner_w, cpu_h)};
-
-        // mem: btop's gauges, then the curve; GPU memory beside it the same way
-        const int mem_w = has_gpus && wide ? inner_w / 2 : inner_w;
-        const double mem_scale = mem_limit_mib > 0 ? mem_limit_mib : std::max(1.0, mem.peak() * 1.25);
-        {
-            const int w = mem_w - 2;
-            const double used = has_live ? live.mem_mib : -1;
-            Elements lines = {meter("used", used < 0 ? -1 : used / mem_scale, used < 0 ? "-" : util::mib(used), w, usageColor(used / mem_scale))};
-            if (mem_h >= 10) {
-                lines.push_back(row("asked", mem_limit_mib > 0 ? util::mib(mem_limit_mib) : "nothing: scaled on its peak"));
-                lines.push_back(row("largest", has_live && live.max_task_mib > 0 ? util::mib(live.max_task_mib) + " (one task)" : "-"));
+            // Beside it, btop's processor box: a gauge for each, then each GPU (or each step) with its little curve
+            const int w = side_w - 2;
+            Elements lines = {gauge("CPU", busy, w, chart::cpuGradient()),
+                              gauge("MEM", mem_mib < 0 ? -1 : mem_mib / memScale(), w, chart::usedGradient())};
+            if (has_gpus) {
+                lines.push_back(gauge("GPU", gpu.last(), w, chart::gpuGradient()));
+                lines.push_back(gauge("VRAM", gpu_mem.last(), w, chart::cachedGradient()));
             }
-            const int plot_h = mem_h - 2 - static_cast<int>(lines.size());
-            lines.push_back(plot(resample(mem, now, step, w * 2, mem_scale), "memory in use", util::mib(mem_scale), theme::magenta(), w,
-                                 plot_h, step * w * 2));
-            Element mem_box = box("mem", used < 0 ? "" : util::mib(used), vbox(std::move(lines)), theme::magenta(), mem_w, mem_h);
-
-            if (!has_gpus) {
-                boxes.push_back(mem_box);
+            lines.push_back(separator() | color(chart::faint()));
+            const int per_row = std::max(1, w / 27), cell_w = w / per_row;
+            const int mini_w = std::max(4, cell_w - 7 - 5 - 5 - 1);
+            const double mini_step = step * graph_w / mini_w;   // the same time as the big curve
+            Elements cells;
+            if (has_gpus) {
+                for (const auto& [key, t] : gpu_tracks) {
+                    const double u = t.last.util < 0 ? -1 : t.last.util / 100;
+                    const double temp = t.last.temp_c;
+                    cells.push_back(hbox({text(util::padRight(shortNode(key.first) + ":" + std::to_string(key.second), 7)) | bold,
+                                          chart::graph(resample(t.util, now, mini_step, mini_w, 1), mini_w, 1, chart::gpuGradient(), false,
+                                                       chart::Symbols::Braille, true),
+                                          text(util::padLeft(pct(u), 5)) | color(chart::gpuGradient().at(std::max(0.0, u))),
+                                          text(temp < 0 ? "     " : util::padLeft(std::to_string(static_cast<int>(temp)) + "°", 5)) |
+                                              color(chart::tempGradient().at((temp - 30) / 60))}) |
+                                    (now - t.seen > 15 ? dim : nothing));
+                }
+                if (gpu_tracks.empty()) cells.push_back(text(gpu_waiting ? "starting nvidia-smi in the job..." : "no GPU answered") | dim);
             } else {
-                double gused = 0, gtotal = 0;
-                for (const auto& [key, t] : gpu_tracks) {
-                    gused += t.last.mem_used_mib;
-                    gtotal += t.last.mem_total_mib;
-                }
-                const int gw = (wide ? inner_w - mem_w : inner_w) - 2;
-                Elements glines = {meter("used", gtotal > 0 ? gused / gtotal : -1, gtotal > 0 ? util::mib(gused) : "-", gw,
-                                         usageColor(gtotal > 0 ? gused / gtotal : 0))};
-                if (mem_h >= 10) {
-                    glines.push_back(row("total", gtotal > 0 ? util::mib(gtotal) : "-"));
-                    glines.push_back(row("free", gtotal > 0 ? util::mib(gtotal - gused) : "-"));
-                }
-                const int gplot_h = mem_h - 2 - static_cast<int>(glines.size());
-                glines.push_back(plot(resample(gpu_mem, now, step, gw * 2, 1), "GPU memory in use", "100%", theme::blue(), gw, gplot_h,
-                                      step * gw * 2));
-                Element gm_box = box("gpu mem", gtotal > 0 ? util::mib(gused) + " / " + util::mib(gtotal) : "", vbox(std::move(glines)),
-                                     theme::blue(), wide ? inner_w - mem_w : inner_w, mem_h);
-                if (wide) boxes.push_back(hbox({mem_box, gm_box}));
-                else {
-                    boxes.push_back(mem_box);
-                    boxes.push_back(gm_box);
+                for (const auto& [id, t] : steps) {
+                    const double c = t.cores.last();
+                    cells.push_back(hbox({text(util::padRight(util::cut(stepName(id), 6), 7)) | bold,
+                                          chart::graph(resample(t.cores, now, mini_step, mini_w, std::max(1, cpus)), mini_w, 1,
+                                                       chart::cpuGradient(), false, chart::Symbols::Braille, true),
+                                          text(util::padLeft(c < 0 ? "-" : std::to_string(static_cast<long>(std::lround(c))), 5)) | bold,
+                                          text(" cor") | color(chart::graphText())}));
                 }
             }
+            for (size_t i = 0; i < cells.size(); i += static_cast<size_t>(per_row)) {
+                Elements r;
+                for (size_t k = i; k < std::min(cells.size(), i + static_cast<size_t>(per_row)); k++)
+                    r.push_back(cells[k] | size(WIDTH, EQUAL, cell_w));
+                lines.push_back(hbox(std::move(r)));
+            }
+            lines.push_back(filler());
+            lines.push_back(hbox({text(busy < 0 ? "" : std::to_string(static_cast<long>(busy * cpus + 0.5)) + "/" + thousands(cpus) + " cores busy") |
+                                      color(chart::graphText()),
+                                  filler(), text(cpu_seconds < 0 ? "" : util::duration(static_cast<long>(cpu_seconds)) + " CPU") | color(chart::graphText())}));
+            Element side = box(util::cut(nodelist, static_cast<size_t>(side_w - 6)), nullptr, vbox(std::move(lines)), chart::faint(), side_w, cpu_h - 2);
+            cpu_content = hbox({cpu_content, text(" "), side});
         }
+        Elements rows = {box("¹cpu",
+                             text(thousands(cpus) + (cpus == 1 ? " CPU" : " CPUs") + " · " + std::to_string(nodes) + (nodes == 1 ? " node" : " nodes")) |
+                                 color(chart::graphText()),
+                             cpu_content, chart::cpuGradient().low, width, cpu_h)};
 
-        // gpu: the mean use of all, and beside it each GPU with its own little curve (btop's cores)
-        if (has_gpus) {
-            const int list_w = wide ? std::min(60, inner_w / 2) : 0;
-            const int plot_w = inner_w - 2 - (wide ? list_w + 1 : 0);
-            double power = 0;
-            int idle = 0;
-            for (const auto& [key, t] : gpu_tracks) {
-                if (t.last.power_w > 0) power += t.last.power_w;
-                idle += t.last.util >= 0 && t.last.util < 5;
-            }
-            Element content = plot(resample(gpu, now, step, plot_w * 2, 1), "mean use of its GPUs", "100%", theme::green(), plot_w,
-                                   gpu_h - 2, step * plot_w * 2);
-            if (wide) {
-                Elements list;
-                gpu_page = std::max(1, gpu_h - 3);
-                gpu_offset = std::clamp(gpu_offset, 0, std::max(0, static_cast<int>(gpu_tracks.size()) - gpu_page));
-                const int mini_w = std::max(4, list_w - 2 - 16 - 5 - 6 - 8);
-                int i = 0;
-                for (const auto& [key, t] : gpu_tracks) {
-                    if (i++ < gpu_offset || static_cast<int>(list.size()) >= gpu_page) continue;
-                    const auto& g = t.last;
-                    const double use = g.util < 0 ? 0 : g.util / 100;
-                    list.push_back(hbox({text(util::padRight(util::cut(key.first, 13) + ":" + std::to_string(key.second), 16)) | color(theme::cyan()),
-                                         brailleGraph(resample(t.util, now, step * plot_w * 2 / (mini_w * 2), mini_w * 2, 1), 1,
-                                                      efficiencyColor(use), false),
-                                         text(g.util < 0 ? "    -" : util::padLeft(percent(use), 5)) | bold | color(efficiencyColor(use)),
-                                         text(g.temp_c < 0 ? "      " : util::padLeft(std::to_string(static_cast<int>(g.temp_c)) + "°C", 6)) |
-                                             color(g.temp_c >= 85 ? theme::red() : g.temp_c >= 75 ? theme::yellow() : theme::gray()),
-                                         text(g.power_w < 0 ? "" : util::padLeft(watts(g.power_w), 8)) | dim}) |
-                                   (now - t.seen > 15 ? dim : nothing));
-                }
-                if (gpu_tracks.empty()) list.push_back(text(gpu_waiting ? "starting nvidia-smi in the job..." : "no GPU answered") | dim);
-                std::string foot = idle > 0 ? std::to_string(idle) + " almost idle: does the code use them?" : "";
-                if (static_cast<int>(gpu_tracks.size()) > gpu_page)
-                    foot += (foot.empty() ? "" : " · ") + std::to_string(gpu_offset + 1) + "-" +
-                            std::to_string(std::min<int>(gpu_offset + gpu_page, static_cast<int>(gpu_tracks.size()))) + " of " +
-                            std::to_string(gpu_tracks.size()) + " (j/k)";
-                list.push_back(filler());
-                list.push_back(text(foot) | color(idle > 0 ? theme::yellow() : theme::gray()));
-                content = hbox({content, text(" "), vbox(std::move(list)) | size(WIDTH, EQUAL, list_w - 2) |
-                                                        borderStyled(ROUNDED, theme::gray()) | size(HEIGHT, EQUAL, gpu_h - 2)});
-            }
-            std::string figure = gpu.empty() ? "" : percent(gpu.last()) + " mean";
-            if (power > 0) figure += " · " + watts(power);
-            boxes.push_back(box("gpu", figure, content, theme::green(), inner_w, gpu_h));
+        // Under it: mem, io and the steps side by side (the steps go when it is narrow)
+        const int mem_w = wide ? width * 26 / 100 : width / 2;
+        const int io_w = wide ? width * 33 / 100 : width - mem_w;
+        const int steps_w = wide ? width - mem_w - io_w : 0;
+        Elements bottom = {memBox(mem_w, low_h, now), ioBox(io_w, low_h, now)};
+        if (steps_w > 0) bottom.push_back(stepsBox(steps_w, low_h, now));
+        rows.push_back(hbox(std::move(bottom)));
+        return vbox(std::move(rows));
+    }
+
+    // btop's mem box: what it asked, what it uses with its curve, what is left, its largest task, the GPUs' memory
+    Element memBox(int width, int height, double now) const {
+        const int w = width - 2;
+        const double step = ZOOMS[zoom], scale = memScale();
+        const auto head = [](const std::string& label, const std::string& value, Color c) {
+            return hbox({text(label) | bold, filler(), text(value) | bold | color(c)});
+        };
+        double gu = 0, gt = 0;
+        for (const auto& [key, t] : gpu_tracks) {
+            gu += t.last.mem_used_mib;
+            gt += t.last.mem_total_mib;
         }
-        boxes.push_back(filler());
+        const int fixed = 2 + (mem_limit_mib > 0 ? 2 : 0) + 2 + (gpus > 0 ? 2 : 0);
+        const int graph_h = std::clamp(height - 2 - fixed, 1, 8);
+        const double used = mem_mib < 0 ? -1 : mem_mib / scale;
+        Elements lines = {head("Asked:", mem_limit_mib > 0 ? util::mib(mem_limit_mib) : "none", Color::RGB(0xee, 0xee, 0xee)),
+                          head("Used:", mem_mib < 0 ? "-" : util::mib(mem_mib), chart::usedGradient().high),
+                          hbox({chart::graph(resample(mem, now, step * 2, w - 5, scale), w - 5, graph_h, chart::usedGradient(), false,
+                                             symbols, true),
+                                vbox({filler(), text(util::padLeft(pct(used), 5)) | bold})})};
+        if (mem_limit_mib > 0) {
+            const double free_ratio = used < 0 ? -1 : std::max(0.0, 1 - used);
+            lines.push_back(head("Free:", mem_mib < 0 ? "-" : util::mib(std::max(0.0, mem_limit_mib - mem_mib)), chart::freeGradient().mid));
+            lines.push_back(hbox({chart::meter(free_ratio, w - 5, chart::freeGradient()), text(util::padLeft(pct(free_ratio), 5))}));
+        }
+        lines.push_back(head("Largest task:", max_task_mib > 0 ? util::mib(max_task_mib) : "-", chart::availableGradient().mid));
+        lines.push_back(text(max_task_node.empty() ? "" : "on " + max_task_node) | color(chart::graphText()));
+        if (gpus > 0) {
+            lines.push_back(head("GPU memory:", gt > 0 ? util::mib(gu) + " / " + util::mib(gt) : "-", chart::cachedGradient().mid));
+            lines.push_back(hbox({chart::meter(gpu_mem.last(), w - 5, chart::cachedGradient()), text(util::padLeft(pct(gpu_mem.last()), 5))}));
+        }
+        return box("²mem", nullptr, vbox(std::move(lines)), chart::usedGradient().mid, width, height);
+    }
 
-        // What went wrong, else the keys
-        Element bottom;
-        if (ended) bottom = text("The job isn't running any more: the curves keep what it did") | color(theme::yellow());
-        else if (!cpu_error.empty() || !gpu_error.empty())
-            bottom = text(util::cut(cpu_error.empty() ? gpu_error : gpu_error.empty() ? cpu_error : cpu_error + " · " + gpu_error,
-                                    static_cast<size_t>(inner_w))) |
-                     color(theme::red());
-        else
-            bottom = hbox({hbox(keyHints({{"+/-", "zoom"}, {"r", "read again"}, {"j/k", "GPUs"}, {"q", "close"}})), filler(),
-                           text(std::to_string(static_cast<int>(step)) + " s per dot") | dim});
+    // btop's net box, for the disks: the reads rising, the writes hanging under them, the rates and totals beside
+    Element ioBox(int width, int height, double now) const {
+        const double step = ZOOMS[zoom];
+        const bool info = width >= 40;
+        const int info_w = info ? 20 : 0;
+        const int gw = width - 2 - info_w - 7;
+        const int gh = height - 2;
+        const double top = chart::niceMax(std::max({reads.peak(now - step * gw), writes.peak(now - step * gw), 1e6}));
+        const double r = reads.last(), w = writes.last();
+        const std::string label = chart::bytes(top);
+        Element content = vbox({hbox({axis((gh + 1) / 2, label, false, 7),
+                                      chart::graph(resample(reads, now, step, gw, top), gw, (gh + 1) / 2, chart::readGradient(), false, symbols)}),
+                                hbox({axis(gh / 2, label, true, 7),
+                                      chart::graph(resample(writes, now, step, gw, top), gw, gh / 2, chart::writeGradient(), true, symbols)})}) |
+                          size(WIDTH, EQUAL, gw + 7);
+        if (info) {
+            Element side = vbox({text(" ▼ read") | bold | color(chart::readGradient().high),
+                                 text(r < 0 ? "   -" : "   " + chart::bytes(r) + "/s") | bold,
+                                 text("   total " + chart::bytes(read_total)) | color(chart::graphText()), text(""),
+                                 text(" ▲ write") | bold | color(chart::writeGradient().high),
+                                 text(w < 0 ? "   -" : "   " + chart::bytes(w) + "/s") | bold,
+                                 text("   total " + chart::bytes(write_total)) | color(chart::graphText()), filler()}) |
+                           size(WIDTH, EQUAL, info_w);
+            content = hbox({content, side});
+        }
+        return box("³io", text("disk, all its steps") | color(chart::graphText()), content, chart::readGradient().mid, width, height);
+    }
 
-        const std::string when = std::string(ended ? "stopped" : "live") + " · sstat 2 s" + (has_gpus ? " · nvidia-smi 2 s" : "");
-        return panel(title, vbox({hbox(std::move(head)), vbox(std::move(boxes)) | size(HEIGHT, EQUAL, body_h), bottom}) |
-                                size(WIDTH, EQUAL, inner_w) | size(HEIGHT, EQUAL, inner_h),
-                     theme::accent(), text(when) | dim);
+    // btop's proc box: the job's steps, the busiest first, each with the curve of the cores it keeps busy
+    Element stepsBox(int width, int height, double now) const {
+        const double step = ZOOMS[zoom];
+        const int w = width - 2;
+        const int graph_w = std::max(4, w - (8 + 7 + 7 + 1 + 7 + 8 + 2 + 6));
+        std::vector<const std::pair<const std::string, StepTrack>*> order;
+        for (const auto& s : steps) order.push_back(&s);
+        std::sort(order.begin(), order.end(), [](auto* a, auto* b) { return a->second.cores.last() > b->second.cores.last(); });
+        const auto col = [](const std::string& s, int n, bool right = true) {
+            return text(right ? util::padLeft(s, static_cast<size_t>(n)) : util::padRight(s, static_cast<size_t>(n)));
+        };
+        Elements lines = {hbox({col("Step:", 8, false), col("Tasks:", 7), col("Cores:", 7), text(" "), text("") | size(WIDTH, EQUAL, graph_w),
+                                col("Mem:", 7), col("MaxRSS:", 8), text("  "), col("Node:", 6, false)}) |
+                          bold};
+        for (const auto* s : order) {
+            const auto& t = s->second;
+            const double c = t.cores.last();
+            lines.push_back(hbox({col(util::cut(stepName(s->first), 7), 8, false) | color(chart::cpuGradient().low),
+                                  col(std::to_string(t.last.tasks), 7),
+                                  col(c < 0 ? "-" : std::to_string(static_cast<long>(std::lround(c))), 7) | bold, text(" "),
+                                  chart::graph(resample(t.cores, now, step * 2, graph_w, std::max(1, cpus)), graph_w, 1, chart::cpuGradient(), false,
+                                               chart::Symbols::Braille, true),
+                                  col(util::mib(t.last.mem_mib), 7), col(util::mib(t.last.max_rss_mib), 8), text("  "),
+                                  col(util::cut(shortNode(t.last.max_rss_node), 6), 6, false) | color(chart::graphText())}));
+        }
+        if (steps.empty()) lines.push_back(text("reading sstat...") | dim);
+        lines.push_back(filler());
+        lines.push_back(text(util::cut("cores: CPU seconds per second · MaxRSS: its largest task, and where", static_cast<size_t>(w))) |
+                        color(chart::graphText()));
+        return box("⁴steps", text(std::to_string(steps.size()) + (steps.size() == 1 ? " step" : " steps")) | color(chart::graphText()),
+                   vbox(std::move(lines)), chart::cpuGradient().mid, width, height);
+    }
+
+    // ---------------------------------------------------------------- 2: a task manager's
+
+    // One resource of the list on the left, and what its chart shows
+    struct Item {
+        struct Curve {
+            const Series* series;
+            double scale;
+            Color color;
+            std::string name;
+        };
+        std::string name, value, subtitle;
+        const Series* mini = nullptr;   // its little curve in the list
+        double mini_scale = 1;
+        chart::Gradient g;
+        std::vector<Curve> curves;
+        std::function<std::string(double)> y_label;
+        std::vector<std::pair<std::string, std::string>> stats;
+    };
+
+    std::vector<Item> items(double now) const {
+        std::vector<Item> out;
+        const std::time_t now_t = static_cast<std::time_t>(now);
+        const auto percentLabel = [](double f) { return std::to_string(static_cast<int>(std::lround(f * 100))) + "%"; };
+        {
+            const double busy = cpu.last();
+            Item it{"CPU", busy < 0 ? "reading..." : pct(busy) + " · " + std::to_string(static_cast<long>(busy * cpus + 0.5)) + " cores",
+                    thousands(cpus) + (cpus == 1 ? " CPU" : " CPUs") + " on " + nodelist, &cpu, 1, chart::cpuGradient(),
+                    {{&cpu, 1, chart::cpuGradient().low, "busy"}}, percentLabel, {}};
+            it.stats = {{"Use", pct(busy)},
+                        {"Cores busy", busy < 0 ? "-" : std::to_string(static_cast<long>(busy * cpus + 0.5)) + " / " + thousands(cpus)},
+                        {"CPU time", cpu_seconds < 0 ? "-" : util::duration(static_cast<long>(cpu_seconds))},
+                        {"Steps", std::to_string(steps.size())}};
+            if (started > 0) {
+                it.stats.push_back({"Running for", util::duration(static_cast<long>(now_t - started))});
+                if (limit > 0) it.stats.push_back({"Time left", util::duration(std::max(0L, limit - static_cast<long>(now_t - started)))});
+            }
+            out.push_back(std::move(it));
+        }
+        {
+            const double scale = memScale();
+            Item it{"Memory",
+                    mem_mib < 0 ? "reading..."
+                                : util::mib(mem_mib) + (mem_limit_mib > 0 ? " / " + util::mib(mem_limit_mib) + " (" + pct(mem_mib / mem_limit_mib) + ")" : ""),
+                    mem_limit_mib > 0 ? util::mib(mem_limit_mib) + " asked" : "nothing asked: scaled on its peak", &mem, scale, chart::usedGradient(),
+                    {{&mem, scale, chart::usedGradient().mid, "in use"}}, [scale](double f) { return util::mib(f * scale); }, {}};
+            it.stats = {{"In use", mem_mib < 0 ? "-" : util::mib(mem_mib)},
+                        {"Asked", mem_limit_mib > 0 ? util::mib(mem_limit_mib) : "-"},
+                        {"Free", mem_limit_mib > 0 && mem_mib >= 0 ? util::mib(std::max(0.0, mem_limit_mib - mem_mib)) : "-"},
+                        {"Peak seen", mem.empty() ? "-" : util::mib(mem.peak())},
+                        {"Largest task", max_task_mib > 0 ? util::mib(max_task_mib) : "-"},
+                        {"Its node", max_task_node.empty() ? "-" : max_task_node}};
+            out.push_back(std::move(it));
+        }
+        {
+            const double top = chart::niceMax(std::max({reads.peak(), writes.peak(), 1e6}));
+            Item it{"Disk",
+                    "R " + (reads.empty() ? "-" : chart::bytes(reads.last()) + "/s") + " · W " + (writes.empty() ? "-" : chart::bytes(writes.last()) + "/s"),
+                    "what its steps read and write, every file system", &reads, top, chart::readGradient(),
+                    {{&reads, top, chart::readGradient().high, "read"}, {&writes, top, chart::writeGradient().high, "write"}},
+                    [top](double f) { return chart::bytes(f * top) + "/s"; }, {}};
+            it.stats = {{"Read", reads.empty() ? "-" : chart::bytes(reads.last()) + "/s"},
+                        {"Write", writes.empty() ? "-" : chart::bytes(writes.last()) + "/s"},
+                        {"Read in all", chart::bytes(read_total)},
+                        {"Written in all", chart::bytes(write_total)},
+                        {"Peak read", chart::bytes(reads.peak()) + "/s"},
+                        {"Peak write", chart::bytes(writes.peak()) + "/s"}};
+            out.push_back(std::move(it));
+        }
+        if (gpus <= 0) return out;
+
+        double power = 0, hottest = -1;
+        int idle = 0;
+        std::string model;
+        for (const auto& [key, t] : gpu_tracks) {
+            if (t.last.power_w > 0) power += t.last.power_w;
+            hottest = std::max(hottest, t.last.temp_c);
+            idle += t.last.util >= 0 && t.last.util < 5;
+            model = t.last.name;
+        }
+        {
+            Item it{"GPUs", gpu.empty() ? (gpu_waiting ? "starting..." : "no answer") : pct(gpu.last()) + " · " + pct(gpu_mem.last()) + " memory",
+                    std::to_string(gpus) + " × " + (model.empty() ? "GPU" : model), &gpu, 1, chart::gpuGradient(),
+                    {{&gpu, 1, chart::gpuGradient().mid, "mean use"}, {&gpu_mem, 1, chart::cachedGradient().mid, "memory"}}, percentLabel, {}};
+            it.stats = {{"Mean use", pct(gpu.last())},
+                        {"Memory", pct(gpu_mem.last())},
+                        {"Power", power > 0 ? watts(power) : "-"},
+                        {"Hottest", hottest >= 0 ? std::to_string(static_cast<int>(hottest)) + " °C" : "-"},
+                        {"Almost idle", std::to_string(idle) + " / " + std::to_string(gpu_tracks.size())}};
+            out.push_back(std::move(it));
+        }
+        for (const auto& [key, t] : gpu_tracks) {
+            const auto& g = t.last;
+            const double use = g.util < 0 ? -1 : g.util / 100;
+            Item it{"GPU " + shortNode(key.first) + ":" + std::to_string(key.second),
+                    pct(use) + " · " + util::mib(g.mem_used_mib) + (g.temp_c >= 0 ? " · " + std::to_string(static_cast<int>(g.temp_c)) + "°C" : ""),
+                    g.name + " on " + key.first, &t.util, 1, chart::gpuGradient(),
+                    {{&t.util, 1, chart::gpuGradient().mid, "use"}, {&t.mem, 1, chart::cachedGradient().mid, "memory"}}, percentLabel, {}};
+            it.stats = {{"Use", pct(use)},
+                        {"Memory", util::mib(g.mem_used_mib) + " / " + util::mib(g.mem_total_mib)},
+                        {"Temperature", g.temp_c >= 0 ? std::to_string(static_cast<int>(g.temp_c)) + " °C" : "-"},
+                        {"Power", g.power_w < 0 ? "-" : watts(g.power_w) + (g.power_limit_w > 0 ? " / " + watts(g.power_limit_w) : "")}};
+            if (now - t.seen > 15) it.stats.push_back({"Last answer", util::duration(static_cast<long>(now - t.seen)) + " ago"});
+            out.push_back(std::move(it));
+        }
+        return out;
+    }
+
+    // A resource in the list: its little curve in a frame, its name and what it does now
+    static Element sideItem(const Item& it, bool on, int width, double now, double window) {
+        const int mini_w = 12;
+        Element mini = chart::graph(resample(*it.mini, now, window / mini_w, mini_w, it.mini_scale), mini_w, 2, it.g) |
+                       borderStyled(ROUNDED, on ? it.g.mid : chart::faint());
+        const size_t text_w = static_cast<size_t>(std::max(4, width - mini_w - 4));
+        Element name = text(util::cut(it.name, text_w)) | bold;
+        if (!on) name = name | color(chart::graphText());
+        Element value = text(util::cut(it.value, text_w));
+        if (!on) value = value | color(chart::graphText());
+        Element row = hbox({text(on ? "▌" : " ") | color(it.g.mid), mini, text(" "), vbox({text(""), name, value})}) | size(WIDTH, EQUAL, width);
+        return on ? row | bgcolor(Color::RGB(0x22, 0x26, 0x2e)) : row;
+    }
+
+    Element performance(int width, int height, double now) {
+        const auto list = items(now);
+        item_count = static_cast<int>(list.size());
+        selected = std::clamp(selected, 0, item_count - 1);
+        const Item& it = list[static_cast<size_t>(selected)];
+        const double step = ZOOMS[zoom];
+
+        const bool side = width >= 90;
+        const int side_w = side ? 40 : 0;
+        const int right_w = width - side_w - (side ? 2 : 0);
+
+        // The figures under the chart, in columns: label above, value under it
+        const int col_w = 20, per_row = std::max(1, right_w / col_w);
+        Elements stat_rows;
+        for (size_t i = 0; i < it.stats.size(); i += static_cast<size_t>(per_row)) {
+            Elements labels, figures;
+            for (size_t k = i; k < std::min(it.stats.size(), i + static_cast<size_t>(per_row)); k++) {
+                labels.push_back(text(util::cut(it.stats[k].first, col_w - 1)) | color(chart::graphText()) | size(WIDTH, EQUAL, col_w));
+                figures.push_back(text(util::cut(it.stats[k].second, col_w - 1)) | bold | size(WIDTH, EQUAL, col_w));
+            }
+            stat_rows.push_back(hbox(std::move(labels)));
+            stat_rows.push_back(hbox(std::move(figures)));
+        }
+        const int chart_h = std::max(6, height - 3 - static_cast<int>(stat_rows.size()));
+
+        // The chart: each curve resampled to two values a column (the canvas' dots)
+        const int cols = chart::lineColumns(right_w, chart_h, it.y_label);
+        const double window = step * cols;
+        std::vector<chart::Line> lines;
+        Elements legend;
+        for (const auto& c : it.curves) {
+            lines.push_back({resample(*c.series, now, step / 2, cols * 2, c.scale), c.color, lines.empty()});
+            legend.push_back(text("━ ") | bold | color(c.color));
+            legend.push_back(text(c.name + "   ") | color(chart::graphText()));
+        }
+        const auto x_label = [step](int from_right) {
+            const long s = std::lround(from_right * step);
+            if (from_right == 0) return std::string("now");
+            if (s < 60) return "-" + std::to_string(s) + "s";
+            if (s % 60 == 0 || s >= 3600) return "-" + util::duration(s);
+            return "-" + std::to_string(s / 60) + "m" + (s % 60 < 10 ? "0" : "") + std::to_string(s % 60);
+        };
+        // A grid line every round number of seconds, about six across
+        double tick = 10;
+        for (double t : {10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600})
+            if ((tick = t) >= cols / 6.0 * step) break;
+        Element big = chart::lineChart(lines, right_w, chart_h, it.y_label, x_label, std::max(4, static_cast<int>(tick / step)));
+
+        const size_t sub_w = static_cast<size_t>(std::max(0, right_w - static_cast<int>(util::width(it.name)) - 2));
+        const std::string where = side ? "" : "  " + std::to_string(selected + 1) + "/" + std::to_string(item_count) + " ↑↓";
+        Element pane = vbox({hbox({text(it.name) | bold | color(it.g.high), text(where) | color(chart::graphText()), text("  "), text(util::cut(it.subtitle, sub_w)) | color(chart::graphText())}),
+                             hbox({hbox(std::move(legend)), filler(), text(util::duration(static_cast<long>(window)) + " shown") | color(chart::graphText())}),
+                             big, text(""), vbox(std::move(stat_rows)), filler()}) |
+                       size(WIDTH, EQUAL, right_w);
+        if (!side) return pane;
+
+        const int fits = std::max(1, (height - 1) / 4);
+        side_offset = std::clamp(side_offset, std::max(0, selected - fits + 1), selected);
+        side_offset = std::clamp(side_offset, 0, std::max(0, item_count - fits));
+        Elements rows;
+        for (int i = side_offset; i < std::min(item_count, side_offset + fits); i++)
+            rows.push_back(sideItem(list[static_cast<size_t>(i)], i == selected, side_w, now, window));
+        rows.push_back(filler());
+        if (item_count > fits)
+            rows.push_back(text(" " + std::to_string(side_offset + 1) + "-" + std::to_string(std::min(item_count, side_offset + fits)) + " of " +
+                                std::to_string(item_count) + " · ↑↓") |
+                           color(chart::graphText()));
+        return hbox({vbox(std::move(rows)) | size(WIDTH, EQUAL, side_w), separator() | color(chart::faint()), text(" "), pane});
+    }
+
+    // ---------------------------------------------------------------- the whole
+
+    Element render(int max_width, int max_height) {
+        const int inner_w = std::max(40, max_width - 2), inner_h = std::max(14, max_height - 2);
+        const double now = nowSeconds();
+
+        // The views as tabs, and the job
+        const auto tab = [&](int i, const std::string& name) {
+            Element t = text(" " + std::to_string(i + 1) + " " + name + " ");
+            return view == i ? t | bold | inverted | color(theme::accent()) : t | color(chart::graphText());
+        };
+        Elements head = {tab(0, "btop"), tab(1, "performance"), text("  "), text(state) | bold | color(stateColor(state)),
+                         text(" · " + partition) | color(chart::graphText()), filler()};
+        if (!cpu_error.empty() || !gpu_error.empty())
+            head.push_back(text(util::cut(cpu_error.empty() ? gpu_error : cpu_error, static_cast<size_t>(inner_w / 2))) | color(theme::red()));
+        else if (ended)
+            head.push_back(text("ended: the curves keep what it did") | color(theme::yellow()));
+
+        const int body_h = inner_h - 2;
+        Element body = view == 0 ? overview(inner_w, body_h, now) : performance(inner_w, body_h, now);
+
+        Elements keys = keyHints({{"1 2", "view"}, {"+ -", "zoom"}});
+        if (view == 0) keys.push_back(keyHint("g", symbols == chart::Symbols::Block ? "braille" : "blocks"));
+        if (view == 1) keys.push_back(keyHint("↑↓", "resource"));
+        for (auto& k : keyHints({{"r", "read again"}, {"q", "close"}})) keys.push_back(k);
+        const std::string when =
+            std::to_string(static_cast<int>(ZOOMS[zoom])) + " s per column · sstat 2 s" + (gpus > 0 ? " · nvidia-smi 2 s" : "");
+        Elements foot = {hbox(std::move(keys)), filler()};
+        if (inner_w >= 110) foot.push_back(text(when) | color(chart::graphText()));
+        return panel(title,
+                     vbox({hbox(std::move(head)), body | size(HEIGHT, EQUAL, body_h), hbox(std::move(foot))}) |
+                         size(WIDTH, EQUAL, inner_w) | size(HEIGHT, EQUAL, inner_h),
+                     theme::accent(), text(ended ? "stopped" : "live") | bold | color(ended ? theme::yellow() : theme::green()));
     }
 };
 

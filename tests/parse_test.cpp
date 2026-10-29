@@ -762,37 +762,78 @@ static void monitor() {
     }
     CHECK_EQ(ui::resample(s, 104, 1, 6, 2)[2], 0.2);   // divided by the scale
 
-    // The curve: a line from the bottom to the top, the cells under it tinted
+    // btop's graph: each character shows the value before (left) and its own (right); blocks or braille
     {
-        auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(3), ftxui::Dimension::Fixed(2));
-        ftxui::Render(screen, ui::curve({0, 0, 1, 1, 1, 1}, 2, ui::theme::cyan(), 0));
-        CHECK_EQ(screen.PixelAt(0, 1).character, std::string("⣸"));   // along the bottom, then up (Bresenham)
-        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("⡏"));
-        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⠉"));   // along the top
-        CHECK(screen.PixelAt(2, 1).background_color == screen.PixelAt(1, 1).background_color);   // under it: tinted
-        CHECK(!(screen.PixelAt(2, 1).background_color == ftxui::Color()));
+        auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(3), ftxui::Dimension::Fixed(1));
+        ftxui::Render(screen, ui::chart::graph({0, 1, 1}, 3, 1, ui::chart::cpuGradient()));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string(" "));   // 0 then nothing before: empty
+        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("⢸"));   // from 0 to full
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
+        ftxui::Render(screen, ui::chart::graph({0.5, 0.5, 1}, 3, 1, ui::chart::cpuGradient(), false, ui::chart::Symbols::Block));
+        CHECK_EQ(screen.PixelAt(1, 0).character, std::string("▄"));
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("▟"));
+        ftxui::Render(screen, ui::chart::graph({1, 1, 1}, 3, 1, ui::chart::cpuGradient(), true));   // hanging from the top
+        CHECK_EQ(screen.PixelAt(2, 0).character, std::string("⣿"));
+    }
+    CHECK_EQ(ui::chart::niceMax(340e6), 500e6);
+    CHECK_EQ(ui::chart::niceMax(1), 1.0);
+    CHECK_EQ(ui::chart::bytes(1536), std::string("1.5 KB"));
+
+    // A task manager's chart: the line, the area under it tinted, its scale on the left
+    {
+        auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(10), ftxui::Dimension::Fixed(3));
+        ftxui::Render(screen, ui::chart::lineChart({{{0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, ui::theme::cyan(), true}}, 10, 3,
+                                                   [](double f) { return std::to_string(static_cast<int>(f * 100)); },
+                                                   [](int) { return std::string(""); }, 100));
+        CHECK_EQ(screen.PixelAt(0, 0).character, std::string("1"));      // "100" at the top
+        CHECK_EQ(screen.PixelAt(2, 1).character, std::string("0"));      // "0" at the bottom
+        CHECK(screen.PixelAt(6, 1).background_color == screen.PixelAt(8, 1).background_color);   // under the line: tinted
+        CHECK(!(screen.PixelAt(8, 1).background_color == ftxui::Color()));
     }
 
-    // sstat: the CPU time between two readings at least 6 s apart (2 CPUs here: 10 s), memory as it is
+    // sstat, step by step: the CPU time between readings at least 6 s apart, memory and bytes summed
     ui::MonitorView m;
     m.cpus = 2;
-    api::LiveUse a;
-    a.at = 1000;
-    a.cpu_seconds = 100;
-    a.mem_mib = 2048;
-    m.setLive(a, "");
+    api::StepUse batch, s0;
+    batch.id = "1.batch";
+    s0.id = "1.0";
+    batch.tasks = s0.tasks = 1;
+    batch.cpu_seconds = 40;
+    s0.cpu_seconds = 60;
+    batch.mem_mib = 1024;
+    s0.mem_mib = 1024;
+    s0.read_bytes = 1e9;
+    m.setSteps({batch, s0}, 1000, "");
     CHECK(m.cpu.empty());   // one reading: nothing to compare with
-    a.at = 1012;
-    a.cpu_seconds = 112;    // 12 s of CPU over 12 s on 2 CPUs
-    m.setLive(a, "");
-    CHECK_EQ(m.cpu.last(), 0.5);
     CHECK_EQ(m.mem.last(), 2048.0);
-    a.at = 1014;
-    a.cpu_seconds = 5;      // a step ended: start again from here
-    m.setLive(a, "");
+    batch.cpu_seconds = 46;
+    s0.cpu_seconds = 66;    // 12 s of CPU over 12 s on 2 CPUs
+    s0.read_bytes = 1.6e9;  // 50 MB/s
+    m.setSteps({batch, s0}, 1012, "");
     CHECK_EQ(m.cpu.last(), 0.5);
-    m.setLive(a, "sstat: error");
+    CHECK_EQ(m.reads.last(), 5e7);
+    CHECK_EQ(m.steps.size(), 2u);
+    CHECK_EQ(m.steps["1.0"].cores.last(), 0.5);
+    m.setSteps({}, 1014, "sstat: error");
     CHECK_EQ(m.cpu_error, std::string("sstat: error"));
+
+    // A total that went down (a step ended): no rate until the next reading
+    ui::Rate rate;
+    CHECK_EQ(rate.add(0, 10), -1.0);
+    CHECK_EQ(rate.add(10, 30), 2.0);
+    CHECK_EQ(rate.add(20, 5), -1.0);
+
+    // sstat with the node of the largest task and the bytes written
+    const auto st = api::parseSteps("9.0|4|2G|romeo-a013|cpu=00:10:00,energy=0,fs/disk=5000,mem=3G,pages=0|energy=0,fs/disk=7000\n");
+    CHECK_EQ(st.size(), 1u);
+    if (st.size() == 1) {
+        CHECK_EQ(st[0].tasks, 4);
+        CHECK_EQ(st[0].cpu_seconds, 600.0);
+        CHECK_EQ(st[0].max_rss_node, std::string("romeo-a013"));
+        CHECK_EQ(st[0].read_bytes, 5000.0);
+        CHECK_EQ(st[0].write_bytes, 7000.0);
+        CHECK_EQ(st[0].mem_mib, 3072.0);
+    }
 
     // GPUs together: the mean use and the memory of all, from each one's last line
     api::GpuUse g0, g1;

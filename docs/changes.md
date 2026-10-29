@@ -2,7 +2,7 @@
 
 **New**
 
-- `m`: a running job live, like btop. Its CPUs, memory, GPU memory and GPUs in boxes, each with a curve like a task manager's (a line over a tinted area, a grid, its scale and time span), and each GPU with its own little curve, use, temperature and power. `+` `-` zoom from the last minutes to the last hour. `sstat` every 2 s on a worker of its own (a slow `squeue` leaves no hole in the curves); the GPUs from one `srun --overlap` step running `nvidia-smi --loop-ms` while the view is open, stopped when it closes.
+- `m`: a running job live, in two views. `1` as btop: CPUs with the GPUs (or memory) hanging under them, gauges, each GPU with its little curve and temperature, memory, disk reads and writes, the job's steps. `2` as a task manager's Performance tab: CPU, memory, disk and each GPU with a chart, its scale and time, and their figures. Graphs in the manner of btop (each character shows the step from one value to the next, colour gradients by height, blocks or braille with `g`), charts on FTXUI's canvas. `+` `-` zoom up to the last hour. `sstat` every 2 s on a worker of its own; the GPUs from one `srun --overlap` step running `nvidia-smi --loop-ms` while the view is open, stopped when it closes.
 
 # Changes in RSV 2.1
 

@@ -1024,10 +1024,27 @@ def sstat():
         cpu += amp / w * (math.cos(w * j["start"]) - math.cos(w * NOW))
     cpu *= j["num_cpus"]
     mem = j["mem_per_node"] * j["num_nodes"] * (0.45 + 0.25 * ((NOW % 300) / 300.0) if train else 0.6 + 0.04 * math.sin(NOW / 40.0))
-    print("%s.batch|1|%dM|cpu=%s,energy=0,fs/disk=123456,mem=%dM,pages=0,vmem=%dM" % (
-        job_id, mem / 1024, duration(cpu * 0.1), mem * 0.1, mem * 0.2))
-    print("%s.0|%d|%dM|cpu=%s,energy=0,fs/disk=654321,mem=%dM,pages=0,vmem=%dM" % (
-        job_id, j["num_nodes"], mem / j["num_nodes"] / 1.5, duration(cpu * 0.9), mem * 0.9, mem * 1.2))
+    fmt = opts.get("format") or ""
+    if "MaxRSSNode" not in fmt:
+        print("%s.batch|1|%dM|cpu=%s,energy=0,fs/disk=123456,mem=%dM,pages=0,vmem=%dM" % (
+            job_id, mem / 1024, duration(cpu * 0.1), mem * 0.1, mem * 0.2))
+        print("%s.0|%d|%dM|cpu=%s,energy=0,fs/disk=654321,mem=%dM,pages=0,vmem=%dM" % (
+            job_id, j["num_nodes"], mem / j["num_nodes"] / 1.5, duration(cpu * 0.9), mem * 0.9, mem * 1.2))
+        return
+    # The live view (m) asks for the node of the largest task and the bytes read and written: reads stream in
+    # (about 400 MB/s, in waves), a checkpoint writes 30 GB every 90 s
+    read = used * 4e8 + 1.5e8 * 30 / (2 * math.pi) * (math.cos(2 * math.pi * j["start"] / 30) - math.cos(2 * math.pi * NOW / 30))
+    write = (used // 90) * 3e10 + min(used % 90, 15) / 15.0 * 3e10 + used * 2e6
+    hosts = node_names(j)
+    node = hosts[-1] if hosts else "romeo-a012"
+    steps = [("batch", 1, 0.02, 0.05, 0.01, 0.01), ("0", j["num_nodes"], 0.88, 0.9, 0.97, 0.98)]
+    if train:
+        steps.append(("1", 1, 0.10, 0.05, 0.02, 0.01))   # a data loader on the side
+    else:
+        steps.append(("extern", j["num_nodes"], 0.0, 0.0, 0.0, 0.0))
+    for name, tasks, c, m, r, w in steps:
+        print("%s.%s|%d|%dM|%s|cpu=%s,energy=0,fs/disk=%d,mem=%dM,pages=0,vmem=%dM|energy=0,fs/disk=%d" % (
+            job_id, name, tasks, mem * m / max(1, tasks) * 1.1, node, duration(cpu * c), read * r, mem * m, mem * m * 1.3, write * w))
 
 
 def sprio():

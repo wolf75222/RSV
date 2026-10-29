@@ -68,7 +68,7 @@ inline Element helpView(int max_width, int max_height, int refresh_seconds, int&
         row("b", "the script it was submitted with"),
         row("d", "everything scontrol says about it"),
         row("n", "its GPUs now: use and memory"),
-        row("m", "live, like btop: curves of its CPUs, memory and GPUs"),
+        row("m", "live: as btop (1) or a task manager (2), CPUs, memory, disk, GPUs"),
         row("c", "cancel it, or a whole array (asks first)"),
         row("H", "hold or release it (ROMEO refuses both to users)"),
         row("y  Y", "copy its id, or its output path"),
