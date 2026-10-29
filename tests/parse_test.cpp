@@ -1060,6 +1060,12 @@ vllm:cache_config_info{block_size="64",cache_dtype="auto",note="a \"quoted\", {b
     odd.buckets = {{0.1, 10}, {0.5, 9}, {INFINITY, 10}};
     odd.count = 10;
     CHECK(odd.quantile(0.5) <= 0.1);
+    // All in the first bucket: its mean bounds the estimate, not the bucket's 0.3 s
+    api::Histogram queue;
+    queue.buckets = {{0.3, 10}, {INFINITY, 10}};
+    queue.count = 10;
+    queue.sum = 0.0003;
+    CHECK(queue.quantile(0.5) < 0.0001);
 
     // SGLang's names, Ollama's models
     const auto sg = api::readMetrics(api::parsePrometheus(
@@ -1143,7 +1149,7 @@ vllm:cache_config_info{block_size="64",cache_dtype="auto",note="a \"quoted\", {b
         auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(140), ftxui::Dimension::Fixed(40));
         ftxui::Render(screen, mv.render(140, 40));
         CHECK(screen.ToString().find("vLLM") != std::string::npos);
-        CHECK(screen.ToString().find("tokens per second") != std::string::npos);
+        CHECK(screen.ToString().find("tokens generated per second") != std::string::npos);
     }
 }
 

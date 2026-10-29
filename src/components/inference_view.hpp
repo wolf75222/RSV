@@ -57,7 +57,8 @@ inline std::string percent(double r) { return r < 0 ? "-" : r < 0.1 && r > 0 ? n
 // ---------------------------------------------------------------- one server, in time
 
 /* A server's readings turned into curves
-- Rates from two readings in a row; latencies, cache hits and accepted drafts over the last 30 s (their histograms
+- Rates over the last 10 s (a prompt's tokens are counted at once when its prefill ends: over 2 s they come in
+  spikes), as vLLM's own log does; latencies, cache hits and accepted drafts over the last 30 s (their histograms
   and counters then minus 30 s before): a curve that moves with what the server does now, not since it started
 - Five minutes of readings are kept for that and for the figures over the last minute
 */
@@ -89,20 +90,29 @@ struct InferenceServer {
         double gen_rate = -1;
         if (!kept.empty()) {
             const auto& prev = kept.back();
-            const double dt = at - prev.at;
+            double base_at = kept.front().at;
+            const api::InferenceReading* base = &kept.front().r;
+            for (const auto& k : kept)
+                if (at - k.at >= 10) {
+                    base_at = k.at;
+                    base = &k.r;
+                }
+            const double dt = at - base_at;
             if (dt > 0.2) {
                 const auto rate = [&](double now, double then) {
                     const double d = delta(now, then);
                     return d < 0 ? -1 : d / dt;
                 };
-                gen_rate = rate(r.generation_tokens, prev.r.generation_tokens);
-                double p = rate(r.prompt_tokens, prev.r.prompt_tokens);
+                gen_rate = rate(r.generation_tokens, base->generation_tokens);
+                double p = rate(r.prompt_tokens, base->prompt_tokens);
                 if (gen_rate < 0) gen_rate = r.generation_tps;
                 if (p < 0) p = r.prompt_tps;
                 if (gen_rate >= 0) generation.add(at, gen_rate);
                 if (p >= 0) prompt.add(at, p);
-                const double q = rate(r.requests_done, prev.r.requests_done);
+                const double q = rate(r.requests_done, base->requests_done);
                 if (q >= 0) requests.add(at, q * 60);
+            }
+            if (at - prev.at > 0.2) {
                 if (r.preemptions > prev.r.preemptions && prev.r.preemptions >= 0) preempted_at = at;
                 if (r.requests_failed > prev.r.requests_failed && prev.r.requests_failed >= 0) failed_at = at;
             }
@@ -459,8 +469,9 @@ struct InferenceView : LivePieces {
                                                                    tickColumns(cols, step, w >= 100 ? 6 : 4))}) |
                    size(WIDTH, EQUAL, w);
         };
-        const double tput_top = chart::niceMax(std::max({1.0, s.generation.peak(now - step * cw), s.prompt.peak(now - step * cw)}));
-        Element tput = chartOf("tokens per second", {{"generated", &s.generation, chart::cachedGradient().mid}, {"prompt", &s.prompt, chart::readGradient().high}},
+        // The tokens it generates alone: a prompt's are often a thousand times more (an agent's context, cached)
+        const double tput_top = chart::niceMax(std::max(1.0, s.generation.peak(now - step * cw)));
+        Element tput = chartOf("tokens generated per second", {{"generated", &s.generation, chart::cachedGradient().mid}},
                                tput_top, [tput_top](double f) { return fmt::count(f * tput_top); }, cw, charts_h);
         Element second;
         if (!s.ttft50.empty()) {

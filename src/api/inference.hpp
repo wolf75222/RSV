@@ -69,7 +69,9 @@ struct Histogram {
             if (n >= rank) {
                 if (std::isinf(le)) return lower;
                 if (n - below <= 0) return le;
-                return lower + (le - lower) * (rank - below) / (n - below);
+                // In the first bucket (vLLM's queue: 0 to 0.3 s), its bound says little: its mean says more
+                const double upper = below == 0 && lower == 0 && sum > 0 ? std::min(le, 2 * sum / count) : le;
+                return lower + (upper - lower) * (rank - below) / (n - below);
             }
             lower = std::isinf(le) ? lower : le;
             below = n;
