@@ -160,7 +160,7 @@ struct MonitorView {
     bool gpu_zoom = false;      // Enter: the selected GPU alone, the whole width
 
     int view = 0;               // 0 overview, 1 performance, 2 GPUs
-    chart::Symbols symbols = chart::Symbols::Braille;   // the graphs of the first view (g: braille, bars, blocks)
+    chart::Symbols symbols = chart::Symbols::Braille;   // the graphs of the first view (v: braille, bars, blocks)
     int zoom = 1;
     int selected = 0, side_offset = 0, item_count = 1;
     std::function<void()> reload;
@@ -283,24 +283,33 @@ struct MonitorView {
         return false;
     }
 
-    /* 1 2 or Tab: the views; + - zoom; g how the graphs are drawn; r reads again (and starts the GPU step again); q, Esc or m close
-       The arrows or j k pick a resource (the second view) */
+    /* Keys, as in the rest of RSV
+- 1 2 3, Tab or ← → (h l): the views, as the cluster view's tabs
+- ↑ ↓ (j k): the resource (2) or the GPU (3); Enter: that GPU alone, Esc back
+- + -: zoom in time; v: how the graphs are drawn; r: read again (and start the GPU steps again)
+- q or Esc close; the key that opened it closes it too: m from the first two views, n from the GPUs (each goes to
+  the other's view otherwise)
+*/
     bool onEvent(Event e, bool& close) {
         const int n = std::max(1, item_count);
+        const int views = gpus > 0 ? 3 : 2;
         if (e == Event::Character('r')) {
             if (reload) reload();
-        } else if (e == Event::Character('1')) {
-            view = 0;
-        } else if (e == Event::Character('2')) {
-            view = 1;
-        } else if (e == Event::Character('g')) {
+        } else if (e == Event::Character('1') || e == Event::Character('2') || (e == Event::Character('3') && gpus > 0)) {
+            view = e.character()[0] - '1';
+        } else if (e == Event::Character('n') && gpus > 0) {
+            if (view == 2) close = true;
+            else view = 2;
+        } else if (e == Event::Character('m')) {
+            if (view == 2) view = 0;
+            else close = true;
+        } else if (e == Event::Character('v')) {
             symbols = symbols == chart::Symbols::Braille ? chart::Symbols::Bars
                       : symbols == chart::Symbols::Bars ? chart::Symbols::Block : chart::Symbols::Braille;
-        } else if (e == Event::Character('3') || e == Event::Character('n')) {
-            if (gpus > 0) view = 2;
-        } else if (e == Event::Tab || e == Event::TabReverse) {
-            const int views = gpus > 0 ? 3 : 2;
-            view = (view + (e == Event::Tab ? 1 : views - 1)) % views;
+        } else if (e == Event::Tab || e == Event::ArrowRight || e == Event::Character('l')) {
+            view = (view + 1) % views;
+        } else if (e == Event::TabReverse || e == Event::ArrowLeft || e == Event::Character('h')) {
+            view = (view + views - 1) % views;
         } else if (view == 2 && (e == Event::ArrowDown || e == Event::Character('j'))) {
             gpu_selected = std::min(static_cast<int>(gpu_tracks.size()) - 1, gpu_selected + 1);
         } else if (view == 2 && (e == Event::ArrowUp || e == Event::Character('k'))) {
@@ -313,17 +322,18 @@ struct MonitorView {
             zoom = std::max(0, zoom - 1);
         } else if (e == Event::Character('-') || e == Event::Character('_')) {
             zoom = std::min(static_cast<int>(std::size(ZOOMS)) - 1, zoom + 1);
-        } else if (e == Event::ArrowDown || e == Event::Character('j')) {
-            view = 1;
+        } else if (view == 1 && (e == Event::ArrowDown || e == Event::Character('j'))) {
             selected = (selected + 1) % n;
-        } else if (e == Event::ArrowUp || e == Event::Character('k')) {
-            view = 1;
+        } else if (view == 1 && (e == Event::ArrowUp || e == Event::Character('k'))) {
             selected = (selected + n - 1) % n;
         } else if (e.is_mouse()) {
             if (view == 1 && e.mouse().button == Mouse::WheelDown) selected = std::min(n - 1, selected + 1);
             else if (view == 1 && e.mouse().button == Mouse::WheelUp) selected = std::max(0, selected - 1);
+            else if (view == 2 && e.mouse().button == Mouse::WheelDown)
+                gpu_selected = std::min(static_cast<int>(gpu_tracks.size()) - 1, gpu_selected + 1);
+            else if (view == 2 && e.mouse().button == Mouse::WheelUp) gpu_selected = std::max(0, gpu_selected - 1);
         } else {
-            close = e == Event::Escape || e == Event::Character('q') || e == Event::Character('m');
+            close = e == Event::Escape || e == Event::Character('q');
         }
         return true;
     }
@@ -877,7 +887,7 @@ struct MonitorView {
             {"Power", g.power_w < 0 ? "-" : watts(g.power_w) + (g.power_limit_w > 0 ? " / " + watts(g.power_limit_w) : "")},
             {"Temperature", g.temp_c < 0 ? "-" : std::to_string(static_cast<int>(g.temp_c)) + " °C"},
             {"ECC errors", g.ecc_corrected < 0 ? "-" : std::to_string(static_cast<long>(g.ecc_uncorrected)) + " uncorr. · " + std::to_string(static_cast<long>(g.ecc_corrected)) + " corr."},
-            {"PCIe / C2C", t.pcie_rx.empty() ? "-" : chart::bytes(t.pcie_rx.last()) + "/s in · " + chart::bytes(t.pcie_tx.last()) + "/s out"},
+            {"PCIe", t.pcie_rx.empty() ? "-" : chart::bytes(t.pcie_rx.last()) + "/s in · " + chart::bytes(t.pcie_tx.last()) + "/s out"},
             {"NVLink", t.nvlink_rx.empty() ? "-" : chart::bytes(t.nvlink_rx.last()) + "/s in · " + chart::bytes(t.nvlink_tx.last()) + "/s out"}};
         const int col_w = 27, per_row = std::max(1, width / col_w);
         Elements stat_rows;
@@ -909,11 +919,11 @@ struct MonitorView {
         // The curves share what is left
         const int fixed = static_cast<int>(out.size()) + static_cast<int>(stat_rows.size()) + 1 + static_cast<int>(procs.size()) + 3 * 2;
         const int chart_h = std::max(4, (height - fixed) / 3);
-        const auto chartOf = [&](const std::string& title, std::vector<std::pair<std::string, std::pair<const Series*, Color>>> curves,
+        const auto chartOf = [&](const std::string& what, std::vector<std::pair<std::string, std::pair<const Series*, Color>>> curves,
                                  double scale, std::function<std::string(double)> y_label) {
             const int cols = chart::lineColumns(width, chart_h, y_label);
             std::vector<chart::Line> lines;
-            Elements legend = {text(title) | bold, text("   ")};
+            Elements legend = {text(what) | bold, text("   ")};
             for (const auto& [name, sc] : curves) {
                 lines.push_back({resample(*sc.first, now, step / 2, cols * 2, scale), sc.second, lines.empty()});
                 legend.push_back(text("━ ") | bold | color(sc.second));
@@ -975,13 +985,13 @@ struct MonitorView {
         if (view == 2 && gpus <= 0) view = 0;
         Element body = view == 0 ? overview(inner_w, body_h, now) : view == 1 ? performance(inner_w, body_h, now) : gpuView(inner_w, body_h, now);
 
-        Elements keys = keyHints({{gpus > 0 ? "1 2 3" : "1 2", "view"}, {"+ -", "zoom"}});
+        Elements keys = keyHints({{gpus > 0 ? "1 2 3 ←→" : "1 2 ←→", "view"}, {"+ -", "zoom"}});
         if (view == 2) {
             keys.push_back(keyHint("↑↓", "GPU"));
             keys.push_back(keyHint("Enter", gpu_zoom ? "list" : "zoom"));
         }
         if (view == 0)
-            keys.push_back(keyHint("g", symbols == chart::Symbols::Braille ? "bars" : symbols == chart::Symbols::Bars ? "blocks" : "braille"));
+            keys.push_back(keyHint("v", symbols == chart::Symbols::Braille ? "bars" : symbols == chart::Symbols::Bars ? "blocks" : "braille"));
         if (view == 1) keys.push_back(keyHint("↑↓", "resource"));
         for (auto& k : keyHints({{"r", "read again"}, {"q", "close"}})) keys.push_back(k);
         const std::string when =
