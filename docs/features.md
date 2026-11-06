@@ -12,7 +12,7 @@
 - History with CPU, memory and time efficiency, CPU and GPU hours, what was reserved but idle and the time asked but not used.
 - Your project: your colleagues' jobs in your accounts, read-only.
 - Several jobs at once: mark them, then cancel them, after a confirmation that lists them.
-- The whole cluster, live: CPUs, GPUs, load, memory and storage in use with their curve since you opened it, reservations and maintenances, partitions and their rules, everyone's queue and why it waits, the nodes down and why, a map of every node (yours marked) with a zoom on one, and the hardware of each kind of node.
+- The whole cluster, live: CPUs, GPUs, load, memory and storage in use with their curve since you opened it, reservations and maintenances, partitions and their rules, everyone's queue and why it waits, every job in it to scroll through, sort and filter, the nodes down and why, a map of every node (yours marked) with a zoom on one, and the hardware of each kind of node.
 - When would a job start? Slurm's own estimate for the job you describe, without submitting it.
 - Your accounts: their limits, fairshare and disk quotas.
 - Never freezes: Slurm is asked in the background, with timeouts, and less often when it is slow. Quits when the SSH connection drops.

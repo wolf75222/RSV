@@ -67,7 +67,8 @@ inline std::string reasonMeaning(const std::string& reason) {
 /* Cluster (p): what the whole of ROMEO is doing now (every user's jobs are visible there), in four tabs
 - Overview: the totals (CPUs, GPUs, load, memory, storage, nodes, Slurm) with the CPUs and GPUs in use since the
   view was opened, reservations, partitions and their rules, kinds of nodes
-- Queue: everyone's jobs by partition, why the pending ones wait and what they ask for, the main users or accounts
+- Queue: everyone's jobs by partition, why the pending ones wait and what they ask for, the main users or accounts.
+  Enter lists every job, to scroll through, sorted (s) and filtered (/)
 - Nodes: the nodes down and why, then every node as a map (■ busy, ■ reserved but idle, . free, x down) or a table
   with its load and memory (t). A cursor moves on them, Enter zooms on one: its jobs, load, memory, why it is down.
 - Hardware: each kind of node, its processors, memory and GPUs
@@ -113,6 +114,11 @@ struct ClusterView {
     std::vector<std::vector<std::string>> map_rows;
     int cursor_line = -1;
     bool follow_cursor = false;
+
+    // Queue: the list of every job (Enter), its sort and filter
+    bool jobs_open = false, filtering = false;
+    int jobs_offset = 0, jobs_sort = 0;   // 0 state, 1 CPUs, 2 user
+    std::string filter;
 
     // A new reading of the cluster (every refresh while the view is open): one more point on the curves
     void setData(api::Cluster d) {
@@ -180,6 +186,7 @@ struct ClusterView {
         const int n = static_cast<int>(tabs().size());
         tab = (t % n + n) % n;
         offset = 0;
+        jobs_open = filtering = false;
         follow_cursor = tab == 2;
         if (tab == 3 && !hardware_asked) requestHardware();
     }
@@ -282,8 +289,49 @@ struct ClusterView {
         return true;   // the zoom takes every key
     }
 
+    static const char* sortName(int s) { return s == 1 ? "CPUs" : s == 2 ? "user" : "state"; }
+
+    /* The list of every job: j k PgUp PgDn g G scroll, s sorts, / filters, Esc back to the queue's summary
+    - While typing the filter every character goes to it (h and l too): Enter keeps it, Esc clears it
+    */
+    bool jobsEvent(Event e, bool& close) {
+        if (filtering) {
+            if (e == Event::Return) filtering = false;
+            else if (e == Event::Escape) filtering = false, filter.clear();
+            else if (e == Event::Backspace) {
+                if (!filter.empty()) filter.pop_back();
+                while (!filter.empty() && (static_cast<unsigned char>(filter.back()) & 0xC0) == 0x80) filter.pop_back();
+            } else if (e.is_character()) filter += e.character();
+            else return e.is_mouse();
+            jobs_offset = 0;
+            return true;
+        }
+        if (tabKey(e, static_cast<int>(tabs().size()))) return true;
+        if (e == Event::Character('p')) close = true;
+        else if (e == Event::Escape || e == Event::Character('q') || e == Event::Backspace) {
+            if (!filter.empty() && e == Event::Escape) filter.clear();
+            else jobs_open = false;
+        } else if (e == Event::Character('/')) filtering = true;
+        else if (e == Event::Character('s')) jobs_sort = (jobs_sort + 1) % 3, jobs_offset = 0;
+        else if (e == Event::Character('r')) {
+            loading = true;
+            if (reload) reload();
+        } else if (e == Event::ArrowDown || e == Event::Character('j')) jobs_offset++;
+        else if (e == Event::ArrowUp || e == Event::Character('k')) jobs_offset--;
+        else if (e == Event::PageDown || e == Event::Character(' ') || e == Event::CtrlD) jobs_offset += page - 3;
+        else if (e == Event::PageUp || e == Event::Character('b') || e == Event::CtrlU) jobs_offset -= page - 3;
+        else if (e == Event::Home || e == Event::Character('g')) jobs_offset = 0;
+        else if (e == Event::End || e == Event::Character('G')) jobs_offset = 1 << 20;
+        else if (e.is_mouse() && e.mouse().button == Mouse::WheelDown) jobs_offset += 3;
+        else if (e.is_mouse() && e.mouse().button == Mouse::WheelUp) jobs_offset -= 3;
+        else return e.is_mouse();
+        jobs_offset = std::max(0, jobs_offset);
+        return true;
+    }
+
     bool onEvent(Event e, bool& close) {
         if (zoom_open) return zoomEvent(e, close);
+        if (jobs_open && tab == 1) return jobsEvent(e, close);
         const int n = static_cast<int>(tabs().size());
         if (e == Event::Escape || e == Event::Character('q') || e == Event::Character('p')) close = true;
         else if (e == Event::Character('r')) {
@@ -298,6 +346,10 @@ struct ClusterView {
             table = !table;
             follow_cursor = true;
         } else if (tab == 1 && e == Event::Character('a')) by_account = !by_account;
+        else if (tab == 1 && e == Event::Return) {
+            jobs_open = true;
+            jobs_offset = 0;
+        }
         else if (e == Event::ArrowDown || e == Event::Character('j')) offset++;
         else if (e == Event::ArrowUp || e == Event::Character('k')) offset--;
         else if (e == Event::PageDown || e == Event::Character(' ') || e == Event::CtrlD) offset += page - 1;
@@ -938,6 +990,84 @@ struct ClusterView {
         }
     }
 
+    /* ---- 2 Queue, Enter: every job, running then pending, the user's own in cyan
+    - The header stays while the rows scroll: `header` gets it, `rows` the jobs
+    - TIME is the time left of a running job, or ~ the time until a pending one should start
+    - WHERE / WHY: the nodes of a running job, the reason of a pending one
+    */
+    void jobRows(Element& header, Elements& rows, int inner, std::time_t now) const {
+        const std::string me = api::currentUser();
+        const std::string needle = util::lower(filter);
+        std::vector<const api::QueueJob*> jobs;
+        int running = 0, pending = 0;
+        for (const auto& j : data.queue.jobs) {
+            if (!needle.empty()) {
+                const std::string all = util::lower(j.id + " " + j.user + " " + j.account + " " + j.partition + " " + j.state + " " +
+                                                    j.reason + " " + j.nodelist + " " + j.name);
+                if (all.find(needle) == std::string::npos) continue;
+            }
+            jobs.push_back(&j);
+            if (api::isActive(j.state)) running++;
+            else pending += j.count;
+        }
+        auto order = [&](const api::QueueJob* a, const api::QueueJob* b) {
+            const bool ra = api::isActive(a->state), rb = api::isActive(b->state);
+            if (jobs_sort == 1 && a->cpus * a->count != b->cpus * b->count) return a->cpus * a->count > b->cpus * b->count;
+            if (jobs_sort == 2 && a->user != b->user) return a->user < b->user;
+            if (ra != rb) return ra;
+            if (ra) return a->left >= 0 && (b->left < 0 || a->left < b->left);   // ending soonest first
+            if ((a->start > 0) != (b->start > 0)) return a->start > 0;            // an expected start first
+            return a->start < b->start;
+        };
+        std::stable_sort(jobs.begin(), jobs.end(), order);
+
+        const bool wide = inner >= 110;
+        const int where_w = wide ? 22 : 16;
+        const int name_w = std::max(4, inner - (wide ? 86 : 73) - where_w - 1);
+        Elements head = {cell("JOB", 17), cell("USER", 11)};
+        if (wide) head.push_back(cell("ACCOUNT", 13));
+        for (const Element& e : std::initializer_list<Element>{cell("PARTITION", 11), cell("ST", 4), cell("CPUS", 7, true), cell("GPUS", 5, true), cell("NODES", 6, true),
+                        text("  "), cell("TIME", 10), cell("WHERE / WHY", where_w)})
+            head.push_back(e);
+        head.push_back(text("NAME"));
+        std::string summary = std::to_string(running) + " running, " + std::to_string(pending) + " pending · sorted by " +
+                              sortName(jobs_sort);
+        Elements top = {title("Jobs  "), text(summary) | dim};
+        if (filtering || !filter.empty())
+            top.push_back(hbox({text("  /") | color(theme::accent()), text(filter) | bold, filtering ? text("▏") : text("")}));
+        header = vbox({hbox(std::move(top)), hbox(std::move(head)) | dim});
+
+        if (jobs.empty()) {
+            rows.push_back(text(data.queue.jobs.empty() ? "No job in the queue" : "No job matches") | dim);
+            return;
+        }
+        for (const api::QueueJob* j : jobs) {
+            const bool own = j->user == me;
+            const bool run = api::isActive(j->state);
+            std::string when = "-";
+            if (run && j->left >= 0) when = util::duration(j->left);
+            else if (!run && j->start > now) when = "~" + util::duration(static_cast<long>(j->start - now));
+            const std::string st = run ? (j->state == "COMPLETING" ? "CG" : "R") : "PD";
+            const std::string why = run ? j->nodelist : j->reason;
+            Elements r = {cell(util::cut(j->id, 16), 17) | (own ? color(theme::cyan()) : Decorator(nothing)),
+                          cell(util::cut(j->user, 10), 11) | (own ? Decorator(bold) : Decorator(nothing))};
+            if (wide) r.push_back(cell(util::cut(j->account, 12), 13) | dim);
+            r.push_back(cell(util::cut(j->partition, 10), 11));
+            r.push_back(cell(st, 4) | color(run ? theme::green() : theme::yellow()));
+            r.push_back(cell(thousands(j->cpus), 7, true));
+            r.push_back(cell(j->gpus ? std::to_string(j->gpus) : "-", 5, true));
+            r.push_back(cell(std::to_string(j->nodes), 6, true));
+            r.push_back(text("  "));
+            r.push_back(cell(when, 10) | dim);
+            r.push_back(cell(util::cut(why, static_cast<size_t>(where_w - 1)), where_w) | (run ? Decorator(dim) : color(theme::yellow())));
+            // A pending array's waiting tasks: how many, after its name
+            const std::string tasks = j->count > 1 ? "  " + std::to_string(j->count) + " tasks" : "";
+            r.push_back(text(util::cut(j->name, static_cast<size_t>(std::max(4, name_w - static_cast<int>(tasks.size()))))));
+            if (!tasks.empty()) r.push_back(text(tasks) | dim);
+            rows.push_back(hbox(std::move(r)));
+        }
+    }
+
     // `mine`: the nodes the user's jobs run on
     Element render(int width, int height, const std::set<std::string>& mine) {
         const int inner = std::max(40, width - 4);
@@ -972,8 +1102,16 @@ struct ClusterView {
             else if (cursor_line >= offset + page) offset = cursor_line - page + 1;
             follow_cursor = false;
         }
-        int& shown = zoom_open ? zoom_offset : offset;
-        shown = std::clamp(shown, 0, std::max(0, static_cast<int>(lines.size()) - page));
+        // Every job: its header stays above the rows that scroll
+        const bool jobs_shown = jobs_open && tab == 1 && !zoom_open;
+        Element jobs_header = text("");
+        if (jobs_shown) {
+            lines.clear();
+            jobRows(jobs_header, lines, inner, now);
+        }
+        const int rows_page = jobs_shown ? std::max(1, page - 2) : page;
+        int& shown = zoom_open ? zoom_offset : jobs_shown ? jobs_offset : offset;
+        shown = std::clamp(shown, 0, std::max(0, static_cast<int>(lines.size()) - rows_page));
 
         std::string when = loading ? "reading..." : updated ? "updated " + (now - updated < 5 ? std::string("now") : util::duration(static_cast<long>(now - updated)) + " ago") : "";
         when += " · every " + std::to_string(refresh_seconds) + " s";
@@ -984,7 +1122,12 @@ struct ClusterView {
             bar_tabs.push_back(text(" "));
         }
         std::vector<std::pair<std::string, std::string>> hints;
-        if (zoom_open) {
+        if (jobs_shown && filtering) {
+            hints = {{"Enter", "keep the filter"}, {"Esc", "clear it"}};
+        } else if (jobs_shown) {
+            hints = {{"Esc", filter.empty() ? "back" : "clear the filter"}, {"j/k", "scroll"}, {"PgUp/PgDn", "page"},
+                     {"/", "filter"}, {"s", std::string("sort: ") + sortName(jobs_sort)}, {"←/→", "tabs"}, {"p", "close"}};
+        } else if (zoom_open) {
             hints = {{"Esc", "back to the map"}, {"n/N", "other node"}, {"j/k", "scroll"}, {"←/→", "tabs"}, {"r", "refresh"},
                      {"p", "close"}};
         } else {
@@ -997,11 +1140,16 @@ struct ClusterView {
             } else {
                 hints.push_back({"j/k", "scroll"});
             }
-            if (tab == 1) hints.push_back({"a", by_account ? "users" : "accounts"});
+            if (tab == 1) {
+                hints.push_back({"Enter", "every job"});
+                hints.push_back({"a", by_account ? "users" : "accounts"});
+            }
             hints.push_back({"r", "refresh"});
             hints.push_back({"q", "close"});
         }
-        return panel("Cluster", vbox({hbox(std::move(bar_tabs)), separator() | dim, scrollWindow(lines, shown, page) | flex,
+        return panel("Cluster", vbox({hbox(std::move(bar_tabs)), separator() | dim,
+                                      jobs_shown ? vbox({jobs_header, scrollWindow(lines, shown, rows_page) | flex}) | flex
+                                                 : scrollWindow(lines, shown, page) | flex,
                                       separator() | dim, hbox(keyHints(hints))}) |
                                     size(WIDTH, EQUAL, width - 2) | size(HEIGHT, EQUAL, height - 2),
                      theme::accent(), text(when));

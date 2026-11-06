@@ -516,7 +516,17 @@ struct UserUse : QueueCounts {
     std::string name;   // a user or an account
 };
 
+// One job of everyone's queue, for the list of every job; a pending array's waiting tasks are one row
+struct QueueJob {
+    std::string id, user, account, partition, state, reason, nodelist, name;
+    long cpus = 0;
+    int gpus = 0, nodes = 1, count = 1;   // count: the tasks of a pending array
+    std::time_t start = 0;                // started, or expected to start (0: unknown)
+    long left = -1;                       // seconds, -1 when unknown
+};
+
 struct Queue : QueueCounts {
+    std::vector<QueueJob> jobs;
     std::set<std::string> users;
     std::map<std::string, QueueCounts> by_partition;
     std::map<std::string, int> reasons;          // why the pending jobs wait
@@ -525,8 +535,10 @@ struct Queue : QueueCounts {
 };
 
 inline const std::vector<std::string>& queueFields() {
-    static const std::vector<std::string> fields = {"UserName", "Account", "Partition", "State",   "NumCPUs",
-                                                    "tres-alloc", "Reason", "JobArrayID"};
+    // The name is last: it may contain the separator
+    static const std::vector<std::string> fields = {"UserName", "Account",   "Partition", "State",    "NumCPUs",
+                                                    "tres-alloc", "Reason",  "JobArrayID", "NumNodes", "TimeLeft",
+                                                    "StartTime",  "NodeList", "Name"};
     return fields;
 }
 
@@ -539,9 +551,11 @@ inline std::string queueFormat() {
 inline Queue parseQueue(const std::string& out) {
     Queue q;
     std::map<std::string, UserUse> users, accounts;
-    for (const auto& line : util::lines(out)) {
+    const size_t n = queueFields().size();
+    for (std::string line : util::lines(out)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         const auto f = util::split(line, SEP);
-        if (f.size() < queueFields().size()) continue;
+        if (f.size() < n) continue;
         const std::string user = util::trim(f[0]);
         const std::string account = util::trim(f[1]);
         std::string partition = util::trim(f[2]);
@@ -578,6 +592,29 @@ inline Queue parseQueue(const std::string& out) {
         }
         if (!user.empty()) q.users.insert(user);
         if (pending) q.reasons[reason] += count;
+
+        QueueJob j;
+        j.id = id;
+        j.user = util::sanitize(user);
+        j.account = util::sanitize(account);
+        j.partition = util::trim(f[2]);
+        j.state = state.substr(0, state.find(' '));
+        j.reason = pending ? reason : "";
+        j.cpus = cpus;
+        j.gpus = gpus;
+        j.count = count;
+        j.nodes = std::max(1, static_cast<int>(util::toLong(util::trim(f[8]), 1)));
+        j.left = running ? util::parseDuration(util::trim(f[9])) : -1;
+        j.start = util::parseTime(util::trim(f[10]));
+        const std::string nodes = util::trim(f[11]);
+        j.nodelist = nodes == "(null)" || nodes == "N/A" ? "" : nodes;
+        // The rest of the line, without the separator after the last field
+        size_t at = 0;
+        for (size_t i = 0; i + 1 < n; i++) at = line.find(SEP, at) + 1;
+        std::string name = line.substr(at);
+        if (!name.empty() && name.back() == SEP) name.pop_back();
+        j.name = util::sanitize(util::trim(name));
+        q.jobs.push_back(std::move(j));
     }
     auto ranked = [](std::map<std::string, UserUse>& m) {
         std::vector<UserUse> v;

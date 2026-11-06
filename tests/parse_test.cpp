@@ -249,14 +249,14 @@ static void partitions() {
 }
 
 static void queue() {
-    // Everyone's jobs: user, account, partition, state, CPUs, TRES, reason, id
+    // Everyone's jobs: user, account, partition, state, CPUs, TRES, reason, id, nodes, time left, start, node list, name
     const std::string out =
-        "alice|proj-a|short|RUNNING|128|cpu=128,mem=1500G,node=2,gres/gpu=8|None|1001|\n"
-        "alice|proj-a|short|RUNNING|64|cpu=64,mem=10G,node=1|None|1002|\n"
-        "bob|proj-b|long|RUNNING|192|cpu=192,mem=50G,node=1|None|1003|\n"
-        "bob|proj-b|long,short|PENDING|16|cpu=16,mem=64G,node=1|Resources|1004|\n"
-        "chen|proj-a|instant|PENDING|8|cpu=8,mem=16G,node=1,gres/gpu=1|QOSMaxJobsPerUserLimit|2000_[3-40%4]|\n"
-        "dana|proj-c|instant|COMPLETED|8|cpu=8|None|1005|\n";
+        "alice|proj-a|short|RUNNING|128|cpu=128,mem=1500G,node=2,gres/gpu=8|None|1001|2|1:00:00|2026-10-23T10:00:00|romeo-a[001-002]|train|\n"
+        "alice|proj-a|short|RUNNING|64|cpu=64,mem=10G,node=1|None|1002|1|30:00|2026-10-23T10:00:00|romeo-c001|a|b|\n"
+        "bob|proj-b|long|RUNNING|192|cpu=192,mem=50G,node=1|None|1003|1|2-00:00:00|2026-10-23T10:00:00|romeo-c002|lbm|\n"
+        "bob|proj-b|long,short|PENDING|16|cpu=16,mem=64G,node=1|Resources|1004|1|1:00:00|2026-10-24T08:00:00||wait|\n"
+        "chen|proj-a|instant|PENDING|8|cpu=8,mem=16G,node=1,gres/gpu=1|QOSMaxJobsPerUserLimit|2000_[3-40%4]|1|1:00:00|N/A||sweep|\n"
+        "dana|proj-c|instant|COMPLETED|8|cpu=8|None|1005|1|0:00|2026-10-23T09:00:00|romeo-c003|done|\n";
     const auto q = api::parseQueue(sep(out));
     CHECK_EQ(q.running, 3);
     CHECK_EQ(q.pending, 1 + 38);
@@ -278,6 +278,18 @@ static void queue() {
     }
     CHECK_EQ(q.by_account.size(), 2u);   // proj-a (alice and chen), proj-b
     if (!q.by_account.empty()) CHECK_EQ(q.by_account[0].pending, 38);
+    // Every job still there, one row for the waiting tasks of an array
+    CHECK_EQ(q.jobs.size(), 5u);
+    if (q.jobs.size() == 5) {
+        CHECK_EQ(q.jobs[0].nodes, 2);
+        CHECK_EQ(q.jobs[0].left, 3600L);
+        CHECK_EQ(q.jobs[0].nodelist, std::string("romeo-a[001-002]"));
+        CHECK_EQ(q.jobs[1].name, std::string("a?b"));   // the separator in the name, made safe to draw
+        CHECK_EQ(q.jobs[3].reason, std::string("Resources"));
+        CHECK_EQ(q.jobs[3].left, -1L);
+        CHECK_EQ(q.jobs[4].count, 38);
+        CHECK_EQ(q.jobs[4].start, std::time_t(0));
+    }
 }
 
 static void sacct() {

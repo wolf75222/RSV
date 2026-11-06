@@ -7,6 +7,7 @@
 
 **New**
 
+- The cluster's Queue tab: `Enter` lists every job in the queue, everyone's, to scroll through, with its nodes or why it waits and its time left or expected start; `s` sorts it, `/` filters it.
 - The steps of the overview as btop's processes: what each runs (`squeue -s`), `↑` `↓` to pick one, `Enter` for it in depth (its graph of cores, memory, largest task, reads and writes).
 
 # Changes in RSV 2.3
